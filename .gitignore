@@ -1,0 +1,29 @@
+# Python caches and local environments
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# Build and packaging outputs
+build/
+dist/
+*.egg-info/
+
+# Test and coverage artifacts
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Local machine and editor/tool state
+.DS_Store
+.env
+.env.*
+.claude/
+.scratch/
+
+# Private/local scientific data configuration
+config/*.yaml
+
+# Generated workflow outputs and trajectory indexes
+outputs/
+*.frameindex.npz
