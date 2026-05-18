@@ -27,3 +27,4 @@ config/*.yaml
 # Generated workflow outputs and trajectory indexes
 outputs/
 *.frameindex.npz
+*.out
