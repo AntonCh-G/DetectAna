@@ -15,7 +15,7 @@ from __future__ import annotations
 
 import re
 from pathlib import Path
-from typing import Iterator
+from typing import Callable, Iterator
 
 import numpy as np
 from ase import Atoms
@@ -125,13 +125,37 @@ def load_reference_frames(
         validate_frame(f, i, source=path.name)
 
     positions = np.array([f.get_positions() for f in frames], dtype=np.float64)
-    energies = np.array([f.get_potential_energy() for f in frames], dtype=np.float64)
+
+    def load_frame_property(
+        getter: Callable[[Atoms], object],
+        info_key: str,
+        info_default: object,
+        zero_fallback: Callable[[], np.ndarray],
+    ) -> np.ndarray:
+        for values in (
+            lambda: [getter(f) for f in frames],
+            lambda: [_atoms_to_info(f).get(info_key, info_default) for f in frames],
+        ):
+            try:
+                return np.asarray(values(), dtype=np.float64)
+            except Exception:
+                continue
+        return zero_fallback()
+
+    energies = load_frame_property(
+        Atoms.get_potential_energy,
+        "REF_energy",
+        0.0,
+        lambda: np.zeros(len(frames), dtype=np.float64),
+    )
 
     # Forces may be absent if the file only contains positions.
-    try:
-        forces = np.array([f.get_forces() for f in frames], dtype=np.float64)
-    except Exception:
-        forces = np.zeros_like(positions)
+    forces = load_frame_property(
+        Atoms.get_forces,
+        "REF_forces",
+        np.zeros((ASPIRIN_N_ATOMS, 3), dtype=np.float64),
+        lambda: np.zeros_like(positions),
+    )
 
     return positions, forces, energies
 
