@@ -87,6 +87,16 @@ only.
 internal coordinate fingerprint. Fit on training reference frames only. Used to
 project bead/centroid frames for Mahalanobis OOD scoring.
 
+**Carboxyl dihedral** — dihedral C6–C5–C10–O7 (0-based atom indices [6, 5, 10, 7]).
+Describes the out-of-plane rotation of the carboxyl group relative to the benzene
+ring. Encoded as `sin_dih_C6-C5-C10-O7` and `cos_dih_C6-C5-C10-O7` in the
+internal-coordinate fingerprint (dihedral index 32).
+
+**Ester dihedral** — dihedral C5–C6–O12–C11 (0-based atom indices [5, 6, 12, 11]).
+Describes the rotation around the ester oxygen bond. Encoded as
+`sin_dih_C5-C6-O12-C11` and `cos_dih_C5-C6-O12-C11` in the
+internal-coordinate fingerprint (dihedral index 35).
+
 **Descriptor space** — the PCA-reduced internal-coordinate space. The
 coordinate system in which inter-frame distances are computed for configuration
 selection and OOD scoring. A point in descriptor space is the PCA projection of

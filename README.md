@@ -64,10 +64,34 @@ coordinates), while staying within a given distance radius. Useful for building
 a diverse, geometrically varied subset of frames for inspection, further
 inference, or active-learning candidate sets.
 
-The script fits the `DescriptorPipeline` (StandardScaler + PCA) on the
-trajectory itself, so the descriptor space reflects the trajectory's own
-variance. Distances are Euclidean in PCA space and are **not** directly
-comparable to the Mahalanobis OOD scores produced by the main pipeline.
+The script operates in two modes depending on whether `--primary-dihedrals` is
+provided.
+
+#### Primary-dihedral mode (recommended for aspirin conformational analysis)
+
+Distance is computed solely in the sin/cos space of the specified dihedral
+angles. No PCA or StandardScaler is needed. This mode ensures the selection is
+driven by the dihedral angles you care about most — for aspirin, the carboxyl
+and ester dihedrals are the primary conformational degrees of freedom.
+
+```bash
+python scripts/select_configurations.py \
+    --reference initial.xyz \
+    --trajectory CCSD_newdata/aspirin.xc.xyz \
+    --radius 0.5 \
+    --n-configs 50 \
+    --output outputs/selected.xyz \
+    --pimd \
+    --primary-dihedrals 6 5 10 7 \
+    --primary-dihedrals 5 6 12 11
+```
+
+#### Full-descriptor mode (default)
+
+Distance is computed in PCA-reduced internal-coordinate space (all bonds,
+angles, dihedrals, ring planarity). The `DescriptorPipeline` is fit on the
+trajectory. Distances are **not** directly comparable to the Mahalanobis OOD
+scores produced by the main pipeline.
 
 ```bash
 python scripts/select_configurations.py \
@@ -79,15 +103,18 @@ python scripts/select_configurations.py \
     --pimd
 ```
 
+#### Arguments
+
 | Argument | Required | Description |
 |----------|----------|-------------|
 | `--reference` | yes | Single-frame XYZ file used as the origin of the distance measurement |
 | `--trajectory` | yes | MD or PIMD centroid trajectory file |
-| `--radius` | yes | Maximum Euclidean distance in descriptor space |
+| `--radius` | yes | Maximum Euclidean distance in the chosen descriptor space |
 | `--n-configs` | yes | Number of configurations to select |
 | `--output` | yes | Output extxyz file path |
 | `--pimd` | no | Pass when the trajectory is an iPI-format file (e.g. `aspirin.xc.xyz`); omit for extended-XYZ MD files |
-| `--pca-variance` | no | Fraction of variance retained by PCA (default: `0.95`) |
+| `--primary-dihedrals I J K L` | no | Use only these dihedral angles for distance computation; repeat for each dihedral |
+| `--pca-variance` | no | (Full-descriptor mode only) Fraction of variance retained by PCA (default: `0.95`) |
 
 **Output format:** a single extxyz file. The first frame is the reference
 configuration (`source=reference`). The remaining frames are the selected
