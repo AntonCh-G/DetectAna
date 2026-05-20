@@ -47,9 +47,36 @@ files.
 **Unit mismatch** — PIMD forces in atomic units (Hartree/Bohr); reference forces
 in eV/Å. Conversion required: 1 Hartree/Bohr ≈ 51.4221 eV/Å.
 
+## MLFF
+
+**MLFF (machine learning force field)** — a neural network trained to predict
+energies and forces from atomic positions. Produces the PIMD trajectories
+DetectAna analyses. The MLFF is an external system; DetectAna does not load or
+call it during the main pipeline. One trained MLFF per quantum-chemical method
+(PBE0, CCSD, RPA, VMC, VD); multiple PIMD runs with the same method share one
+checkpoint.
+
+**MlffModel** — the specific MLFF architecture used in this project. A message-
+passing equivariant graph neural network with SO(3)-symmetric transformer blocks.
+Relevant output: `inv_features`, the invariant per-atom embedding after the last
+transformer layer. Shape `(n_atoms, n_features)`, e.g. `(21, 128)`. Extracted
+via `return_descriptors=True` in the forward pass. Lives in a separate codebase
+(`mlff_torch`); DetectAna never imports it.
+
+**Atomic embedding** — the `inv_features` tensor produced by MlffModel for one
+frame. Rotation-invariant; encodes the local chemical environment of each atom
+as learned by the MLFF during training. Used as the basis for the embedding OOD
+track.
+
+**Pre-computed embeddings** — MlffModel inference results written to HDF5 files
+before DetectAna runs. One HDF5 file per bead trajectory (`embedding_glob`),
+one for the centroid (`centroid_embedding_h5`), one for the reference training
+set. DetectAna reads these files; it does not trigger MLFF inference.
+
 ## Descriptors
 
-**Internal coordinate fingerprint** — the primary descriptor for OOD scoring.
+**Internal coordinate fingerprint** — the primary descriptor for the geometric
+OOD track.
 Composed of: all pairwise bond lengths, bond angles, dihedral torsions (encoded
 as sin/cos pairs to handle periodicity), and ring planarity deviation for the
 benzene ring. Computed for every frame (bead or centroid). Feature vector is
@@ -60,15 +87,17 @@ only.
 internal coordinate fingerprint. Fit on training reference frames only. Used to
 project bead/centroid frames for Mahalanobis OOD scoring.
 
-**Mahalanobis distance** — primary OOD score. Computed in the PCA-reduced space
-using the covariance of training projections. Higher = more out-of-distribution.
+**Mahalanobis distance** — OOD score used by both tracks. Computed from a fitted
+mean and inverse covariance. Higher = more out-of-distribution. In the geometric
+track: computed in PCA-reduced internal-coordinate space. In the embedding track:
+computed per atom in the 128-dimensional `inv_features` space.
 
 ## Anomaly Detection
 
-**OOD threshold** — 99th percentile of Mahalanobis distances computed on the
-validation set frames. Fit on training set only; calibrated on held-out
-validation set. No PIMD trajectory frames leak into threshold calibration unless
-explicitly configured.
+**OOD threshold** — 99th percentile of scores computed on the validation set.
+Fit on training set only; calibrated on held-out validation set. No PIMD
+trajectory frames leak into threshold calibration. One threshold per track
+(geometric and embedding).
 
 **OOD (out-of-distribution)** — a frame whose descriptor falls outside the
 distribution of the reference training set. OOD does *not* automatically imply
@@ -78,11 +107,36 @@ chemically impossible; it means the MLFF is being asked to extrapolate.
 torsions, ring planarity, and close contacts. Separate from OOD score.
 A frame can be OOD without failing chemical validity and vice versa.
 
-**Anomaly onset** — the first time in a run where anomaly signals become
-persistent (not a single-frame spike). Detected by a sliding window over bead-
-aggregated scores: onset = first window where fraction of frames above OOD
+**Geometric OOD score** — Mahalanobis distance in PCA-reduced internal-coordinate
+space. Flags structural outliers: unusual bonds, angles, dihedrals, ring
+planarity. One scalar per frame (bead or centroid).
+
+**Embedding OOD score** — per-atom Mahalanobis distance in MlffModel `inv_features`
+space. Flags model-reliability outliers: frames the MLFF has not encountered
+during training, where energy/force predictions are likely extrapolating. One
+scalar per atom per frame; aggregated to one scalar per frame via max over all 21
+atoms. Computed at a configurable stride and optional frame range.
+
+**Geometric onset** — anomaly onset derived from the geometric OOD track.
+
+**Embedding onset** — anomaly onset derived from the embedding OOD track.
+Comparable to geometric onset; the two are always shown side-by-side in the
+output table. Represents the first moment the MLFF enters an extrapolation
+regime, independent of whether the geometry is yet visibly anomalous.
+
+**Anomaly onset** — generic term for either geometric or embedding onset. Detected
+by a sliding window: onset = first window where fraction of frames above OOD
 threshold exceeds a configured fraction threshold. Window size, step size, and
 fraction threshold are versioned config parameters.
+
+**Embedding stride** — frames between successive MlffModel inference calls.
+Independent of the geometric pipeline stride. Configured per-run to manage GPU
+inference cost.
+
+**Frame range** — optional `[frame_start, frame_end)` window that restricts
+embedding OOD computation to a subrange of the trajectory. Frames outside the
+range have no embedding score. Useful for focusing expensive inference around a
+region of interest (e.g., near the geometric onset).
 
 ## Aggregation Levels
 

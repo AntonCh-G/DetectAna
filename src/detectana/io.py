@@ -161,6 +161,42 @@ def load_reference_frames(
 
 
 # ---------------------------------------------------------------------------
+# Pre-computed MlffModel embedding reader (HDF5)
+# ---------------------------------------------------------------------------
+
+def load_embeddings_h5(
+    h5_path: str | Path,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Load pre-computed MlffModel inv_features from an HDF5 file.
+
+    Expected HDF5 layout (written by scripts/extract_embeddings.py):
+    - ``inv_features`` : (n_frames, n_atoms, n_features)  float32 or float64
+    - ``steps``        : (n_frames,)                       int64
+
+    Parameters
+    ----------
+    h5_path : path to a bead or centroid embedding HDF5 file.
+
+    Returns
+    -------
+    embeddings : (n_frames, n_atoms, n_features)  float64
+    steps      : (n_frames,)                       int64
+    """
+    try:
+        import h5py
+    except ImportError as exc:
+        raise ImportError(
+            "h5py is required to read embedding files. "
+            "Install it with: pip install h5py"
+        ) from exc
+
+    with h5py.File(h5_path, "r") as fh:
+        embeddings = fh["inv_features"][()].astype(np.float64)
+        steps = fh["steps"][()].astype(np.int64)
+    return embeddings, steps
+
+
+# ---------------------------------------------------------------------------
 # Single-frame reader (for initial.xyz topology seed)
 # ---------------------------------------------------------------------------
 

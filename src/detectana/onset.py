@@ -40,6 +40,16 @@ class OnsetResult:
     # Which bead (0-based index) first exceeded the OOD threshold
     first_anomaly_bead_idx: int | None = None
 
+    # ── Embedding OOD track ────────────────────────────────────────────────
+    # None when embedding track is disabled or the criterion was never met.
+    # Frame indices are relative to the embedding-scored subset (not the full
+    # trajectory), because embedding inference may cover only a strided
+    # frame range.
+    embedding_persistent_bead_onset_step: int | None = None
+    embedding_persistent_bead_onset_frame: int | None = None
+    embedding_centroid_onset_step: int | None = None
+    embedding_centroid_onset_frame: int | None = None
+
     def to_dict(self) -> dict:
         return {
             "first_bead_anomaly_step": self.first_bead_anomaly_step,
@@ -51,6 +61,10 @@ class OnsetResult:
             "centroid_anomaly_frame": self.centroid_anomaly_frame,
             "collective_anomaly_frame": self.collective_anomaly_frame,
             "first_anomaly_bead_idx": self.first_anomaly_bead_idx,
+            "embedding_persistent_bead_onset_step": self.embedding_persistent_bead_onset_step,
+            "embedding_persistent_bead_onset_frame": self.embedding_persistent_bead_onset_frame,
+            "embedding_centroid_onset_step": self.embedding_centroid_onset_step,
+            "embedding_centroid_onset_frame": self.embedding_centroid_onset_frame,
         }
 
 
@@ -104,6 +118,27 @@ def detect_onset(
             break
     collective_step = int(steps[collective_idx]) if collective_idx is not None else None
 
+    # ── Embedding onset (optional — only when columns are present) ────────────
+    emb_pb_step = emb_pb_frame = emb_c_step = emb_c_frame = None
+    if "emb_bead_frac_ood" in aggregate_df.columns:
+        valid = aggregate_df["emb_bead_frac_ood"].notna()
+        emb_sub = aggregate_df.loc[valid].reset_index(drop=True)
+        orig_indices = np.where(valid.to_numpy())[0]
+
+        emb_steps_sub = emb_sub["step"].to_numpy(dtype=np.int64)
+        emb_bead_frac = emb_sub["emb_bead_frac_ood"].to_numpy(dtype=np.float64)
+        emb_cent_ood = emb_sub["emb_centroid_ood"].to_numpy(dtype=np.float64)
+
+        emb_pb_idx = _windowed_onset(emb_bead_frac, window_frames, step_frames, fraction_threshold)
+        if emb_pb_idx is not None:
+            emb_pb_step = int(emb_steps_sub[emb_pb_idx])
+            emb_pb_frame = int(orig_indices[emb_pb_idx])
+
+        emb_c_idx = _windowed_onset(emb_cent_ood, window_frames, step_frames, fraction_threshold)
+        if emb_c_idx is not None:
+            emb_c_step = int(emb_steps_sub[emb_c_idx])
+            emb_c_frame = int(orig_indices[emb_c_idx])
+
     return OnsetResult(
         first_bead_anomaly_step=first_bead_step,
         persistent_bead_anomaly_step=persistent_bead_step,
@@ -113,6 +148,10 @@ def detect_onset(
         persistent_bead_anomaly_frame=persistent_bead_idx,
         centroid_anomaly_frame=centroid_idx,
         collective_anomaly_frame=collective_idx,
+        embedding_persistent_bead_onset_step=emb_pb_step,
+        embedding_persistent_bead_onset_frame=emb_pb_frame,
+        embedding_centroid_onset_step=emb_c_step,
+        embedding_centroid_onset_frame=emb_c_frame,
     )
 
 

@@ -25,9 +25,10 @@ import pandas as pd
 from joblib import Parallel, delayed
 
 from detectana import __version__
-from detectana.aggregator import aggregate_bead_scores, bead_score_summary
+from detectana.aggregator import add_embedding_scores, aggregate_bead_scores, bead_score_summary
 from detectana.descriptors import DescriptorPipeline, compute_descriptor_batch
-from detectana.io import iter_bead_positions, load_reference_frames, load_single_frame
+from detectana.embedding_scorer import EmbeddingPipeline
+from detectana.io import iter_bead_positions, load_embeddings_h5, load_reference_frames, load_single_frame
 from detectana.onset import OnsetResult, detect_onset
 from detectana.scorer import MahalanobisScorer
 from detectana.topology import AspirinTopology, build_topology, check_chemistry_batch  # noqa: F401
@@ -109,6 +110,29 @@ def run_pipeline(cfg: dict) -> None:
     pipe.save(models_dir / "descriptor_pipeline.pkl")
     scorer.save(models_dir / "scorer.pkl")
 
+    # ── Embedding scorer (optional) ────────────────────────────────────────────
+    emb_cfg = cfg.get("embedding", {})
+    emb_pipe: EmbeddingPipeline | None = None
+    emb_threshold: float | None = None
+
+    if emb_cfg.get("enabled", False):
+        log.info("Fitting embedding OOD scorer …")
+        from detectana.io import load_embeddings_h5 as _load_emb
+        ref_train_emb, _ = _load_emb(emb_cfg["reference_train_h5"])
+        ref_val_emb, _   = _load_emb(emb_cfg["reference_valid_h5"])
+
+        emb_pipe = EmbeddingPipeline()
+        emb_pipe.fit(ref_train_emb)
+        emb_threshold = emb_pipe.calibrate(
+            ref_val_emb,
+            percentile=cfg["threshold"]["percentile"],
+        )
+        log.info(
+            "Embedding OOD threshold (%.1f-th pct of validation): %.4f",
+            cfg["threshold"]["percentile"], emb_threshold,
+        )
+        emb_pipe.save(models_dir / "embedding_pipeline.pkl")
+
     # ── Per-run processing ────────────────────────────────────────────────────
     manifest_base = {
         "detectana_version": __version__,
@@ -130,6 +154,9 @@ def run_pipeline(cfg: dict) -> None:
             pipe=pipe,
             scorer=scorer,
             threshold=threshold,
+            emb_pipe=emb_pipe,
+            emb_threshold=emb_threshold,
+            emb_cfg=emb_cfg,
             cfg=cfg,
             out_root=out_root,
         )
@@ -160,6 +187,9 @@ def _process_run(
     pipe: DescriptorPipeline,
     scorer: MahalanobisScorer,
     threshold: float,
+    emb_pipe: EmbeddingPipeline | None,
+    emb_threshold: float | None,
+    emb_cfg: dict,
     cfg: dict,
     out_root: Path,
 ) -> OnsetResult:
@@ -257,6 +287,30 @@ def _process_run(
         threshold=threshold,
         frame_time_fs=frame_time_fs,
     )
+
+    # ── Embedding track (optional) ────────────────────────────────────────────
+    if emb_pipe is not None and emb_threshold is not None:
+        emb_bead_glob = run_cfg.get("embedding_glob", "")
+        emb_centroid_h5 = run_cfg.get("centroid_embedding_h5", "")
+
+        if emb_bead_glob and emb_centroid_h5:
+            log.info("Scoring embedding track for run '%s' …", run_name)
+            agg_df = _add_embedding_track(
+                agg_df=agg_df,
+                emb_bead_glob=emb_bead_glob,
+                emb_centroid_h5=emb_centroid_h5,
+                emb_pipe=emb_pipe,
+                emb_threshold=emb_threshold,
+                emb_cfg=emb_cfg,
+                run_out=run_out,
+                n_jobs=n_jobs,
+            )
+        else:
+            log.warning(
+                "Embedding enabled but 'embedding_glob' or 'centroid_embedding_h5' "
+                "missing from run '%s' — skipping embedding track.", run_name,
+            )
+
     agg_df.to_csv(run_out / "frame_aggregate.csv", index=False)
     log.info("Saved frame_aggregate.csv (%d frames)", len(agg_df))
 
@@ -435,6 +489,88 @@ def _chemistry_check_chunked(
 
 
 # ---------------------------------------------------------------------------
+# Embedding track helpers
+# ---------------------------------------------------------------------------
+
+def _score_bead_embedding(
+    bead_h5: str,
+    emb_pipe: EmbeddingPipeline,
+    bead_idx: int,
+) -> tuple[int, np.ndarray, np.ndarray]:
+    """Load one bead's pre-computed embeddings and return its OOD scores.
+
+    Returns (bead_idx, scores, steps).
+    """
+    embeddings, steps = load_embeddings_h5(bead_h5)
+    scores = emb_pipe.score(embeddings)
+    log.info(
+        "Embedding bead %02d scored: max=%.3f, n_frames=%d",
+        bead_idx, scores.max(), len(scores),
+    )
+    return bead_idx, scores, steps
+
+
+def _add_embedding_track(
+    agg_df: pd.DataFrame,
+    emb_bead_glob: str,
+    emb_centroid_h5: str,
+    emb_pipe: EmbeddingPipeline,
+    emb_threshold: float,
+    emb_cfg: dict,
+    run_out: Path,
+    n_jobs: int,
+) -> pd.DataFrame:
+    """Score all bead and centroid embedding HDF5 files and merge into agg_df."""
+    bead_h5_files = sorted(glob.glob(emb_bead_glob))
+    if not bead_h5_files:
+        raise FileNotFoundError(f"No embedding bead files matched: {emb_bead_glob}")
+    log.info("Found %d embedding bead files", len(bead_h5_files))
+
+    emb_results: list[tuple[int, np.ndarray, np.ndarray]] = Parallel(n_jobs=n_jobs)(
+        delayed(_score_bead_embedding)(bead_h5, emb_pipe, bead_idx)
+        for bead_idx, bead_h5 in enumerate(bead_h5_files)
+    )
+    emb_results.sort(key=lambda r: r[0])
+
+    # Guard against mismatched frame counts across bead embedding files
+    n_emb_frames_ref = emb_results[0][1].shape[0]
+    for bead_idx, scores, _ in emb_results:
+        if scores.shape[0] != n_emb_frames_ref:
+            raise ValueError(
+                f"Embedding bead {bead_idx:02d} has {scores.shape[0]} frames; "
+                f"expected {n_emb_frames_ref}. Check for mismatched HDF5 files."
+            )
+
+    emb_bead_scores = np.stack([s for _, s, _ in emb_results])  # (n_beads, n_emb_frames)
+    emb_steps = emb_results[0][2]
+    np.save(run_out / "emb_bead_scores.npy", emb_bead_scores)
+
+    # Centroid
+    emb_centroid_emb, emb_centroid_steps = load_embeddings_h5(emb_centroid_h5)
+    emb_centroid_scores = emb_pipe.score(emb_centroid_emb)
+    np.save(run_out / "emb_centroid_scores.npy", emb_centroid_scores)
+
+    # Align bead and centroid step arrays
+    if len(emb_steps) != len(emb_centroid_steps):
+        log.warning(
+            "Embedding bead step count %d ≠ centroid step count %d — truncating to min",
+            len(emb_steps), len(emb_centroid_steps),
+        )
+        n = min(len(emb_steps), len(emb_centroid_steps))
+        emb_steps = emb_steps[:n]
+        emb_bead_scores = emb_bead_scores[:, :n]
+        emb_centroid_scores = emb_centroid_scores[:n]
+
+    return add_embedding_scores(
+        agg_df=agg_df,
+        emb_bead_scores=emb_bead_scores,
+        emb_centroid_scores=emb_centroid_scores,
+        emb_steps=emb_steps,
+        emb_threshold=emb_threshold,
+    )
+
+
+# ---------------------------------------------------------------------------
 # Plotting
 # ---------------------------------------------------------------------------
 
@@ -452,34 +588,57 @@ def _make_plots(
     plots_dir = out_dir / "plots"
     plots_dir.mkdir(exist_ok=True)
 
+    has_emb = "emb_bead_max" in agg_df.columns
+    n_panels = 6 if has_emb else 3
     time_ps = agg_df["time_ps"].to_numpy()
 
-    fig, axes = plt.subplots(3, 1, figsize=(12, 9), sharex=True)
+    fig, axes = plt.subplots(n_panels, 1, figsize=(12, 3 * n_panels), sharex=True)
 
-    # Panel 1: bead max + p95 + threshold
+    # ── Geometric track ───────────────────────────────────────────────────────
     ax = axes[0]
     ax.plot(time_ps, agg_df["bead_max"], lw=0.5, label="bead max", color="steelblue")
     ax.plot(time_ps, agg_df["bead_p95"], lw=0.5, label="bead p95", color="cornflowerblue")
     ax.axhline(threshold, color="red", ls="--", lw=1, label=f"threshold={threshold:.2f}")
-    _mark_onset(ax, time_ps, onset.persistent_bead_anomaly_frame, "persistent bead", "orange")
+    _mark_onset(ax, time_ps, onset.persistent_bead_anomaly_frame, "geo bead onset", "orange")
     ax.set_ylabel("Mahalanobis distance")
     ax.legend(fontsize=7)
-    ax.set_title(f"{run_name} — bead scores")
+    ax.set_title(f"{run_name} — geometric track")
 
-    # Panel 2: bead fraction OOD
     ax = axes[1]
     ax.plot(time_ps, agg_df["bead_frac_ood"], lw=0.5, color="darkorange", label="bead frac OOD")
     ax.set_ylabel("Fraction OOD")
     ax.legend(fontsize=7)
 
-    # Panel 3: centroid score
     ax = axes[2]
     ax.plot(time_ps, agg_df["centroid_score"], lw=0.5, color="forestgreen", label="centroid score")
     ax.axhline(threshold, color="red", ls="--", lw=1)
-    _mark_onset(ax, time_ps, onset.centroid_anomaly_frame, "centroid onset", "purple")
+    _mark_onset(ax, time_ps, onset.centroid_anomaly_frame, "geo centroid onset", "purple")
     ax.set_ylabel("Mahalanobis distance")
-    ax.set_xlabel("Time (ps)")
     ax.legend(fontsize=7)
+    if not has_emb:
+        ax.set_xlabel("Time (ps)")
+
+    # ── Embedding track (when present) ───────────────────────────────────────
+    if has_emb:
+        ax = axes[3]
+        ax.plot(time_ps, agg_df["emb_bead_max"], lw=0.5, label="emb bead max", color="royalblue")
+        ax.plot(time_ps, agg_df["emb_bead_p95"], lw=0.5, label="emb bead p95", color="skyblue")
+        _mark_onset(ax, time_ps, onset.embedding_persistent_bead_onset_frame, "emb bead onset", "orange")
+        ax.set_ylabel("Emb. Mahalanobis")
+        ax.legend(fontsize=7)
+        ax.set_title(f"{run_name} — embedding track")
+
+        ax = axes[4]
+        ax.plot(time_ps, agg_df["emb_bead_frac_ood"], lw=0.5, color="darkorange", label="emb bead frac OOD")
+        ax.set_ylabel("Fraction OOD")
+        ax.legend(fontsize=7)
+
+        ax = axes[5]
+        ax.plot(time_ps, agg_df["emb_centroid_score"], lw=0.5, color="teal", label="emb centroid score")
+        _mark_onset(ax, time_ps, onset.embedding_centroid_onset_frame, "emb centroid onset", "purple")
+        ax.set_ylabel("Emb. Mahalanobis")
+        ax.set_xlabel("Time (ps)")
+        ax.legend(fontsize=7)
 
     plt.tight_layout()
     fig.savefig(plots_dir / "score_vs_time.png", dpi=150)

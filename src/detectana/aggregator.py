@@ -65,6 +65,59 @@ def aggregate_bead_scores(
     })
 
 
+def add_embedding_scores(
+    agg_df: pd.DataFrame,
+    emb_bead_scores: np.ndarray,
+    emb_centroid_scores: np.ndarray,
+    emb_steps: np.ndarray,
+    emb_threshold: float,
+) -> pd.DataFrame:
+    """Merge embedding OOD scores into the per-timestep aggregate table.
+
+    Only frames covered by ``emb_steps`` are filled; all other rows get NaN,
+    reflecting that embedding inference was not run there (stride / frame range).
+
+    Parameters
+    ----------
+    agg_df : output of ``aggregate_bead_scores`` — must have a ``step`` column.
+    emb_bead_scores : (n_beads, n_emb_frames) — per-bead embedding OOD scores
+    emb_centroid_scores : (n_emb_frames,) — centroid embedding OOD scores
+    emb_steps : (n_emb_frames,) — simulation step indices for the scored frames
+    emb_threshold : float — embedding OOD threshold (from EmbeddingPipeline.threshold)
+
+    Returns
+    -------
+    DataFrame with added columns:
+        emb_bead_max, emb_bead_p95, emb_bead_frac_ood,
+        emb_centroid_score, emb_centroid_ood
+    """
+    if emb_bead_scores.ndim != 2:
+        raise ValueError(
+            f"emb_bead_scores must be 2-D (n_beads, n_emb_frames), "
+            f"got shape {emb_bead_scores.shape}"
+        )
+    if emb_centroid_scores.shape[0] != emb_bead_scores.shape[1]:
+        raise ValueError(
+            f"emb_centroid_scores length {emb_centroid_scores.shape[0]} != "
+            f"n_emb_frames {emb_bead_scores.shape[1]}"
+        )
+
+    emb_bead_max = emb_bead_scores.max(axis=0)
+    emb_bead_p95 = np.percentile(emb_bead_scores, 95, axis=0)
+    emb_bead_frac_ood = (emb_bead_scores > emb_threshold).mean(axis=0)
+
+    emb_df = pd.DataFrame({
+        "step": emb_steps.astype(np.int64),
+        "emb_bead_max": emb_bead_max,
+        "emb_bead_p95": emb_bead_p95,
+        "emb_bead_frac_ood": emb_bead_frac_ood,
+        "emb_centroid_score": emb_centroid_scores,
+        "emb_centroid_ood": (emb_centroid_scores > emb_threshold).astype(np.float64),
+    })
+
+    return agg_df.merge(emb_df, on="step", how="left")
+
+
 def bead_score_summary(bead_scores: np.ndarray, threshold: float) -> dict:
     """Return scalar summary statistics for a full bead score matrix.
 
