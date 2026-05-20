@@ -87,6 +87,15 @@ only.
 internal coordinate fingerprint. Fit on training reference frames only. Used to
 project bead/centroid frames for Mahalanobis OOD scoring.
 
+**Descriptor space** — the PCA-reduced internal-coordinate space. The
+coordinate system in which inter-frame distances are computed for configuration
+selection and OOD scoring. A point in descriptor space is the PCA projection of
+a single frame's standardized internal-coordinate fingerprint. When used for
+configuration selection from a trajectory, the PCA is fit on the trajectory
+itself; this space is distinct from the training-set-fitted descriptor space
+used by the main OOD pipeline, and distances between the two are not
+directly comparable.
+
 **Mahalanobis distance** — OOD score used by both tracks. Computed from a fitted
 mean and inverse covariance. Higher = more out-of-distribution. In the geometric
 track: computed in PCA-reduced internal-coordinate space. In the embedding track:

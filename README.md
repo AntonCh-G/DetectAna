@@ -56,6 +56,51 @@ Output: `outputs/<run>/extraction_bead<NN>_frame<FFFF>_N<N>_M<M>.xyz`
 - `persistent` (default) — first window where bead fraction OOD exceeds threshold (canonical onset)
 - `first` — first single frame any bead exceeded the threshold
 
+### Select diverse configurations from a trajectory
+
+Select N configurations from an MD or PIMD trajectory that are **farthest from
+a reference configuration in descriptor space** (PCA-reduced internal
+coordinates), while staying within a given distance radius. Useful for building
+a diverse, geometrically varied subset of frames for inspection, further
+inference, or active-learning candidate sets.
+
+The script fits the `DescriptorPipeline` (StandardScaler + PCA) on the
+trajectory itself, so the descriptor space reflects the trajectory's own
+variance. Distances are Euclidean in PCA space and are **not** directly
+comparable to the Mahalanobis OOD scores produced by the main pipeline.
+
+```bash
+python scripts/select_configurations.py \
+    --reference initial.xyz \
+    --trajectory CCSD_newdata/aspirin.xc.xyz \
+    --radius 5.0 \
+    --n-configs 50 \
+    --output outputs/selected.xyz \
+    --pimd
+```
+
+| Argument | Required | Description |
+|----------|----------|-------------|
+| `--reference` | yes | Single-frame XYZ file used as the origin of the distance measurement |
+| `--trajectory` | yes | MD or PIMD centroid trajectory file |
+| `--radius` | yes | Maximum Euclidean distance in descriptor space |
+| `--n-configs` | yes | Number of configurations to select |
+| `--output` | yes | Output extxyz file path |
+| `--pimd` | no | Pass when the trajectory is an iPI-format file (e.g. `aspirin.xc.xyz`); omit for extended-XYZ MD files |
+| `--pca-variance` | no | Fraction of variance retained by PCA (default: `0.95`) |
+
+**Output format:** a single extxyz file. The first frame is the reference
+configuration (`source=reference`). The remaining frames are the selected
+configurations in descending order of descriptor-space distance, each annotated
+with:
+
+```
+source_frame=<int>  source_step=<int>  descriptor_distance=<float>
+```
+
+If fewer than `--n-configs` frames fall within the radius, the script emits a
+warning and writes all qualifying frames rather than failing.
+
 ## Configuration
 
 All paths, thresholds, and hyperparameters live in `config/default.yaml`.
@@ -143,15 +188,18 @@ Covers the full AGENTS.md validation checklist:
 
 ```
 src/detectana/
-  io.py           XYZ loaders (chunked bead + reference)
-  topology.py     Bond graph, angles, dihedrals, ring, hard-chemistry checks
-  descriptors.py  Internal-coord fingerprint + StandardScaler + PCA
-  scorer.py       Mahalanobis OOD scorer + threshold calibration
-  aggregator.py   Per-timestep bead-score aggregation
-  onset.py        Windowed fraction onset detector
-  pipeline.py     Full 10-step orchestrator
+  io.py               XYZ loaders (chunked bead, reference, full trajectory)
+  topology.py         Bond graph, angles, dihedrals, ring, hard-chemistry checks
+  descriptors.py      Internal-coord fingerprint + StandardScaler + PCA
+  scorer.py           Mahalanobis OOD scorer + threshold calibration
+  aggregator.py       Per-timestep bead-score aggregation
+  onset.py            Windowed fraction onset detector
+  pipeline.py         Full 10-step orchestrator
 scripts/
-  run_pipeline.py CLI entry point
+  run_pipeline.py             Full anomaly-detection pipeline
+  extract_onset_frames.py     Extract frames around anomaly onset
+  select_configurations.py    Select diverse configurations from a trajectory
+  extract_embeddings.py       Extract MlffModel inv_features to HDF5
 config/
   default.yaml    All parameters (paths, thresholds, window settings)
 tests/

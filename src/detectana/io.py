@@ -197,6 +197,42 @@ def load_embeddings_h5(
 
 
 # ---------------------------------------------------------------------------
+# Full-trajectory loader (MD extxyz or PIMD iPI format)
+# ---------------------------------------------------------------------------
+
+def load_trajectory_frames(
+    path: str | Path,
+    pimd: bool = False,
+) -> tuple[list[Atoms], np.ndarray]:
+    """Load all frames from an MD (extxyz) or PIMD centroid (iPI) XYZ file.
+
+    Parameters
+    ----------
+    path : path to trajectory file.
+    pimd : True → read as iPI-format XYZ (e.g. ``aspirin.xc.xyz``);
+           False → read as extended XYZ (e.g. reference dataset files).
+
+    Returns
+    -------
+    atoms_list : list of Atoms, one per frame (validated against aspirin)
+    steps      : (n_frames,)  int64 — MD step numbers parsed from comment lines;
+                 falls back to frame index when the comment carries no Step field.
+    """
+    path = Path(path)
+    fmt = "xyz" if pimd else "extxyz"
+    atoms_list: list[Atoms] = []
+    steps: list[int] = []
+    for frame_idx, atoms in enumerate(iread(str(path), format=fmt)):
+        validate_frame(atoms, frame_idx, source=path.name)
+        atoms_list.append(atoms)
+        m = _STEP_RE.search(str(atoms.info))
+        steps.append(int(m.group(1)) if m else frame_idx)
+    if not atoms_list:
+        raise ValueError(f"No frames found in {path}")
+    return atoms_list, np.array(steps, dtype=np.int64)
+
+
+# ---------------------------------------------------------------------------
 # Single-frame reader (for initial.xyz topology seed)
 # ---------------------------------------------------------------------------
 
