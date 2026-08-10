@@ -51,6 +51,62 @@ Calibrating on the trajectory would define anomalies relative to the anomalous
 run itself, which quietly suppresses exactly what you are looking for. There is
 a test for this, and it should stay.
 
+## The window rule is the detector, not the threshold
+
+A threshold calibrated to flag a fraction α of in-distribution frames flags about
+α of any long run by construction. At α = 1 % over 200,000 frames that is ~2000
+flagged frames per bead, and the first arrives after ~100 frames, which is a few
+picoseconds. So `first_bead_anomaly` says nothing about the trajectory; it is a
+restatement of the threshold. It stays in the output because it is a useful
+diagnostic, but it is not an onset and must not be reported as one.
+
+What controls false alarms is the windowed criterion: the fraction of a window
+that has to be flagged. The pipeline computes and records that trade-off for
+every run rather than leaving it implicit. The null model is that flags inside a
+window are Bernoulli(α); frame-to-frame correlation is handled by converting the
+window to an effective sample size (AR(1), from the lag-1 autocorrelation measured
+on the opening `stable_fraction` of the run, default 0.1), and overlapping windows
+by a union bound. Both approximations run the same way, so the reported
+probability is an upper bound on the false-alarm rate, not an estimate of it. A
+second number counting only disjoint windows is reported alongside it, so the
+width of that conservatism is visible instead of assumed.
+
+Two consequences worth keeping:
+
+- Prefer stating a false-alarm budget over guessing a fraction. Given α, the
+  window and the budget, there is a unique loosest fraction that stays inside it,
+  and that is the most sensitive rule available. `fraction_threshold: 0.20` with
+  α = 1 % has a bound near 10⁻⁹¹ — it needs 100 of 500 frames flagged, so it is
+  safe and insensitive at once, and a real partial excursion can pass under it.
+- Do not assume frames are independent. Reference scores in this project show a
+  lag-1 autocorrelation near 0.3, and a trajectory is worse. Assuming
+  independence inflates the effective sample size and understates false alarms.
+
+Beads count as one observation per timestep unless you have measured otherwise.
+They are path-integral images of one molecule, so treating 16 beads as 16
+independent draws would understate the false-alarm rate by orders of magnitude.
+
+## A distortion is not an anomaly
+
+Synthetic anomalies are the only labelled positives available, and the tempting
+shortcut — distort a frame by a lot, call it out of distribution — is wrong. If the
+training set already samples the region the distortion lands in, the frame *is* in
+distribution and flagging it would be the error.
+
+This is not hypothetical. Rotating aspirin's ester torsion by 180° produces a
+perfectly ordinary frame, because the reference set covers that torsion's whole
+circle, and an early version of the benchmark scored the detector at AUROC 0.52 on
+exactly that basis before the mislabelling was found.
+
+So every synthetic positive is labelled by training coverage, and the two regimes
+are reported separately: flag rate where training data is dense is a false-alarm
+measurement, flag rate where there is none is a sensitivity measurement. Averaging
+them describes nothing. See [adr/0004-detector-evaluation.md](adr/0004-detector-evaluation.md).
+
+The same benchmark is where "out of distribution is not unphysical" stops being a
+slogan: a torsion slice holding 5 of 2500 training frames is flagged every time,
+and those conformers are chemically unremarkable.
+
 ## Report the three levels separately
 
 Bead, centroid and run are different things and get their own rows:
@@ -71,6 +127,12 @@ Atom count and atom order are checked against `initial.xyz` on every frame, and
 a mismatch is a hard failure rather than a warning. Internal coordinates are
 computed from index triples and quadruples, so a reordered file produces
 descriptors that are wrong in a way nothing downstream can detect.
+
+`initial.xyz` is the reference, not a hard-coded molecule: the first run's file
+defines the expected atom count and element order (`io.MoleculeSpec`), and the
+reference set, the other runs' initial geometries and every trajectory frame are
+validated against it. The binary XYZ reader and the HDF5 files carry no element
+symbols, so on those paths only the atom count can be checked.
 
 The same applies to bead counts and frame counts across bead files. A truncated
 bead file gives a shorter score array, and silently trimming it would misalign
@@ -122,12 +184,25 @@ the number.
 
 ## Known limitations
 
-Only positions go into the descriptor. Forces are loaded and unit-checked but
-not scored on, even though a force-based descriptor would likely catch some
-failures earlier.
+Only positions go into the descriptor. Forces are loaded and unit-checked but not
+scored on, even though a force-based descriptor would likely catch some failures
+earlier. Forces are used in one place, outside the pipeline:
+`scripts/score_vs_error.py` compares the score against force error.
 
-Frame validation is hard-coded to aspirin, 21 atoms in a fixed order. The
-descriptors themselves are general.
+Whether a high score actually predicts force-field error is not yet answered. The
+machinery exists and is validated on synthetic controls, but it needs forces
+recomputed with the reference method for the frames being analysed, which has not
+been run. Until it has, the score is a statement about training coverage only —
+which is all the repository claims for it.
+
+Only a single gas-phase molecule is supported. Internal coordinates are computed
+on raw coordinates with no periodic images, so a periodic cell or a second
+molecule in the file is not handled; a disconnected bond graph produces a warning
+and nothing more.
+
+Frame validation is no longer tied to aspirin: the reference atom count and
+element order come from `initial.xyz`. The molecule still has to be the same one
+throughout a run, which is the point of the check.
 
 Local atomic-environment descriptors of the SOAP or ACSF kind would be more
 expressive than internal coordinates. They were left out to avoid a heavy

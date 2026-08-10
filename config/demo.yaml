@@ -50,6 +50,10 @@ onset:
   window_frames: 5
   step_frames: 1
   fraction_threshold: 0.20
+  # Measure the frame autocorrelation instead of assuming frames are independent.
+  # With no false_alarm_budget set this only affects the reported false-alarm
+  # bound, not the detected onset. See config/example.yaml for the budget mode.
+  frame_autocorrelation: "auto"
 
 # ── Pipeline ─────────────────────────────────────────────────────────────────
 pipeline:

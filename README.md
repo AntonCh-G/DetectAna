@@ -53,10 +53,19 @@ It answers a slightly different question: not "is this structure unusual" but
 "has the model seen anything like this". Both onsets end up in the same table.
 See [docs/adr/0002-embedding-ood-track.md](docs/adr/0002-embedding-ood-track.md).
 
-One limitation worth knowing before you clone: the descriptors are generic, but
-the frame validation is not. Every frame is checked against aspirin, 21 atoms in
-a fixed order. Another molecule means editing the atom-count and atom-type check
-in [src/detectana/io.py](src/detectana/io.py) and rebuilding the topology.
+The pipeline was developed on aspirin but is not tied to it. The molecule comes
+from the run's `initial_xyz`: its atom count, element order and bond graph define
+everything downstream, and every reference and trajectory frame is then checked
+against that file. Point the config at another single molecule and it runs. A
+molecule with no benzene-like ring works too — the ring-planarity feature and
+flag are dropped, which makes the descriptor one column shorter, so the fit, the
+threshold and the scored frames all have to come from the same topology.
+
+Two limitations are still real. There is no periodic-boundary or multi-molecule
+support: internal coordinates are computed on raw coordinates, so this is a
+gas-phase single-molecule tool (a disconnected bond graph only earns a warning).
+And with several candidate rings the auto-detection picks the lowest-indexed one,
+so set `chemistry.ring_atoms` explicitly when the choice matters.
 
 ## An example run
 
@@ -71,6 +80,71 @@ brief excursion that the run recovers from.
 The middle panel is the reason bead scores are never averaged. Individual beads
 cross the threshold on and off throughout the first half of the run, long before
 anything happens collectively. Average them and that signal disappears.
+
+## How well does the detector work?
+
+A score that flags frames is not evidence until you know what it catches and what
+it misses, so [scripts/benchmark_detector.py](scripts/benchmark_detector.py)
+measures it against distortions of a known size. Held-out reference frames are the
+negatives; distorted copies of those frames are the positives. Nothing about the
+distorted frames reaches the fit or the threshold.
+
+![Detection rate against distortion size, and against training coverage](docs/images/detection_benchmark.png)
+
+The right panel is the whole argument in one picture: grey bars are how much
+training data sits at each torsion angle, the green line is how often the detector
+flags a frame placed there. Where the training data is, it stays silent. Where the
+training data is absent, it fires every time.
+
+Measured on the MD17-derived aspirin reference set (2500 training frames, 600
+held-out split into calibration and evaluation, 71 PCA components, α = 1 %):
+
+| distortion | magnitude | detected | also caught by the chemistry flags |
+|---|---|---|---|
+| Gaussian rattle | σ = 0.05 Å | 44 % | 0 % |
+| Gaussian rattle | σ = 0.10 Å | 100 % | 0 % |
+| bond stretch | δ = 0.30 Å | 39 % | 0 % |
+| bond stretch | δ = 0.50 Å | 100 % | 0 % |
+
+The bond-stretch rows are the useful ones: at 0.3–0.5 Å the OOD score fires while
+the hard-chemistry bond check is still silent, because its cutoff is 2.0 Å. The
+statistical track sees a strained bond well before it looks broken.
+
+**The result worth reporting is the torsion scan.** A rotatable torsion is driven
+right around its circle and each target angle is labelled by how often the training
+set visits it. Bond lengths and angles are untouched by construction — asserted in
+[tests/test_evaluation.py](tests/test_evaluation.py), not assumed — so this
+isolates conformational novelty:
+
+| target angle for C4-C11-O12-C6 | training frames in that 30° slice | flagged |
+|---|---|---|
+| ±165° | ~1200 | 0.3 % |
+| ±135° | 29–43 | 6–10 % |
+| −105° to +75° | 0 | 100 % |
+
+Spearman correlation between training density and flag rate: **−0.93**. The
+detector flags a conformer in proportion to how little training data supports it,
+which is the behaviour the definition of OOD demands. Note the +105° slice, which
+holds 5 frames out of 2500 and is flagged 100 % of the time: 0.2 % coverage is not
+coverage. That frame is chemically unremarkable, which is exactly why this
+repository insists that out of distribution and unphysical are different claims.
+
+An earlier version of this benchmark rotated whichever torsion split the molecule
+most evenly and reported AUROC ≈ 0.52, which looked like a blind spot. It was not:
+that torsion is fully sampled in the training set, so the rotated frames were
+genuinely in distribution and flagging them would have been an error. Labelling
+distorted frames as anomalies without checking coverage is a mistake worth
+avoiding.
+
+### Does a high score mean the force field is wrong there?
+
+The question that decides whether the score is a usable reliability estimate.
+[scripts/score_vs_error.py](scripts/score_vs_error.py) answers it given the same
+frames twice — once with reference forces, once with the force field's — and
+reports Spearman correlation, force error by score decile, and the top-to-bottom
+decile ratio. It needs recomputed reference forces, so it is not part of the demo;
+the machinery is validated on synthetic controls (no relationship → Spearman
+−0.01; injected relationship → +0.23 with a 2.4× decile ratio).
 
 ## Getting started
 
@@ -138,7 +212,9 @@ It writes `outputs/<run>/extraction_bead<NN>_frame<FFFF>_N<N>_M<M>.xyz`.
 `--onset-type` picks which frame to centre on:
 - `persistent` (default): the first window where the fraction of OOD beads
   exceeds the threshold. This is the onset the rest of the pipeline means.
-- `first`: the first single frame any bead went over.
+- `first`: the first single frame any bead went over. On a long run this is
+  almost always a false flag produced by the threshold itself — see
+  [Choosing the window rule](#choosing-the-window-rule).
 
 ### Picking a diverse set of configurations
 
@@ -291,9 +367,60 @@ onset:
   window_frames: 500
   step_frames: 50
   fraction_threshold: 0.20   # how much of the window must be OOD
+  frame_autocorrelation: "auto"
+  # false_alarm_budget: 0.01  # recommended instead of fraction_threshold
 ```
 
 Add another entry under `runs:` for a second run.
+
+### Choosing the window rule
+
+The `onset` block, not `threshold.percentile`, is what controls false alarms. A
+threshold calibrated to flag 1 % of in-distribution frames flags about 1 % of any
+long run as well: ~2000 frames out of 200,000, the first of them after ~100
+frames. `first_bead_anomaly` in the output is therefore a property of the
+threshold rather than of the trajectory — read it as a diagnostic, not an onset.
+Only the windowed criteria carry evidence.
+
+Every run now logs and records what its rule costs, so this is visible rather
+than implicit:
+
+```
+Onset rule: 13/230 effective flags per 500-frame window (fraction 0.0565);
+false-alarm bound 0.00306 per run (0.000306 counting disjoint windows only)
+```
+
+Two numbers because the first counts every window start as a separate test, even
+though windows that overlap by 90 % are nearly the same test. The truth is between
+them; the pipeline works from the pessimistic one.
+
+The 500-frame window is not 500 independent chances to flag, because consecutive
+frames are correlated; `frame_autocorrelation: "auto"` measures the lag-1
+correlation on the first `stable_fraction` of the run and converts the window to
+an effective sample size. Setting it to 0 assumes independence and makes the
+bound optimistic.
+
+Set `false_alarm_budget` and the fraction is derived from it — the loosest, most
+sensitive rule that keeps the run-level false-alarm probability inside the
+budget. This is the recommended direction: you state the false-alarm rate you can
+live with, rather than guessing a fraction. For 200,000 frames, a 1 % threshold
+and a 1 % budget:
+
+| autocorrelation | derived fraction | flags needed | bound per run |
+|---|---|---|---|
+| 0 (assumed independent) | 0.038 | 19 of 500 | 0.005 |
+| 0.37 (measured) | 0.057 | 13 of 230 | 0.003 |
+
+Compare the default `fraction_threshold: 0.20`, which needs 100 of 500 frames
+flagged for a bound near 10⁻⁹¹. That is safe to the point of being insensitive: it
+will miss a real but partial excursion. The defaults are unchanged, so nothing
+moves unless you set the budget, but the logged bound tells you where you stand.
+
+The arithmetic assumes flags inside a window are Bernoulli(α), corrects for
+frame correlation with an effective sample size, and unions over overlapping
+windows, so the reported probability is an upper bound. Beads count as one
+observation per timestep by default (`n_effective_beads: 1`), because beads are
+path-integral images of the same molecule and far from independent.
 
 ## Parallelism
 
@@ -358,27 +485,33 @@ runs them on Python 3.10, 3.11 and 3.12, and runs the demo pipeline end to end.
 
 ```
 src/detectana/
-  io.py               XYZ and HDF5 loaders (chunked bead, reference, full trajectory)
+  io.py               XYZ and HDF5 loaders, MoleculeSpec frame validation
   topology.py         Bond graph, angles, dihedrals, ring, hard-chemistry checks
   descriptors.py      Internal-coordinate fingerprint + StandardScaler + PCA
   scorer.py           Mahalanobis scorer and threshold calibration
   embedding_scorer.py Per-atom Mahalanobis scorer in MLFF embedding space
   aggregator.py       Bead-score aggregation per timestep
-  onset.py            Windowed fraction onset detector
+  onset.py            Windowed fraction onset detector + false-alarm arithmetic
+  evaluation.py       Detection metrics, error correlation, controlled distortions
   pipeline.py         The orchestrator
 scripts/
   run_pipeline.py             Main pipeline, XYZ input
   run_pipeline_hdf5.py        Same pipeline, HDF5 input
   extract_onset_frames.py     Frames around the onset
-  select_configurations.py    Diverse configuration selection
+  select_configurations.py    Training-set selection in descriptor space
+  benchmark_detector.py       Detector benchmark against known distortions
+  score_vs_error.py           OOD score against force-field error
   extract_embeddings.py       MlffModel inv_features to HDF5
 config/
   demo.yaml       Runs on data/smoke/ as-is
   example.yaml    Annotated template for real data
 data/smoke/       Small aspirin dataset for the tests and the demo
 tests/
-  test_smoke.py   Validation checklist
-  test_units.py   Per-module unit tests
+  test_smoke.py               Validation checklist
+  test_units.py               Per-module unit tests
+  test_molecule_generality.py Nothing is tied to aspirin
+  test_onset_design.py        False-alarm arithmetic
+  test_evaluation.py          Metrics and distortion invariants
 docs/
   scientific-rules.md   The constraints the pipeline is built around
   adr/                  Decision records
@@ -395,6 +528,11 @@ docs/
   why Mahalanobis distance on PCA-reduced internal coordinates.
 - [docs/adr/0002-embedding-ood-track.md](docs/adr/0002-embedding-ood-track.md):
   why there is a second track in embedding space.
+- [docs/adr/0003-molecule-agnostic-topology.md](docs/adr/0003-molecule-agnostic-topology.md):
+  why the molecule comes from `initial.xyz` and how the optional ring works.
+- [docs/adr/0004-detector-evaluation.md](docs/adr/0004-detector-evaluation.md):
+  how the detector is benchmarked, and why coverage-labelled torsions rather than
+  arbitrary distortions.
 
 ## Caveats worth repeating
 

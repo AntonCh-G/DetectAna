@@ -2,8 +2,23 @@
 
 ## Molecule
 
-**Aspirin** (C9H8O4) — the molecule under study. Always 21 atoms. Atom ordering
-must be validated against `initial.xyz` before any descriptor calculation.
+**Aspirin** (C9H8O4) — the molecule this project studies, 21 atoms. It is the
+data, not a code constant: nothing in the package assumes it.
+
+**MoleculeSpec** — the expected atom count and element order for a run, built
+from the first run's `initial.xyz` (`io.MoleculeSpec`). Every reference frame,
+every other run's initial geometry and every trajectory frame is validated
+against it before any descriptor is computed. Trajectory formats without element
+symbols (binary XYZ reader, HDF5) can only be checked on atom count.
+
+**Ring** — the carbon ring used for the planarity feature and flag. Auto-detected
+as a 6-membered all-carbon ring, or set explicitly via `chemistry.ring_atoms`
+when there is more than one candidate. A molecule without one drops the feature,
+which shortens the descriptor by one column, so fit, threshold and scored frames
+must share a topology.
+
+**Scope** — one gas-phase molecule. No periodic boundaries, no second molecule in
+the frame; a disconnected bond graph is warned about, not handled.
 
 ## Simulation
 
@@ -27,6 +42,46 @@ trajectory per PIMD run. Files: `aspirin.xc.xyz` (positions),
 
 **Frame** — one saved snapshot. A single (step, bead) pair in the trajectory
 files.
+
+## Onset
+
+**False-flag rate (α)** — the fraction of in-distribution frames the OOD
+threshold flags by construction, `1 − threshold.percentile/100`. Not an error
+rate: at α = 1 % a clean 200,000-frame run still gets ~2000 flagged frames.
+
+**Window rule** — the real detector: onset is the first window in which the
+flagged fraction reaches `fraction_threshold`. Bounds on its false-alarm rate come
+from `onset.window_false_alarm_probability`; `onset.choose_fraction_threshold`
+inverts it, turning a `false_alarm_budget` into the loosest fraction that fits.
+
+**Effective trials** — independent flag opportunities in a window, `window ·
+(1−ρ)/(1+ρ)` for lag-1 autocorrelation ρ, times `n_effective_beads` (default 1,
+since beads are not independent). A 500-frame window at ρ = 0.37 carries ~230.
+
+**Onset design report** — the block written to `manifest.json` recording α, the
+window, the fraction actually used, ρ, effective trials, flags needed and the
+false-alarm bounds per window and per run.
+
+## Evaluation
+
+**Detection rate** — fraction of known-abnormal frames whose score exceeds the
+threshold, where the threshold is the conformal order statistic of the calibration
+scores. Answers "what would a real run have flagged?", unlike AUROC, which is
+threshold-free.
+
+**Training coverage** — how many training frames occupy a slice of some coordinate,
+usually a torsion's 30° bin. What makes a synthetic distortion a *labelled*
+anomaly: a distortion into a well-covered slice is in-distribution, into an empty
+slice it is not.
+
+**Torsion scan** — driving one torsion around its full circle with `set_dihedral`
+and scoring every target angle, each labelled by training coverage. Isolates
+conformational novelty, since bond lengths and angles are preserved exactly.
+
+**Score-error correlation** — Spearman correlation between OOD score and per-frame
+force error, plus error by score decile. Decides whether the score is a usable
+reliability estimate. Needs forces from the reference method, so it lives in
+`scripts/score_vs_error.py` rather than in the pipeline.
 
 ## Data Files
 

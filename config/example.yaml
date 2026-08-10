@@ -22,7 +22,10 @@ reference:
 # more entries here to compare force fields against the same reference set.
 runs:
   - name: "run_name"
-    # Single frame that fixes the atom ordering and the bond graph.
+    # Single frame that defines the molecule: atom count, atom ordering and the
+    # bond graph all come from here, and every other frame — reference or
+    # trajectory — is checked against it. The first run's file is the reference;
+    # further runs must contain the same molecule in the same order.
     initial_xyz: "path/to/initial.xyz"
 
     # --- Option A: i-PI XYZ, one file per bead ---
@@ -63,13 +66,54 @@ chemistry:
   close_contact_cutoff: 1.2
   # NeighborList multiplier used when building the fixed bond graph.
   nl_mult: 1.1
+  # Ring used for the planarity feature and flag, as 0-based atom indices.
+  # Leave it out to auto-detect one 6-membered all-carbon ring; set it explicitly
+  # when the molecule has several candidate rings (auto-detection picks the
+  # lowest-indexed one), or set it to [] to drop the planarity feature.
+  # A molecule with no such ring drops the feature automatically, which shortens
+  # the descriptor — so fit, threshold and scored frames must share one topology.
+  # ring_atoms: [0, 1, 2, 3, 4, 5]
 
 # ── Onset detection ──────────────────────────────────────────────────────────
+# This block, not threshold.percentile, is what controls false alarms. A
+# threshold that flags 1 % of in-distribution frames flags ~1 % of any long run
+# too — about 2000 frames out of 200 000, the first after ~100 frames. So
+# `first_bead_anomaly` in the output is a property of the threshold, not of the
+# trajectory, and only the windowed criteria below carry evidence.
 onset:
   window_frames: 500
   step_frames: 50
-  # How much of a window has to be OOD before it counts as onset.
+
+  # How much of a window has to be OOD before it counts as onset. Pick one of
+  # the two next keys.
+  #
+  # (a) Fixed fraction. The run logs the false-alarm probability it implies, so
+  #     you can see what it costs. 0.20 with a 1 % threshold is ~1e-91 per run:
+  #     safe, but it needs 100 of 500 frames flagged, so it will miss partial
+  #     excursions.
   fraction_threshold: 0.20
+  #
+  # (b) Recommended: state the run-level false-alarm probability you accept and
+  #     let the fraction be derived from it. You get the most sensitive rule
+  #     inside that budget. Setting this overrides fraction_threshold.
+  # false_alarm_budget: 0.01
+
+  # Frames are autocorrelated, so a 500-frame window is not 500 independent
+  # chances to flag. "auto" measures the lag-1 autocorrelation on the first
+  # `stable_fraction` of the run; a number sets it directly; 0 assumes
+  # independence and makes the false-alarm bound optimistic.
+  frame_autocorrelation: "auto"
+  # How much of the run counts as the quiet opening segment used for that
+  # measurement. Keep it small: it only has to be long enough to estimate one
+  # correlation, and a segment that reaches into the anomaly would overestimate
+  # it and flatter the false-alarm bound.
+  stable_fraction: 0.1
+
+  # Beads contribute to the bead criterion as well as frames, but they are
+  # path-integral images of one molecule and strongly correlated. 1 treats a
+  # timestep as a single observation, which is the conservative choice. Raise it
+  # only if you have measured the between-bead correlation.
+  n_effective_beads: 1
 
 # ── Embedding track, optional ────────────────────────────────────────────────
 # Needs the per-frame MLFF invariant features written to HDF5 first, see
