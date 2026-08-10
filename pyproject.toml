@@ -36,12 +36,59 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-dev = ["pytest>=7.0", "pytest-cov"]
+dev = [
+    "pytest>=7.0",
+    "pytest-cov",
+    "ruff>=0.6",
+    "mypy>=1.11",
+    "pandas-stubs",
+    "types-PyYAML",
+]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 # Run the suite straight from a clone, with or without an editable install.
 pythonpath = ["src"]
+
+# ---------------------------------------------------------------------------
+# Lint
+# ---------------------------------------------------------------------------
+[tool.ruff]
+line-length = 120
+target-version = "py310"
+# These scripts are owned by other in-flight work; they will be linted once that
+# lands. Everything under src/ and tests/ is checked.
+extend-exclude = [
+    "scripts/extract_embeddings.py",
+    "scripts/extract_onset_frames.py",
+    "scripts/score_vs_error.py",
+    "scripts/select_configurations.py",
+]
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "UP", "B", "C4"]
+ignore = [
+    # i/j/k/l are the standard index names for bonds, angles and dihedrals; E741
+    # would force us to rename them to something less readable for a chemist.
+    "E741",
+    # zip(..., strict=True) would turn today's silent truncation into an
+    # exception. That is probably the right call, but it changes runtime
+    # behaviour, so it belongs in its own change rather than a lint sweep.
+    "B905",
+]
+
+# ---------------------------------------------------------------------------
+# Types
+# ---------------------------------------------------------------------------
+[tool.mypy]
+python_version = "3.10"
+files = ["src/detectana"]
+# ase, sklearn, scipy, h5py and joblib ship no usable stubs.
+ignore_missing_imports = true
+warn_unused_ignores = true
+warn_redundant_casts = true
+no_implicit_optional = true
+strict_equality = true
 
 [project.urls]
 Homepage = "https://github.com/AntonCh-G/DetectAna"
@@ -49,3 +96,7 @@ Repository = "https://github.com/AntonCh-G/DetectAna"
 
 [tool.setuptools.packages.find]
 where = ["src"]
+
+# Ship the PEP 561 marker so type checkers use detectana's annotations.
+[tool.setuptools.package-data]
+detectana = ["py.typed"]

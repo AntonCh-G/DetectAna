@@ -7,6 +7,31 @@ on:
   workflow_dispatch:
 
 jobs:
+  # Style and types are Python-version independent, so they run once rather than
+  # three times across the test matrix.
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[dev]"
+
+      # Configuration lives in pyproject.toml ([tool.ruff], [tool.mypy]).
+      - name: ruff
+        run: ruff check .
+
+      - name: mypy
+        run: mypy
+
   test:
     runs-on: ubuntu-latest
     strategy:
@@ -28,11 +53,23 @@ jobs:
           python -m pip install --upgrade pip
           pip install -e ".[dev]"
 
+      # The floor is well below where the suite currently sits; it is here to
+      # catch a drop, not to be satisfied by the current number.
       - name: Run test suite
-        run: pytest tests/ -v
+        run: pytest tests/ -v --cov=detectana --cov-report=term-missing --cov-fail-under=85
 
       - name: Run demo pipeline end-to-end
         run: |
           python scripts/run_pipeline.py --config config/demo.yaml
           test -f outputs/demo/demo/onset_table.csv
           test -f outputs/demo/demo/manifest.json
+          test -f outputs/demo/onset_summary.csv
+
+      # Smoke test only: data/smoke has too few frames per PCA component for the
+      # numbers to mean anything, so this checks the benchmark runs, not that the
+      # detector is good. See docs/adr/0004-detector-evaluation.md.
+      - name: Run detector benchmark on the demo data
+        run: |
+          python scripts/benchmark_detector.py --config config/demo.yaml
+          test -f outputs/demo/benchmark/detection_benchmark.csv
+          test -f outputs/demo/benchmark/torsion_coverage.csv
