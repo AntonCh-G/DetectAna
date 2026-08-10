@@ -20,7 +20,6 @@ import os
 from pathlib import Path
 
 import numpy as np
-import pytest
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 SMOKE_DATA_DIR = PROJECT_ROOT / "data" / "smoke"
@@ -175,8 +174,8 @@ def test_bead_stack_shape(topo, train_positions, fitted_pipeline):
 
     agg = aggregate_bead_scores(bead_scores, centroid_scores, steps, scorer.threshold)
     assert len(agg) == n_frames
-    assert set(["step", "bead_max", "bead_p95", "bead_frac_ood",
-                "centroid_score", "centroid_ood"]).issubset(agg.columns)
+    assert {"step", "bead_max", "bead_p95", "bead_frac_ood",
+            "centroid_score", "centroid_ood"}.issubset(agg.columns)
 
 
 def test_bead_fixture_shape(tmp_path):
@@ -206,7 +205,7 @@ def test_no_leakage_in_pipeline(topo, train_positions, fitted_pipeline):
     Validates that transform(X_train) uses scaler/PCA fit on X_train,
     and that the fitted pipeline can score held-out data without refitting.
     """
-    from detectana.descriptors import DescriptorPipeline, compute_descriptor_batch
+    from detectana.descriptors import compute_descriptor_batch
     from detectana.scorer import MahalanobisScorer
 
     pipe, X_train = fitted_pipeline

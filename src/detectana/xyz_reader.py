@@ -5,21 +5,22 @@ Ported from ConfAna/src/io_xyz.py.  Key design choices:
 - Byte-offset index (NPZ) — O(1) random access; loaded from existing iPI-
   generated ``*.frameindex.npz`` files or built by a one-pass scan.
 - No ASE objects — returns raw numpy arrays (steps, positions) per chunk.
-- Coordinate-only parsing — element symbols validated once then discarded.
+- Coordinate-only parsing — element symbols are skipped, not read, so atom
+  ordering has to be validated elsewhere (see ``io.MoleculeSpec``).
 
 Frame format assumed (iPI standard XYZ):
-    21
+    N
     # CELL(abcABC): ...  Step:   NNNNNNNN  Bead:   NN  positions{angstrom} ...
     C   x  y  z
-    ...  (21 lines)
+    ...  (N lines)
 """
 
 from __future__ import annotations
 
 import os
 import re
+from collections.abc import Iterator
 from pathlib import Path
-from typing import Iterator
 
 import numpy as np
 
@@ -220,6 +221,7 @@ def iter_positions_chunked(
     chunk_size: int = 5000,
     stride: int = 50,
     cache_path: str | Path | None = None,
+    expected_n_atoms: int | None = None,
 ) -> Iterator[tuple[np.ndarray, np.ndarray]]:
     """Yield ``(steps, positions)`` chunks from an iPI bead XYZ file.
 
@@ -228,10 +230,11 @@ def iter_positions_chunked(
 
     Parameters
     ----------
-    xyz_path : path to ``aspirin.pos_NN.xyz`` or ``aspirin.xc.xyz``.
+    xyz_path : path to a bead or centroid trajectory file.
     chunk_size : frames per yielded chunk.
     stride : used as fallback when Step cannot be parsed from comment.
     cache_path : optional explicit path for the frameindex NPZ.
+    expected_n_atoms : when given, the file's atom count must equal it.
 
     Yields
     ------
@@ -241,7 +244,20 @@ def iter_positions_chunked(
     xyz_path = Path(xyz_path)
     idx = load_or_build_index(xyz_path, cache_path)
     n_frames = idx.n_frames
-    n_atoms = int(idx.atom_count[0])
+
+    # All frames must hold the same molecule: the parser reuses one atom count.
+    unique_counts = np.unique(idx.atom_count)
+    if len(unique_counts) != 1:
+        raise ValueError(
+            f"{xyz_path.name}: mixed atom counts across frames: "
+            f"{unique_counts.tolist()}"
+        )
+    n_atoms = int(unique_counts[0])
+    if expected_n_atoms is not None and n_atoms != expected_n_atoms:
+        raise ValueError(
+            f"{xyz_path.name}: expected {expected_n_atoms} atoms per frame, "
+            f"got {n_atoms}"
+        )
 
     steps_buf: list[int] = []
     pos_buf: list[np.ndarray] = []

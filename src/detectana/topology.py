@@ -1,21 +1,29 @@
-"""Aspirin molecular topology: bond graph, angles, dihedrals, ring detection.
+"""Molecular topology: bond graph, angles, dihedrals, ring detection.
 
 Hard-chemistry checks (bond breaking, close contacts, ring planarity) are
 computed here and are separate from the statistical OOD score.
 
 The topology is built once from ``initial.xyz`` and frozen for the entire run.
-Atom ordering and count are validated before any descriptor is computed.
+Nothing about the molecule is hard-coded: atom count, element order, the bond
+graph and the ring all come from that file.  Atom ordering and count are then
+validated on every frame before any descriptor is computed.
+
+A molecule with no ring is supported — the ring-planarity feature and flag are
+simply dropped, which changes the descriptor length.  Fit and threshold must
+therefore come from the same topology as the frames being scored.
 """
 
 from __future__ import annotations
 
+import logging
+from collections.abc import Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Sequence
 
 import numpy as np
-from ase import Atoms
 from ase.neighborlist import NeighborList, natural_cutoffs
+
+log = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
@@ -23,7 +31,7 @@ from ase.neighborlist import NeighborList, natural_cutoffs
 # ---------------------------------------------------------------------------
 
 @dataclass
-class AspirinTopology:
+class MoleculeTopology:
     """Fixed molecular topology derived from the initial geometry.
 
     Attributes
@@ -31,12 +39,14 @@ class AspirinTopology:
     bonds : list of (i, j) with i < j
     angles : list of (i, j, k)  — j is the vertex
     dihedrals : list of (i, j, k, l)
-    ring_atoms : indices of the 6 benzene-ring carbons
-    n_atoms : always 21
+    ring_atoms : indices of the carbon ring used for the planarity feature;
+                 empty when the molecule has no such ring
+    n_atoms : atom count taken from the initial geometry
     atom_types : list of element symbols
     bond_names : human-readable label per bond, e.g. "C0-C5"
     angle_names : human-readable label per angle
-    dihedral_names : pairs of sin/cos feature labels
+    dihedral_names : sin labels for every dihedral, then cos labels, matching
+                     the descriptor column order
     planarity_name : label for ring-planarity feature
     """
 
@@ -44,7 +54,7 @@ class AspirinTopology:
     angles: list[tuple[int, int, int]] = field(default_factory=list)
     dihedrals: list[tuple[int, int, int, int]] = field(default_factory=list)
     ring_atoms: list[int] = field(default_factory=list)
-    n_atoms: int = 21
+    n_atoms: int = 0
     atom_types: list[str] = field(default_factory=list)
 
     # Feature names (populated by _build_names)
@@ -58,7 +68,12 @@ class AspirinTopology:
     bond_idx: np.ndarray | None = field(default=None)       # (n_bonds, 2)
     angle_idx: np.ndarray | None = field(default=None)      # (n_angles, 3)
     dihedral_idx: np.ndarray | None = field(default=None)   # (n_dihedrals, 4)
-    ring_idx: np.ndarray | None = field(default=None)       # (6,)
+    ring_idx: np.ndarray | None = field(default=None)       # (ring_size,) or None
+
+    @property
+    def has_ring(self) -> bool:
+        """True when a ring was found or configured, so planarity is a feature."""
+        return len(self.ring_atoms) > 0
 
     @property
     def n_bond_features(self) -> int:
@@ -73,16 +88,30 @@ class AspirinTopology:
         return 2 * len(self.dihedrals)  # sin + cos per dihedral
 
     @property
+    def n_planarity_features(self) -> int:
+        return 1 if self.has_ring else 0
+
+    @property
     def n_features(self) -> int:
-        return self.n_bond_features + self.n_angle_features + self.n_dihedral_features + 1
+        return (
+            self.n_bond_features
+            + self.n_angle_features
+            + self.n_dihedral_features
+            + self.n_planarity_features
+        )
 
     @property
     def feature_names(self) -> list[str]:
         names = list(self.bond_names)
         names += self.angle_names
-        names += self.dihedral_names   # already 2 per dihedral (sin_, cos_)
-        names += [self.planarity_name]
+        names += self.dihedral_names   # sin block then cos block
+        if self.has_ring:
+            names += [self.planarity_name]
         return names
+
+
+# Name kept for backwards compatibility with earlier, aspirin-only releases.
+AspirinTopology = MoleculeTopology
 
 
 # ---------------------------------------------------------------------------
@@ -92,18 +121,27 @@ class AspirinTopology:
 def build_topology(
     initial_xyz: str | Path,
     nl_mult: float = 1.1,
-) -> AspirinTopology:
+    ring_atoms: Sequence[int] | None = None,
+    ring_size: int = 6,
+) -> MoleculeTopology:
     """Build topology from the first frame of ``initial_xyz``.
 
     Parameters
     ----------
-    initial_xyz : path to initial geometry (21-atom aspirin XYZ).
+    initial_xyz : path to the initial geometry. Its atom count and element order
+        define the molecule for the whole run.
     nl_mult : NeighborList covalent-radii multiplier (default 1.1).
+    ring_atoms : explicit 0-based indices of the ring used for the planarity
+        feature. Give this when the molecule has more than one candidate ring,
+        since auto-detection would otherwise pick one of them arbitrarily.
+        Pass an empty sequence to switch the planarity feature off.
+    ring_size : ring length to search for when ``ring_atoms`` is None
+        (default 6, i.e. a benzene-like carbon ring).
     """
     from detectana.io import load_single_frame
 
     atoms = load_single_frame(initial_xyz)
-    topo = AspirinTopology(
+    topo = MoleculeTopology(
         n_atoms=len(atoms),
         atom_types=list(atoms.get_chemical_symbols()),
     )
@@ -122,13 +160,24 @@ def build_topology(
     ]
 
     if not topo.bonds:
-        raise ValueError("No bonds detected in initial.xyz with nl_mult={nl_mult}")
+        raise ValueError(
+            f"No bonds detected in {Path(initial_xyz).name} with nl_mult={nl_mult}"
+        )
 
     # ── Adjacency dict ───────────────────────────────────────────────────────
     adj: dict[int, list[int]] = {i: [] for i in range(topo.n_atoms)}
     for i, j in topo.bonds:
         adj[i].append(j)
         adj[j].append(i)
+
+    n_fragments = _count_connected_components(adj, topo.n_atoms)
+    if n_fragments > 1:
+        log.warning(
+            "%s: bond graph has %d disconnected fragments. Internal coordinates "
+            "are computed on raw positions with no periodic images, so results "
+            "are only meaningful for a single gas-phase molecule.",
+            Path(initial_xyz).name, n_fragments,
+        )
 
     # ── Angles ───────────────────────────────────────────────────────────────
     seen_angles: set[tuple[int, int, int]] = set()
@@ -157,8 +206,22 @@ def build_topology(
                     seen_dih.add(canonical)
                     topo.dihedrals.append(canonical)
 
-    # ── Benzene ring (6-membered all-carbon ring) ────────────────────────────
-    topo.ring_atoms = _find_benzene_ring(adj, topo.atom_types)
+    # ── Ring used for the planarity feature ──────────────────────────────────
+    if ring_atoms is None:
+        topo.ring_atoms = _find_carbon_ring(adj, topo.atom_types, ring_size)
+        if topo.ring_atoms:
+            log.info("Ring for planarity feature (auto-detected): %s", topo.ring_atoms)
+        else:
+            log.info(
+                "No %d-membered all-carbon ring found — ring-planarity feature "
+                "and flag are omitted.", ring_size,
+            )
+    else:
+        topo.ring_atoms = _validate_ring_atoms(ring_atoms, adj, topo.n_atoms)
+        if topo.ring_atoms:
+            log.info("Ring for planarity feature (from config): %s", topo.ring_atoms)
+        else:
+            log.info("Ring-planarity feature disabled by configuration.")
 
     # ── Feature names ────────────────────────────────────────────────────────
     sym = topo.atom_types
@@ -167,29 +230,56 @@ def build_topology(
         f"angle_{sym[i]}{i}-{sym[j]}{j}-{sym[k]}{k}_rad"
         for i, j, k in topo.angles
     ]
-    topo.dihedral_names = [
-        name
+    # Column order matches the descriptor: all sines first, then all cosines.
+    dih_labels = [
+        f"dih_{sym[i]}{i}-{sym[j]}{j}-{sym[k]}{k}-{sym[l]}{l}"
         for i, j, k, l in topo.dihedrals
-        for name in (
-            f"sin_dih_{sym[i]}{i}-{sym[j]}{j}-{sym[k]}{k}-{sym[l]}{l}",
-            f"cos_dih_{sym[i]}{i}-{sym[j]}{j}-{sym[k]}{k}-{sym[l]}{l}",
-        )
     ]
+    topo.dihedral_names = (
+        [f"sin_{label}" for label in dih_labels]
+        + [f"cos_{label}" for label in dih_labels]
+    )
 
     # ── Precomputed numpy index arrays for vectorised descriptors ─────────────
     topo.bond_idx = np.array(topo.bonds, dtype=np.int32)            # (n_bonds, 2)
     topo.angle_idx = np.array(topo.angles, dtype=np.int32)          # (n_angles, 3)
     topo.dihedral_idx = np.array(topo.dihedrals, dtype=np.int32)    # (n_dihedrals, 4)
-    topo.ring_idx = np.array(topo.ring_atoms, dtype=np.int32)       # (6,)
+    topo.ring_idx = (
+        np.array(topo.ring_atoms, dtype=np.int32) if topo.ring_atoms else None
+    )
 
     return topo
 
 
-def _find_benzene_ring(
+def _count_connected_components(adj: dict[int, list[int]], n_atoms: int) -> int:
+    """Number of connected fragments in the bond graph."""
+    seen: set[int] = set()
+    components = 0
+    for start in range(n_atoms):
+        if start in seen:
+            continue
+        components += 1
+        stack = [start]
+        seen.add(start)
+        while stack:
+            current = stack.pop()
+            for nbr in adj[current]:
+                if nbr not in seen:
+                    seen.add(nbr)
+                    stack.append(nbr)
+    return components
+
+
+def _find_carbon_ring(
     adj: dict[int, list[int]],
     atom_types: list[str],
+    ring_size: int = 6,
 ) -> list[int]:
-    """Return indices of the 6 benzene-ring carbons (DFS cycle search)."""
+    """Return the indices of one all-carbon ring, or [] if there is none.
+
+    DFS cycle search; with several matching rings the lowest-indexed one wins,
+    so pass ``ring_atoms`` explicitly when the choice matters.
+    """
     n = len(atom_types)
     carbon_set = {i for i in range(n) if atom_types[i] == "C"}
 
@@ -202,9 +292,9 @@ def _find_benzene_ring(
         for nbr in adj[current]:
             if nbr not in carbon_set:
                 continue
-            if nbr == start and len(path) == 6:
+            if nbr == start and len(path) == ring_size:
                 return path[:]
-            if nbr in visited or len(path) >= 6:
+            if nbr in visited or len(path) >= ring_size:
                 continue
             visited.add(nbr)
             result = dfs(start, nbr, path + [nbr], visited)
@@ -218,10 +308,39 @@ def _find_benzene_ring(
         if result is not None:
             return sorted(result)
 
-    raise ValueError(
-        "No 6-membered all-carbon ring found in topology. "
-        "Check initial.xyz atom ordering."
-    )
+    return []
+
+
+def _validate_ring_atoms(
+    ring_atoms: Sequence[int],
+    adj: dict[int, list[int]],
+    n_atoms: int,
+) -> list[int]:
+    """Check explicitly configured ring indices and return them sorted."""
+    indices = [int(i) for i in ring_atoms]
+    if not indices:
+        return []
+    if len(indices) < 3:
+        raise ValueError(
+            f"ring_atoms needs at least 3 atoms to define a plane, got {indices}"
+        )
+    if len(set(indices)) != len(indices):
+        raise ValueError(f"ring_atoms contains duplicate indices: {indices}")
+    out_of_range = [i for i in indices if not 0 <= i < n_atoms]
+    if out_of_range:
+        raise ValueError(
+            f"ring_atoms indices out of range for a {n_atoms}-atom molecule: "
+            f"{out_of_range}. Indices are 0-based."
+        )
+    ring_set = set(indices)
+    for i in indices:
+        if len(ring_set.intersection(adj[i])) != 2:
+            raise ValueError(
+                f"ring_atoms {indices} is not a closed ring in the bond graph: "
+                f"atom {i} has {len(ring_set.intersection(adj[i]))} ring "
+                "neighbours, expected 2."
+            )
+    return sorted(indices)
 
 
 # ---------------------------------------------------------------------------
@@ -234,7 +353,7 @@ class ChemistryFlags:
 
     broken_bonds: list[tuple[int, int, float]]   # (i, j, distance_Å)
     close_contacts: list[tuple[int, int, float]]  # (i, j, distance_Å)
-    ring_planarity_rmsd: float                    # Å
+    ring_planarity_rmsd: float | None             # Å; None when there is no ring
 
     @property
     def has_broken_bond(self) -> bool:
@@ -256,7 +375,7 @@ class ChemistryFlags:
 
 def check_chemistry(
     positions: np.ndarray,
-    topo: AspirinTopology,
+    topo: MoleculeTopology,
     bond_break_cutoff: float = 2.0,
     close_contact_cutoff: float = 1.2,
 ) -> ChemistryFlags:
@@ -268,6 +387,8 @@ def check_chemistry(
     topo : topology from build_topology
     bond_break_cutoff : bond longer than this (Å) is flagged broken
     close_contact_cutoff : non-bonded pair closer than this (Å) is flagged
+
+    Ring planarity is None for a molecule without a ring.
     """
     broken: list[tuple[int, int, float]] = []
     for i, j in topo.bonds:
@@ -275,7 +396,7 @@ def check_chemistry(
         if d > bond_break_cutoff:
             broken.append((i, j, d))
 
-    bonded_set = set(map(frozenset, topo.bonds))  # type: ignore[arg-type]
+    bonded_set = set(map(frozenset, topo.bonds))
     close: list[tuple[int, int, float]] = []
     n = len(positions)
     for i in range(n):
@@ -286,13 +407,15 @@ def check_chemistry(
             if d < close_contact_cutoff:
                 close.append((i, j, d))
 
-    planarity = _ring_planarity_rmsd(positions, topo.ring_atoms)
+    planarity = (
+        _ring_planarity_rmsd(positions, topo.ring_atoms) if topo.has_ring else None
+    )
     return ChemistryFlags(broken, close, planarity)
 
 
 def check_chemistry_batch(
     positions: np.ndarray,
-    topo: AspirinTopology,
+    topo: MoleculeTopology,
     bond_break_cutoff: float = 2.0,
     close_contact_cutoff: float = 1.2,
 ) -> list[ChemistryFlags]:
@@ -310,7 +433,7 @@ def check_chemistry_batch(
 
 def _ring_planarity_rmsd(positions: np.ndarray, ring_indices: Sequence[int]) -> float:
     """RMSD of ring atoms from their best-fit plane (Å)."""
-    ring_pos = positions[list(ring_indices)]   # (6, 3)
+    ring_pos = positions[list(ring_indices)]   # (ring_size, 3)
     centroid = ring_pos.mean(axis=0)
     centered = ring_pos - centroid
     _, _, Vt = np.linalg.svd(centered, full_matrices=False)

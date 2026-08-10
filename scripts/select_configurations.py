@@ -2,8 +2,8 @@
 
 Two modes, selected by whether --primary-dihedrals is given:
 
-Primary-dihedral mode (recommended for aspirin conformational analysis)
------------------------------------------------------------------------
+Primary-dihedral mode (recommended for conformational analysis)
+----------------------------------------------------------------
 --radius constrains frames in the sin/cos space of the specified dihedrals.
 Accepts one value (isotropic, circular constraint shared across all primary
 dihedrals) or one value per --primary-dihedrals (anisotropic, elliptic
@@ -14,7 +14,8 @@ ellipse.
 
 Among frames that pass, N configurations are selected to maximise diversity in
 the *complementary* raw internal-coordinate space (all bonds, angles, other
-dihedrals, ring planarity — the primary dihedral sin/cos columns are excluded).
+dihedrals, ring planarity if present — the primary dihedral sin/cos columns
+are excluded).
 
 In short: keep the specified dihedral(s) fixed near the reference value, then
 pick diverse structures in the remaining conformational degrees of freedom.
@@ -43,7 +44,8 @@ Anisotropic (elliptic) example — tight carbonyl, loose ester:
 Full-descriptor mode (default)
 ------------------------------
 Distance is computed in PCA-reduced internal-coordinate space (bonds, angles,
-all dihedrals, ring planarity). The DescriptorPipeline is fit on the trajectory.
+all dihedrals, and ring planarity when the molecule has a ring). The
+DescriptorPipeline is fit on the trajectory.
 
     python scripts/select_configurations.py \\
         --reference initial.xyz \\
@@ -71,7 +73,7 @@ from ase.io import write
 
 from detectana.descriptors import DescriptorPipeline, compute_descriptor_batch
 from detectana.io import (
-    ASPIRIN_ATOM_TYPES,
+    MoleculeSpec,
     load_single_frame,
     load_trajectory_positions,
 )
@@ -162,7 +164,7 @@ def _complementary_feature_mask(
 
     Parameters
     ----------
-    topo : AspirinTopology
+    topo : MoleculeTopology
     primary_dihedrals : list of (i, j, k, l) tuples
 
     Returns
@@ -272,10 +274,15 @@ def main() -> None:
     log.info("Loading reference configuration from %s", args.reference)
     ref_atoms = load_single_frame(args.reference)
     ref_positions = ref_atoms.get_positions()[np.newaxis, :]  # (1, n_atoms, 3)
+    # The reference frame defines the molecule; the trajectory must match it.
+    spec = MoleculeSpec.from_atoms(ref_atoms)
+    log.info("Molecule: %d atoms (%s)", spec.n_atoms, "".join(spec.atom_types))
 
     # ── Trajectory ────────────────────────────────────────────────────────────
     log.info("Loading trajectory from %s (--pimd=%s)", args.trajectory, args.pimd)
-    traj_positions, steps = load_trajectory_positions(args.trajectory, pimd=args.pimd)
+    traj_positions, steps = load_trajectory_positions(
+        args.trajectory, pimd=args.pimd, spec=spec
+    )
     n_frames = len(traj_positions)
     log.info("Loaded %d trajectory frames", n_frames)
 
@@ -384,7 +391,7 @@ def main() -> None:
     output_frames: list[Atoms] = [ref_out]
     for idx in selected_indices:
         out = Atoms(
-            symbols=ASPIRIN_ATOM_TYPES,
+            symbols=list(spec.atom_types),
             positions=traj_positions[idx],
         )
         out.info = {

@@ -4,8 +4,12 @@ Feature vector per frame
 ------------------------
 1. Bond lengths          (n_bonds,)         Å
 2. Bond angles           (n_angles,)        radians
-3. Dihedral torsions     (2 × n_dihedrals,) [sin θ, cos θ] pairs — periodic-safe
-4. Ring planarity RMSD   (1,)               Å
+3. Dihedral sines        (n_dihedrals,)     periodic-safe torsion encoding …
+4. Dihedral cosines      (n_dihedrals,)     … the other half of it
+5. Ring planarity RMSD   (1,)               Å — omitted for a ring-less molecule
+
+The layout comes entirely from the topology, so ``topo.n_features`` and
+``topo.feature_names`` are the authority on length and column order.
 
 Standardisation: zero-mean, unit-variance using training-set statistics only.
 PCA: fit on standardised training features, retain ``pca_variance`` fraction.
@@ -20,8 +24,7 @@ import numpy as np
 from sklearn.decomposition import PCA
 from sklearn.preprocessing import StandardScaler
 
-from detectana.topology import AspirinTopology, _ring_planarity_rmsd
-
+from detectana.topology import MoleculeTopology, _ring_planarity_rmsd
 
 # ---------------------------------------------------------------------------
 # Per-frame descriptor
@@ -29,14 +32,14 @@ from detectana.topology import AspirinTopology, _ring_planarity_rmsd
 
 def compute_descriptor(
     positions: np.ndarray,
-    topo: AspirinTopology,
+    topo: MoleculeTopology,
 ) -> np.ndarray:
     """Compute internal-coordinate feature vector for one frame.
 
     Parameters
     ----------
     positions : (n_atoms, 3) Å
-    topo : AspirinTopology
+    topo : MoleculeTopology
 
     Returns
     -------
@@ -56,21 +59,25 @@ def compute_descriptor(
         cos_a = float(np.clip(cos_a, -1.0, 1.0))
         feats.append(np.arccos(cos_a))
 
-    # ── Dihedral torsions (sin, cos) ─────────────────────────────────────────
-    for i, j, k, l in topo.dihedrals:
-        angle_rad = _dihedral_rad(positions[i], positions[j], positions[k], positions[l])
-        feats.append(np.sin(angle_rad))
-        feats.append(np.cos(angle_rad))
+    # ── Dihedral torsions: all sines, then all cosines ───────────────────────
+    # Same column order as the vectorised batch path and topo.feature_names.
+    dih_rad = [
+        _dihedral_rad(positions[i], positions[j], positions[k], positions[l])
+        for i, j, k, l in topo.dihedrals
+    ]
+    feats += [np.sin(a) for a in dih_rad]
+    feats += [np.cos(a) for a in dih_rad]
 
-    # ── Ring planarity ────────────────────────────────────────────────────────
-    feats.append(_ring_planarity_rmsd(positions, topo.ring_atoms))
+    # ── Ring planarity (only when the molecule has a ring) ───────────────────
+    if topo.has_ring:
+        feats.append(_ring_planarity_rmsd(positions, topo.ring_atoms))
 
     return np.array(feats, dtype=np.float64)
 
 
 def compute_descriptor_batch(
     positions: np.ndarray,
-    topo: AspirinTopology,
+    topo: MoleculeTopology,
 ) -> np.ndarray:
     """Compute descriptors for a batch of frames — fully vectorised.
 
@@ -95,16 +102,22 @@ def compute_descriptor_batch(
 
 def _compute_descriptor_batch_vectorised(
     pos: np.ndarray,
-    topo: AspirinTopology,
+    topo: MoleculeTopology,
 ) -> np.ndarray:
     """Vectorised internal-coordinate descriptor for (n, n_atoms, 3) positions."""
+    bond_idx, angle_idx, dihedral_idx = topo.bond_idx, topo.angle_idx, topo.dihedral_idx
+    if bond_idx is None or angle_idx is None or dihedral_idx is None:
+        raise ValueError(
+            "Topology is missing its index arrays — build it with build_topology()."
+        )
+
     # ── Bond lengths: (n, n_bonds) ───────────────────────────────────────────
-    bi, bj = topo.bond_idx[:, 0], topo.bond_idx[:, 1]
+    bi, bj = bond_idx[:, 0], bond_idx[:, 1]
     bond_vecs = pos[:, bj] - pos[:, bi]                        # (n, n_bonds, 3)
     bond_lengths = np.linalg.norm(bond_vecs, axis=-1)          # (n, n_bonds)
 
     # ── Bond angles: (n, n_angles) ───────────────────────────────────────────
-    ai, aj, ak = topo.angle_idx[:, 0], topo.angle_idx[:, 1], topo.angle_idx[:, 2]
+    ai, aj, ak = angle_idx[:, 0], angle_idx[:, 1], angle_idx[:, 2]
     v1 = pos[:, ai] - pos[:, aj]                               # (n, n_angles, 3)
     v2 = pos[:, ak] - pos[:, aj]
     n1 = np.linalg.norm(v1, axis=-1)                           # (n, n_angles)
@@ -113,7 +126,7 @@ def _compute_descriptor_batch_vectorised(
     angles = np.arccos(np.clip(cos_a, -1.0, 1.0))             # (n, n_angles)
 
     # ── Dihedral torsions: (n, 2 × n_dihedrals) ─────────────────────────────
-    di = topo.dihedral_idx
+    di = dihedral_idx
     p0 = pos[:, di[:, 0]]                                      # (n, n_dih, 3)
     p1 = pos[:, di[:, 1]]
     p2 = pos[:, di[:, 2]]
@@ -137,17 +150,20 @@ def _compute_descriptor_batch_vectorised(
         [np.sin(dih_angles), np.cos(dih_angles)], axis=1
     )                                                          # (n, 2*n_dih)
 
-    # ── Ring planarity RMSD: (n, 1) ──────────────────────────────────────────
-    ring_pos = pos[:, topo.ring_idx]                           # (n, 6, 3)
-    centroid = ring_pos.mean(axis=1, keepdims=True)
-    centered = ring_pos - centroid                             # (n, 6, 3)
-    # Batched SVD: last right singular vector is the plane normal
-    _, _, Vt = np.linalg.svd(centered, full_matrices=False)   # Vt: (n, 3, 3)
-    normals = Vt[:, -1, :]                                     # (n, 3)
-    dists = np.abs(np.einsum("nkd,nd->nk", centered, normals))  # (n, 6)
-    planarity = np.sqrt(np.mean(dists**2, axis=1, keepdims=True))  # (n, 1)
+    blocks = [bond_lengths, angles, sin_cos]
 
-    return np.concatenate([bond_lengths, angles, sin_cos, planarity], axis=1)
+    # ── Ring planarity RMSD: (n, 1) — skipped for a ring-less molecule ───────
+    if topo.has_ring:
+        ring_pos = pos[:, topo.ring_idx]                        # (n, ring_size, 3)
+        centroid = ring_pos.mean(axis=1, keepdims=True)
+        centered = ring_pos - centroid                          # (n, ring_size, 3)
+        # Batched SVD: last right singular vector is the plane normal
+        _, _, Vt = np.linalg.svd(centered, full_matrices=False)  # Vt: (n, 3, 3)
+        normals = Vt[:, -1, :]                                  # (n, 3)
+        dists = np.abs(np.einsum("nkd,nd->nk", centered, normals))  # (n, ring_size)
+        blocks.append(np.sqrt(np.mean(dists**2, axis=1, keepdims=True)))  # (n, 1)
+
+    return np.concatenate(blocks, axis=1)
 
 
 # ---------------------------------------------------------------------------
@@ -200,7 +216,7 @@ class DescriptorPipeline:
         self._pca: PCA | None = None
 
     # ------------------------------------------------------------------
-    def fit(self, X_train: np.ndarray) -> "DescriptorPipeline":
+    def fit(self, X_train: np.ndarray) -> DescriptorPipeline:
         """Fit scaler and PCA on training descriptors.
 
         Parameters
@@ -277,7 +293,7 @@ class DescriptorPipeline:
                          "random_seed": self.random_seed}, fh)
 
     @classmethod
-    def load(cls, path: str | Path) -> "DescriptorPipeline":
+    def load(cls, path: str | Path) -> DescriptorPipeline:
         with open(path, "rb") as fh:
             state = pickle.load(fh)
         obj = cls(pca_variance=state["pca_variance"], random_seed=state["random_seed"])

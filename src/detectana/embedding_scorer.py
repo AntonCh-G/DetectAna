@@ -37,7 +37,7 @@ class EmbeddingPipeline:
         self.n_features: int | None = None
 
     # ------------------------------------------------------------------
-    def fit(self, embeddings: np.ndarray) -> "EmbeddingPipeline":
+    def fit(self, embeddings: np.ndarray) -> EmbeddingPipeline:
         """Fit one Mahalanobis scorer per atom from training embeddings.
 
         Parameters
@@ -69,12 +69,12 @@ class EmbeddingPipeline:
         -------
         scores : (n_frames, n_atoms)
         """
-        self._check_fitted()
+        atom_scorers = self._fitted()
         n_frames, n_atoms, _ = embeddings.shape
         if n_atoms != self.n_atoms:
             raise ValueError(f"Expected {self.n_atoms} atoms, got {n_atoms}")
         out = np.empty((n_frames, n_atoms), dtype=np.float64)
-        for i, scorer in enumerate(self._atom_scorers):  # type: ignore[union-attr]
+        for i, scorer in enumerate(atom_scorers):
             out[:, i] = scorer.score(embeddings[:, i, :])
         return out
 
@@ -136,7 +136,7 @@ class EmbeddingPipeline:
             )
 
     @classmethod
-    def load(cls, path: str | Path) -> "EmbeddingPipeline":
+    def load(cls, path: str | Path) -> EmbeddingPipeline:
         with open(path, "rb") as fh:
             state = pickle.load(fh)
         obj = cls()
@@ -148,5 +148,10 @@ class EmbeddingPipeline:
 
     # ------------------------------------------------------------------
     def _check_fitted(self) -> None:
+        self._fitted()
+
+    def _fitted(self) -> list[MahalanobisScorer]:
+        """Return the per-atom scorers, raising if ``fit()`` was never called."""
         if self._atom_scorers is None:
             raise RuntimeError("EmbeddingPipeline not fitted. Call fit() first.")
+        return self._atom_scorers
