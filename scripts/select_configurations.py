@@ -4,14 +4,36 @@ Two modes, selected by whether --primary-dihedrals is given:
 
 Primary-dihedral mode (recommended for aspirin conformational analysis)
 -----------------------------------------------------------------------
-Distance is computed in the sin/cos space of the specified dihedral angles only.
-No PCA or StandardScaler is needed. The radius has a direct geometric meaning in
-the 2N-dimensional sin/cos torus (N = number of specified dihedrals).
+--radius constrains frames in the sin/cos space of the specified dihedrals.
+Accepts one value (isotropic, circular constraint shared across all primary
+dihedrals) or one value per --primary-dihedrals (anisotropic, elliptic
+constraint).  A frame passes when sum((dᵢ/Rᵢ)²) ≤ 1, where dᵢ is the chord
+distance in sin/cos space for dihedral i and Rᵢ is its radius.  The output
+descriptor_distance is sqrt(sum((dᵢ/Rᵢ)²)); values ≤ 1 lie inside the
+ellipse.
 
+Among frames that pass, N configurations are selected to maximise diversity in
+the *complementary* raw internal-coordinate space (all bonds, angles, other
+dihedrals, ring planarity — the primary dihedral sin/cos columns are excluded).
+
+In short: keep the specified dihedral(s) fixed near the reference value, then
+pick diverse structures in the remaining conformational degrees of freedom.
+
+Isotropic (circular) example:
     python scripts/select_configurations.py \\
         --reference initial.xyz \\
         --trajectory aspirin.xc.xyz \\
-        --radius 0.5 \\
+        --radius 0.2 \\
+        --n-configs 50 \\
+        --output selected.xyz \\
+        --pimd \\
+        --primary-dihedrals 5 6 12 11
+
+Anisotropic (elliptic) example — tight carbonyl, loose ester:
+    python scripts/select_configurations.py \\
+        --reference initial.xyz \\
+        --trajectory aspirin.xc.xyz \\
+        --radius 0.1 0.4 \\
         --n-configs 50 \\
         --output selected.xyz \\
         --pimd \\
@@ -48,7 +70,11 @@ from ase import Atoms
 from ase.io import write
 
 from detectana.descriptors import DescriptorPipeline, compute_descriptor_batch
-from detectana.io import load_single_frame, load_trajectory_frames
+from detectana.io import (
+    ASPIRIN_ATOM_TYPES,
+    load_single_frame,
+    load_trajectory_positions,
+)
 from detectana.topology import build_topology
 
 log = logging.getLogger(__name__)
@@ -90,6 +116,82 @@ def _dihedral_sincos_batch(
     return np.concatenate(parts, axis=-1)  # (n_frames, 2*N)
 
 
+def _fps_select(
+    features: np.ndarray,
+    ref_features: np.ndarray,
+    n_select: int,
+) -> np.ndarray:
+    """Farthest-Point Sampling starting from the reference.
+
+    Greedily picks the frame that maximises the minimum distance to any
+    already-selected point (starting with the reference).  Guarantees
+    diversity among selected frames while respecting the pre-filter.
+
+    Parameters
+    ----------
+    features : (n_candidates, n_features) — already filtered to within radius
+    ref_features : (1, n_features)
+    n_select : number of frames to select
+
+    Returns
+    -------
+    indices : (n_select,) — indices into ``features``
+    """
+    min_dists = np.linalg.norm(features - ref_features, axis=1).copy()
+    selected: list[int] = []
+    for _ in range(n_select):
+        idx = int(np.argmax(min_dists))
+        selected.append(idx)
+        new_dists = np.linalg.norm(features - features[idx], axis=1)
+        np.minimum(min_dists, new_dists, out=min_dists)
+        min_dists[idx] = -1.0  # exclude from future picks
+    return np.array(selected, dtype=np.intp)
+
+
+def _complementary_feature_mask(
+    topo,
+    primary_dihedrals: list[tuple[int, int, int, int]],
+) -> np.ndarray:
+    """Boolean mask over full internal-coordinate features; False = primary dihedral column.
+
+    The full descriptor layout is:
+        [bond_lengths | angles | sin_d0..sin_dN | cos_d0..cos_dN | planarity]
+
+    For each primary dihedral (i,j,k,l) the canonical form is located in
+    topo.dihedrals; the corresponding sin and cos columns are masked out.
+
+    Parameters
+    ----------
+    topo : AspirinTopology
+    primary_dihedrals : list of (i, j, k, l) tuples
+
+    Returns
+    -------
+    mask : (n_features,) bool — True = keep in complementary space
+    """
+    n_bonds = len(topo.bonds)
+    n_angles = len(topo.angles)
+    n_dih = len(topo.dihedrals)
+    mask = np.ones(topo.n_features, dtype=bool)
+
+    for quad in primary_dihedrals:
+        i, j, k, l = quad
+        canonical = min((i, j, k, l), (l, k, j, i))
+        try:
+            dih_idx = list(topo.dihedrals).index(canonical)
+        except ValueError:
+            raise ValueError(
+                f"Primary dihedral {quad} (canonical {canonical}) not found in "
+                f"topology. Check 0-based atom indices."
+            )
+        # sin column: offset n_bonds + n_angles + dih_idx
+        # cos column: offset n_bonds + n_angles + n_dih + dih_idx
+        mask[n_bonds + n_angles + dih_idx] = False
+        mask[n_bonds + n_angles + n_dih + dih_idx] = False
+
+    return mask
+
+
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
@@ -114,8 +216,13 @@ def main() -> None:
         help="Path to MD or PIMD centroid XYZ trajectory file.",
     )
     parser.add_argument(
-        "--radius", type=float, required=True,
-        help="Maximum Euclidean distance in the chosen descriptor space.",
+        "--radius", type=float, nargs="+", required=True,
+        help=(
+            "Proximity radius in the chosen descriptor space. Accepts one value "
+            "(isotropic, circular constraint) or one value per --primary-dihedrals "
+            "(anisotropic, elliptic constraint). Multiple values require "
+            "--primary-dihedrals."
+        ),
     )
     parser.add_argument(
         "--n-configs", type=int, required=True,
@@ -150,6 +257,16 @@ def main() -> None:
         [tuple(d) for d in args.primary_dihedrals]  # type: ignore[misc]
         if args.primary_dihedrals else None
     )
+    radii: list[float] = args.radius
+
+    # ── Validate --radius / --primary-dihedrals combination ──────────────────
+    if len(radii) > 1 and not primary_dihedrals:
+        parser.error("Multiple --radius values require --primary-dihedrals.")
+    if primary_dihedrals and len(radii) not in (1, len(primary_dihedrals)):
+        parser.error(
+            f"--radius accepts 1 value (isotropic) or {len(primary_dihedrals)} values "
+            f"(one per --primary-dihedrals); got {len(radii)}."
+        )
 
     # ── Reference configuration ───────────────────────────────────────────────
     log.info("Loading reference configuration from %s", args.reference)
@@ -158,26 +275,58 @@ def main() -> None:
 
     # ── Trajectory ────────────────────────────────────────────────────────────
     log.info("Loading trajectory from %s (--pimd=%s)", args.trajectory, args.pimd)
-    atoms_list, steps = load_trajectory_frames(args.trajectory, pimd=args.pimd)
-    n_frames = len(atoms_list)
+    traj_positions, steps = load_trajectory_positions(args.trajectory, pimd=args.pimd)
+    n_frames = len(traj_positions)
     log.info("Loaded %d trajectory frames", n_frames)
-
-    traj_positions = np.array(
-        [a.get_positions() for a in atoms_list], dtype=np.float64
-    )  # (n_frames, n_atoms, 3)
 
     # ── Compute features and distances ────────────────────────────────────────
     if primary_dihedrals:
         log.info(
-            "Primary-dihedral mode: %d dihedral(s) → %d sin/cos features",
-            len(primary_dihedrals), 2 * len(primary_dihedrals),
+            "Primary-dihedral mode: %d dihedral(s) as proximity constraint",
+            len(primary_dihedrals),
         )
-        for atoms in primary_dihedrals:
-            log.info("  dihedral atoms: %s", list(atoms))
+        for d in primary_dihedrals:
+            log.info("  dihedral atoms: %s", list(d))
 
-        traj_features = _dihedral_sincos_batch(traj_positions, primary_dihedrals)
-        ref_features = _dihedral_sincos_batch(ref_positions, primary_dihedrals)
-        distances = np.linalg.norm(traj_features - ref_features, axis=1)
+        # Per-dihedral chord distances in sin/cos space: (n_frames, n_primary)
+        traj_dih = _dihedral_sincos_batch(traj_positions, primary_dihedrals)
+        ref_dih = _dihedral_sincos_batch(ref_positions, primary_dihedrals)
+        d_per_dih = np.sqrt(
+            (traj_dih[:, 0::2] - ref_dih[:, 0::2]) ** 2 +
+            (traj_dih[:, 1::2] - ref_dih[:, 1::2]) ** 2
+        )
+        n_prim = len(primary_dihedrals)
+        radii_arr = np.array(radii if len(radii) > 1 else radii * n_prim)
+        # Normalized ellipse distance: sqrt(sum((dᵢ/Rᵢ)²)); ≤ 1 = inside ellipse
+        distances = np.sqrt(np.sum((d_per_dih / radii_arr) ** 2, axis=1))
+
+        # Filter first — cheap dihedral distances already computed
+        within_indices = np.where(distances <= 1.0)[0]
+        n_within = len(within_indices)
+        log.info(
+            "Ellipse filter: %d / %d frames within constraint (radii=%s)",
+            n_within, len(distances), radii,
+        )
+        if n_within == 0:
+            log.error(
+                "No trajectory frames found within ellipse constraint (radii=%s). "
+                "Try increasing --radius.",
+                radii,
+            )
+            return
+
+        # Full internal-coordinate descriptor minus primary dihedral columns
+        # — computed only on the filtered subset, not all 1M frames
+        topo = build_topology(args.reference)
+        traj_full = compute_descriptor_batch(traj_positions[within_indices], topo)
+        ref_full = compute_descriptor_batch(ref_positions, topo)
+        comp_mask = _complementary_feature_mask(topo, primary_dihedrals)
+        comp_features = traj_full[:, comp_mask]   # (n_within, n_comp)
+        ref_comp = ref_full[:, comp_mask]          # (1, n_comp)
+        log.info(
+            "Complementary descriptor: %d features (removed %d primary dihedral columns)",
+            comp_mask.sum(), (~comp_mask).sum(),
+        )
 
     else:
         log.info("Full-descriptor mode: building topology and computing descriptors...")
@@ -194,29 +343,36 @@ def main() -> None:
         ref_features = pipeline.transform(ref_descriptor)
         distances = np.linalg.norm(traj_features - ref_features, axis=1)
 
-    # ── Filter by radius ──────────────────────────────────────────────────────
-    within_indices = np.where(distances <= args.radius)[0]
-    n_within = len(within_indices)
+    # ── Filter by radius (full-descriptor mode only; primary-dihedral filtered above) ──
+    if not primary_dihedrals:
+        within_indices = np.where(distances <= radii[0])[0]
+        n_within = len(within_indices)
 
-    if n_within == 0:
-        log.error(
-            "No trajectory frames found within radius %.4f. "
-            "Try increasing --radius.",
-            args.radius,
-        )
-        return
+        if n_within == 0:
+            log.error(
+                "No trajectory frames found within radius %.4f. "
+                "Try increasing --radius.",
+                radii[0],
+            )
+            return
 
     n_select = min(args.n_configs, n_within)
     if n_within < args.n_configs:
         warnings.warn(
-            f"Only {n_within} frames within radius {args.radius}; "
+            f"Only {n_within} frames within constraint (radii={radii}); "
             f"requested {args.n_configs}. Writing {n_within} selected frames.",
             stacklevel=2,
         )
 
-    # ── Select N farthest within radius ───────────────────────────────────────
-    order = np.argsort(distances[within_indices])[::-1]
-    selected_indices = within_indices[order[:n_select]]
+    # ── Select N diverse frames via Farthest-Point Sampling ───────────────────
+    # Primary-dihedral mode: diversity in complementary space (constraint = dihedral).
+    #   comp_features already indexed to within_indices — pass directly.
+    # Full-descriptor mode: diversity in PCA-reduced full space.
+    if primary_dihedrals:
+        fps_local = _fps_select(comp_features, ref_comp, n_select)
+    else:
+        fps_local = _fps_select(traj_features[within_indices], ref_features, n_select)
+    selected_indices = within_indices[fps_local]
 
     # ── Build output frames (positions only) ──────────────────────────────────
     ref_out = Atoms(
@@ -228,8 +384,8 @@ def main() -> None:
     output_frames: list[Atoms] = [ref_out]
     for idx in selected_indices:
         out = Atoms(
-            symbols=atoms_list[idx].get_chemical_symbols(),
-            positions=atoms_list[idx].get_positions(),
+            symbols=ASPIRIN_ATOM_TYPES,
+            positions=traj_positions[idx],
         )
         out.info = {
             "source_frame": int(idx),

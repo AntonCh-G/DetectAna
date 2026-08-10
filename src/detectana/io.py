@@ -13,13 +13,16 @@ Assumptions
 
 from __future__ import annotations
 
+import logging
 import re
 from pathlib import Path
-from typing import Callable, Iterator
+from typing import Callable, Iterator, NamedTuple
 
 import numpy as np
 from ase import Atoms
 from ase.io import iread, read
+
+log = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -229,7 +232,69 @@ def load_trajectory_frames(
         steps.append(int(m.group(1)) if m else frame_idx)
     if not atoms_list:
         raise ValueError(f"No frames found in {path}")
-    return atoms_list, np.array(steps, dtype=np.int64)
+    return atoms_list, np.array(steps, dtype=np.int32)
+
+
+def load_trajectory_positions(
+    path: str | Path,
+    pimd: bool = False,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Fast loader returning positions and steps as numpy arrays.
+
+    For ``pimd=True``, uses the binary xyz_reader (no ASE overhead) — orders
+    of magnitude faster than load_trajectory_frames on large iPI files.
+    Validates atom count and atom types on the first frame only; logs a warning
+    if the file contains mixed atom counts (caught by the index scan).
+
+    Parameters
+    ----------
+    path : path to trajectory file.
+    pimd : True → fast binary reader (iPI XYZ, e.g. ``aspirin.xc.xyz``);
+           False → falls back to load_trajectory_frames + position extraction.
+
+    Returns
+    -------
+    positions : (n_frames, n_atoms, 3)  float64  Å
+    steps      : (n_frames,)            int64
+    """
+    if not pimd:
+        atoms_list, steps = load_trajectory_frames(path, pimd=False)
+        positions = np.array(
+            [a.get_positions() for a in atoms_list], dtype=np.float64
+        )
+        return positions, steps.astype(np.int64)
+
+    from detectana.xyz_reader import iter_positions_chunked, load_or_build_index
+
+    path = Path(path)
+    idx = load_or_build_index(path)
+
+    # Validate atom count from index (all frames must match)
+    unique_counts = np.unique(idx.atom_count)
+    if len(unique_counts) != 1:
+        raise ValueError(
+            f"{path.name}: mixed atom counts across frames: {unique_counts.tolist()}"
+        )
+    if int(unique_counts[0]) != ASPIRIN_N_ATOMS:
+        raise ValueError(
+            f"{path.name}: expected {ASPIRIN_N_ATOMS} atoms per frame, "
+            f"got {int(unique_counts[0])}"
+        )
+
+    log.info("Fast binary reader: %d frames in %s", idx.n_frames, path.name)
+
+    all_positions: list[np.ndarray] = []
+    all_steps: list[np.ndarray] = []
+    for steps_chunk, pos_chunk in iter_positions_chunked(path):
+        all_positions.append(pos_chunk)
+        all_steps.append(steps_chunk)
+
+    if not all_positions:
+        raise ValueError(f"No frames found in {path}")
+
+    positions = np.concatenate(all_positions, axis=0)
+    steps = np.concatenate(all_steps, axis=0)
+    return positions, steps
 
 
 # ---------------------------------------------------------------------------
@@ -242,3 +307,93 @@ def load_single_frame(path: str | Path) -> Atoms:
     atoms = read(str(path), index=0)
     validate_frame(atoms, 0, source=path.name)
     return atoms
+
+
+# ---------------------------------------------------------------------------
+# PIMD HDF5 trajectory loader
+# ---------------------------------------------------------------------------
+
+class PIMDTrajectory(NamedTuple):
+    """Full PIMD trajectory loaded from a single HDF5 file.
+
+    All position arrays are in Angstrom.  Potential is in eV.
+    Force fields are None until the HDF5 format includes them.
+    """
+
+    bead_positions: np.ndarray    # (n_frames, n_beads, n_atoms, 3)  Å
+    centroid_positions: np.ndarray  # (n_frames, n_atoms, 3)          Å
+    potential: np.ndarray          # (n_frames,)                      eV
+    steps: np.ndarray              # (n_frames,)                      int64  frame index
+    bead_forces: np.ndarray | None = None      # (n_frames, n_beads, n_atoms, 3) future
+    centroid_forces: np.ndarray | None = None  # (n_frames, n_atoms, 3)          future
+
+
+def load_pimd_trajectory_hdf5(h5_path: str | Path) -> PIMDTrajectory:
+    """Load a PIMD trajectory from an HDF5 file.
+
+    Expected datasets
+    -----------------
+    bead_positions : (n_frames, n_beads, n_atoms, 3)  float64  Å
+    positions      : (n_frames, n_atoms, 3)            float64  Å  (centroid)
+    potential      : (n_frames,)                       float64  eV
+
+    Optional (not yet present — reserved for future format versions)
+    -----------------
+    bead_forces    : (n_frames, n_beads, n_atoms, 3)
+    forces         : (n_frames, n_atoms, 3)            (centroid forces)
+
+    Parameters
+    ----------
+    h5_path : path to ``nvt_trajectory.hdf5`` or equivalent.
+
+    Returns
+    -------
+    PIMDTrajectory namedtuple — see class docstring for field shapes.
+    """
+    try:
+        import h5py
+    except ImportError as exc:
+        raise ImportError(
+            "h5py is required to read HDF5 trajectory files. "
+            "Install it with: pip install h5py"
+        ) from exc
+
+    h5_path = Path(h5_path)
+    with h5py.File(h5_path, "r") as fh:
+        bead_pos = fh["bead_positions"][()].astype(np.float64)
+        centroid_pos = fh["positions"][()].astype(np.float64)
+        potential = fh["potential"][()].astype(np.float64)
+
+        bead_forces = (
+            fh["bead_forces"][()].astype(np.float64)
+            if "bead_forces" in fh else None
+        )
+        centroid_forces = (
+            fh["forces"][()].astype(np.float64)
+            if "forces" in fh else None
+        )
+
+    n_frames, n_beads, n_atoms, _ = bead_pos.shape
+    if n_atoms != ASPIRIN_N_ATOMS:
+        raise ValueError(
+            f"{h5_path.name}: expected {ASPIRIN_N_ATOMS} atoms, got {n_atoms}"
+        )
+    if centroid_pos.shape != (n_frames, n_atoms, 3):
+        raise ValueError(
+            f"{h5_path.name}: centroid shape {centroid_pos.shape} inconsistent "
+            f"with bead shape {bead_pos.shape}"
+        )
+
+    steps = np.arange(n_frames, dtype=np.int64)
+    log.info(
+        "Loaded HDF5 trajectory %s: %d frames, %d beads, %d atoms",
+        h5_path.name, n_frames, n_beads, n_atoms,
+    )
+    return PIMDTrajectory(
+        bead_positions=bead_pos,
+        centroid_positions=centroid_pos,
+        potential=potential,
+        steps=steps,
+        bead_forces=bead_forces,
+        centroid_forces=centroid_forces,
+    )

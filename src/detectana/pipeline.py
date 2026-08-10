@@ -1,4 +1,4 @@
-"""Pipeline orchestrator: steps 1–10 from AGENTS.md.
+"""Pipeline orchestrator: the ten workflow steps, end to end.
 
 Step 1.  Load trajectories and metadata.
 Step 2.  Validate units, atom order, indexing.
@@ -28,7 +28,7 @@ from detectana import __version__
 from detectana.aggregator import add_embedding_scores, aggregate_bead_scores, bead_score_summary
 from detectana.descriptors import DescriptorPipeline, compute_descriptor_batch
 from detectana.embedding_scorer import EmbeddingPipeline
-from detectana.io import iter_bead_positions, load_embeddings_h5, load_reference_frames, load_single_frame
+from detectana.io import iter_bead_positions, load_embeddings_h5, load_pimd_trajectory_hdf5, load_reference_frames, load_single_frame
 from detectana.onset import OnsetResult, detect_onset
 from detectana.scorer import MahalanobisScorer
 from detectana.topology import AspirinTopology, build_topology, check_chemistry_batch  # noqa: F401
@@ -208,65 +208,113 @@ def _process_run(
     force_recompute = io_cfg["force_recompute"]
     n_jobs = cfg.get("pipeline", {}).get("n_jobs", -1)
 
-    # ── Bead files ────────────────────────────────────────────────────────────
-    bead_files = sorted(glob.glob(run_cfg["bead_glob"]))
-    if not bead_files:
-        raise FileNotFoundError(f"No bead files matched: {run_cfg['bead_glob']}")
-    n_beads = len(bead_files)
-    log.info("Found %d bead files for run '%s'", n_beads, run_name)
+    if "hdf5" in run_cfg:
+        # ── HDF5 path ─────────────────────────────────────────────────────────
+        log.info("Loading HDF5 trajectory for run '%s' …", run_name)
+        traj = load_pimd_trajectory_hdf5(run_cfg["hdf5"])
+        _, n_beads, _, _ = traj.bead_positions.shape
+        log.info("Found %d beads for run '%s'", n_beads, run_name)
 
-    # ── Step 3+4+7: Per-bead descriptor cache + score (parallel) ─────────────
-    log.info("Processing %d beads with n_jobs=%d …", n_beads, n_jobs)
-    results: list[tuple[int, np.ndarray, np.ndarray]] = Parallel(n_jobs=n_jobs)(
-        delayed(_process_bead)(
-            bead_idx=bead_idx,
-            bead_path=bead_path,
-            desc_cache_dir=desc_cache_dir,
+        # ── Step 3+4+7: Per-bead from array (parallel threads, shared memory) ─
+        log.info("Processing %d beads with n_jobs=%d …", n_beads, n_jobs)
+        results: list[tuple[int, np.ndarray, np.ndarray]] = Parallel(
+            n_jobs=n_jobs, prefer="threads"
+        )(
+            delayed(_process_bead_array)(
+                bead_idx=bead_idx,
+                bead_positions=traj.bead_positions[:, bead_idx, :, :],
+                desc_cache_dir=desc_cache_dir,
+                topo=topo,
+                pipe=pipe,
+                scorer=scorer,
+                chem_cfg=chem_cfg,
+                force_recompute=force_recompute,
+                run_out=run_out,
+                threshold=threshold,
+            )
+            for bead_idx in range(n_beads)
+        )
+        results.sort(key=lambda r: r[0])
+
+        n_frames_ref = results[0][1].shape[0]
+        for bead_idx, scores, _ in results:
+            if scores.shape[0] != n_frames_ref:
+                raise ValueError(
+                    f"Bead {bead_idx:02d} has {scores.shape[0]} frames; "
+                    f"expected {n_frames_ref} (same as bead 00)."
+                )
+
+        bead_score_arrays = [scores for _, scores, _ in results]
+        step_arrays = results[0][2]
+
+        bead_scores = np.stack(bead_score_arrays)
+        np.save(run_out / "bead_scores.npy", bead_scores)
+
+        centroid_scores, centroid_steps = _score_centroid_array(
+            centroid_positions=traj.centroid_positions,
             topo=topo,
             pipe=pipe,
             scorer=scorer,
-            chem_cfg=chem_cfg,
+            force_recompute=force_recompute,
+            cache_dir=desc_cache_dir,
+        )
+        np.save(run_out / "centroid_scores.npy", centroid_scores)
+        del traj  # release RAM early
+
+    else:
+        # ── XYZ / bead_glob path (original) ──────────────────────────────────
+        bead_files = sorted(glob.glob(run_cfg["bead_glob"]))
+        if not bead_files:
+            raise FileNotFoundError(f"No bead files matched: {run_cfg['bead_glob']}")
+        n_beads = len(bead_files)
+        log.info("Found %d bead files for run '%s'", n_beads, run_name)
+
+        log.info("Processing %d beads with n_jobs=%d …", n_beads, n_jobs)
+        results: list[tuple[int, np.ndarray, np.ndarray]] = Parallel(n_jobs=n_jobs)(
+            delayed(_process_bead)(
+                bead_idx=bead_idx,
+                bead_path=bead_path,
+                desc_cache_dir=desc_cache_dir,
+                topo=topo,
+                pipe=pipe,
+                scorer=scorer,
+                chem_cfg=chem_cfg,
+                chunk_size=chunk_size,
+                stride=stride,
+                force_recompute=force_recompute,
+                run_out=run_out,
+                threshold=threshold,
+            )
+            for bead_idx, bead_path in enumerate(bead_files)
+        )
+        results.sort(key=lambda r: r[0])
+
+        n_frames_ref = results[0][1].shape[0]
+        for bead_idx, scores, _ in results:
+            if scores.shape[0] != n_frames_ref:
+                raise ValueError(
+                    f"Bead {bead_idx:02d} has {scores.shape[0]} frames; "
+                    f"expected {n_frames_ref} (same as bead 00). "
+                    "Check for truncated bead files."
+                )
+
+        bead_score_arrays = [scores for _, scores, _ in results]
+        step_arrays = results[0][2]
+
+        bead_scores = np.stack(bead_score_arrays)
+        np.save(run_out / "bead_scores.npy", bead_scores)
+
+        centroid_scores, centroid_steps = _score_centroid(
+            centroid_xyz=run_cfg["centroid_xyz"],
+            topo=topo,
+            pipe=pipe,
+            scorer=scorer,
             chunk_size=chunk_size,
             stride=stride,
             force_recompute=force_recompute,
-            run_out=run_out,
-            threshold=threshold,
+            cache_dir=desc_cache_dir,
         )
-        for bead_idx, bead_path in enumerate(bead_files)
-    )
-
-    # joblib preserves order, but sort explicitly to be safe
-    results.sort(key=lambda r: r[0])
-
-    # Guard against truncated bead files
-    n_frames_ref = results[0][1].shape[0]
-    for bead_idx, scores, _ in results:
-        if scores.shape[0] != n_frames_ref:
-            raise ValueError(
-                f"Bead {bead_idx:02d} has {scores.shape[0]} frames; "
-                f"expected {n_frames_ref} (same as bead 00). "
-                "Check for truncated bead files."
-            )
-
-    bead_score_arrays = [scores for _, scores, _ in results]
-    step_arrays = results[0][2]  # all beads share the same MD step sequence
-
-    # Stack bead scores: (n_beads, n_frames)
-    bead_scores = np.stack(bead_score_arrays)
-    np.save(run_out / "bead_scores.npy", bead_scores)
-
-    # ── Centroid ────────────────────────────────────────────────────────────
-    centroid_scores, centroid_steps = _score_centroid(
-        centroid_xyz=run_cfg["centroid_xyz"],
-        topo=topo,
-        pipe=pipe,
-        scorer=scorer,
-        chunk_size=chunk_size,
-        stride=stride,
-        force_recompute=force_recompute,
-        cache_dir=desc_cache_dir,
-    )
-    np.save(run_out / "centroid_scores.npy", centroid_scores)
+        np.save(run_out / "centroid_scores.npy", centroid_scores)
 
     # Align step arrays (bead and centroid should match; warn if not)
     if len(step_arrays) != len(centroid_steps):
@@ -438,6 +486,82 @@ def _load_or_compute_descriptors(
     np.savez_compressed(cache_path, steps=steps, descriptors=descs)
     log.info("Cached %d frames → %s", len(steps), cache_path.name)
     return steps, descs
+
+
+def _process_bead_array(
+    bead_idx: int,
+    bead_positions: np.ndarray,
+    desc_cache_dir: Path,
+    topo: AspirinTopology,
+    pipe: DescriptorPipeline,
+    scorer: MahalanobisScorer,
+    chem_cfg: dict,
+    force_recompute: bool,
+    run_out: Path,
+    threshold: float,
+) -> tuple[int, np.ndarray, np.ndarray]:
+    """Score one bead from an in-memory position array (HDF5 path)."""
+    bead_name = f"bead_{bead_idx:02d}"
+    cache_path = desc_cache_dir / f"{bead_name}_descriptors.npz"
+
+    if cache_path.exists() and not force_recompute:
+        log.info("Loading descriptor cache: %s", cache_path.name)
+        data = np.load(cache_path)
+        descs, steps = data["descriptors"], data["steps"]
+    else:
+        log.info("Computing descriptors for %s …", bead_name)
+        descs = compute_descriptor_batch(bead_positions, topo)
+        steps = np.arange(len(bead_positions), dtype=np.int64)
+        np.savez_compressed(cache_path, steps=steps, descriptors=descs)
+        log.info("Cached %d frames → %s", len(steps), cache_path.name)
+
+    if bead_idx == 0:
+        log.info("Running hard-chemistry checks on bead 00 …")
+        flags_batch = check_chemistry_batch(
+            bead_positions, topo,
+            chem_cfg["bond_break_cutoff"],
+            chem_cfg["close_contact_cutoff"],
+        )
+        chem_rows = [{"step": int(s), **f.to_dict()} for s, f in zip(steps, flags_batch)]
+        chem_df = pd.DataFrame(chem_rows)
+        chem_df.to_csv(run_out / "chemistry_flags_bead00.csv", index=False)
+        log.info(
+            "Chemistry flags — broken bonds: %d frames, close contacts: %d frames",
+            chem_df["broken_bond"].sum(), chem_df["close_contact"].sum(),
+        )
+
+    X_pca = pipe.transform(descs)
+    scores = scorer.score(X_pca)
+    log.info("Bead %02d scored: max=%.3f, frac_ood=%.4f",
+             bead_idx, scores.max(), (scores > threshold).mean())
+    return bead_idx, scores, steps
+
+
+def _score_centroid_array(
+    centroid_positions: np.ndarray,
+    topo: AspirinTopology,
+    pipe: DescriptorPipeline,
+    scorer: MahalanobisScorer,
+    force_recompute: bool,
+    cache_dir: Path,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Score centroid from an in-memory position array (HDF5 path)."""
+    cache_path = cache_dir / "centroid_descriptors.npz"
+
+    if cache_path.exists() and not force_recompute:
+        log.info("Loading descriptor cache: centroid_descriptors.npz")
+        data = np.load(cache_path)
+        descs, steps = data["descriptors"], data["steps"]
+    else:
+        log.info("Computing descriptors for centroid …")
+        descs = compute_descriptor_batch(centroid_positions, topo)
+        steps = np.arange(len(centroid_positions), dtype=np.int64)
+        np.savez_compressed(cache_path, steps=steps, descriptors=descs)
+        log.info("Cached %d frames → centroid_descriptors.npz", len(steps))
+
+    X_pca = pipe.transform(descs)
+    scores = scorer.score(X_pca)
+    return scores, steps
 
 
 def _score_centroid(

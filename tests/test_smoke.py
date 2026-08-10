@@ -1,4 +1,4 @@
-"""Smoke-test suite — validates AGENTS.md checklist without requiring full data.
+"""Smoke-test suite — the project validation checklist, run without full data.
 
 Tests
 -----
@@ -26,34 +26,7 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 SMOKE_DATA_DIR = PROJECT_ROOT / "data" / "smoke"
 
 INITIAL_XYZ = Path(os.environ.get("DETECTANA_INITIAL_XYZ", SMOKE_DATA_DIR / "initial.xyz"))
-TRAIN_XYZ = Path(os.environ.get("DETECTANA_TRAIN_XYZ", SMOKE_DATA_DIR / "reference_train.xyz"))
 BEAD_00_XYZ = Path(os.environ.get("DETECTANA_BEAD_00_XYZ", SMOKE_DATA_DIR / "aspirin.pos_00.xyz"))
-
-
-# ---------------------------------------------------------------------------
-# Fixtures
-# ---------------------------------------------------------------------------
-
-@pytest.fixture(scope="module")
-def topo():
-    from detectana.topology import build_topology
-    return build_topology(INITIAL_XYZ)
-
-
-@pytest.fixture(scope="module")
-def train_positions():
-    from detectana.io import load_reference_frames
-    pos, _, _ = load_reference_frames(TRAIN_XYZ)
-    return pos  # (n_frames, 21, 3)
-
-
-@pytest.fixture(scope="module")
-def fitted_pipeline(topo, train_positions):
-    from detectana.descriptors import DescriptorPipeline, compute_descriptor_batch
-    X_train = compute_descriptor_batch(train_positions, topo)
-    pipe = DescriptorPipeline(pca_variance=0.95, random_seed=42)
-    pipe.fit(X_train)
-    return pipe, X_train
 
 
 # ---------------------------------------------------------------------------

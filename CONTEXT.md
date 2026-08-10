@@ -30,13 +30,23 @@ files.
 
 ## Data Files
 
-**PIMD trajectory data** — `CCSD_newdata/`:
+**PIMD trajectory data (iPI XYZ format)** — `CCSD_newdata/`:
 - `aspirin.pos_NN.xyz` — bead NN positions (Å), 16 files (NN = 00–15)
 - `aspirin.for_NN.xyz` — bead NN forces (atomic units), 16 files
 - `aspirin.xc.xyz` — centroid positions (Å)
 - `aspirin.fc.xyz` — centroid forces (atomic units)
 - `*.frameindex.npz` — byte-offset index for O(1) frame access
 - ~200,000 frames per bead file (10,000,000 steps ÷ stride 50)
+
+**PIMD trajectory data (HDF5 format)** — `*/hdf5/nvt_trajectory.hdf5`:
+- Single file per run containing all beads and centroid together.
+- `bead_positions` : `(n_frames, n_beads, n_atoms, 3)` float64 Å
+- `positions`      : `(n_frames, n_atoms, 3)` float64 Å — centroid (= mean of beads)
+- `potential`      : `(n_frames,)` float64 eV
+- `bead_momenta`, `momenta` : momenta arrays (not used by pipeline currently)
+- No forces in current files; `bead_forces` / `forces` datasets reserved for future versions.
+- Steps are frame indices `0…n_frames−1`; no physical time metadata stored.
+- Read via `load_pimd_trajectory_hdf5` → `PIMDTrajectory` namedtuple.
 
 **Reference dataset** — `aspirin_md17_pimd_pbe_mbd_tight/`:
 - `aspirin_md_pimd_pbe0_mbd_train2500.xyz` — 2500 training frames
@@ -96,6 +106,27 @@ internal-coordinate fingerprint (dihedral index 32).
 Describes the rotation around the ester oxygen bond. Encoded as
 `sin_dih_C5-C6-O12-C11` and `cos_dih_C5-C6-O12-C11` in the
 internal-coordinate fingerprint (dihedral index 35).
+
+**Constrained diverse sampling** — configuration selection mode in
+`select_configurations.py`. One or more dihedrals are designated *primary
+dihedrals* (constraint); `--radius` is the maximum allowed distance in the
+sin/cos space of those dihedrals from the reference value. `--radius` accepts
+either one scalar (isotropic, circular constraint: same radius for all primary
+dihedrals) or one scalar per primary dihedral (anisotropic, elliptic
+constraint). Among the frames that pass the constraint, N configurations are
+chosen by Farthest-Point Sampling in the *complementary* raw
+internal-coordinate space (all bonds, angles, remaining dihedrals, ring
+planarity — the primary dihedral sin/cos columns are excluded). Result:
+structures with the constrained dihedral held near the reference value but
+maximally diverse in all other conformational degrees of freedom.
+
+**Elliptic dihedral constraint** — anisotropic variant of constrained diverse
+sampling. Each primary dihedral i is assigned its own radius Rᵢ. A frame
+passes the filter when `sum((dᵢ/Rᵢ)²) ≤ 1`, where dᵢ is the chord distance
+in the sin/cos space of dihedral i. With a single shared radius this reduces
+exactly to the isotropic (circular) constraint. The output `descriptor_distance`
+field stores the normalized ellipse distance `sqrt(sum((dᵢ/Rᵢ)²))`; values
+≤ 1 lie inside the ellipse.
 
 **Descriptor space** — the PCA-reduced internal-coordinate space. The
 coordinate system in which inter-frame distances are computed for configuration
