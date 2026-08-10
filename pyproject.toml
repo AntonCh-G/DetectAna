@@ -5,7 +5,23 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "detectana"
 version = "0.1.0"
-description = "Detect onset of structural anomalies in aspirin PIMD trajectories"
+description = "Detect the onset of structural anomalies in MD and PIMD trajectories from machine-learned force fields"
+readme = "README.md"
+license = { text = "MIT" }
+authors = [{ name = "Anton Charkin-Gorbulin" }]
+keywords = [
+    "molecular-dynamics",
+    "path-integral-molecular-dynamics",
+    "machine-learning-force-fields",
+    "out-of-distribution-detection",
+    "computational-chemistry",
+]
+classifiers = [
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Intended Audience :: Science/Research",
+    "Topic :: Scientific/Engineering :: Chemistry",
+]
 requires-python = ">=3.10"
 dependencies = [
     "ase>=3.22",
@@ -21,6 +37,15 @@ dependencies = [
 
 [project.optional-dependencies]
 dev = ["pytest>=7.0", "pytest-cov"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+# Run the suite straight from a clone, with or without an editable install.
+pythonpath = ["src"]
+
+[project.urls]
+Homepage = "https://github.com/AntonCh-G/DetectAna"
+Repository = "https://github.com/AntonCh-G/DetectAna"
 
 [tool.setuptools.packages.find]
 where = ["src"]

@@ -43,7 +43,7 @@ Add a second, fully independent OOD track alongside the geometric track.
    scores on the validation set.
 
 4. **Per-frame aggregation** — reduce `(21,)` per-atom scores to one scalar via
-   `max`. Rationale: consistent with AGENTS.md rule of "never average away bead
+   `max`. Rationale: consistent with the project rule of "never average away bead
    signals"; flags as OOD if *any* atom is extrapolating.
 
 5. **Bead aggregation** — aggregate per-frame max scores over 16 beads via the

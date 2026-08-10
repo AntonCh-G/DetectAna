@@ -1,0 +1,94 @@
+# Template. Copy it and fill in your paths:
+#
+#     cp config/example.yaml config/local.yaml
+#     python scripts/run_pipeline.py --config config/local.yaml
+#
+# config/local.yaml is git-ignored. Paths can be absolute, or relative to
+# wherever you run the command from.
+
+# ── Reference data ────────────────────────────────────────────────────────────
+# Extended XYZ: positions in Å, forces in eV/Å, energy in eV. The MD17 and
+# rMD17 aspirin sets work if you need a public source.
+#   train  fits the StandardScaler, the PCA and the Mahalanobis statistics
+#   valid  sets the OOD threshold, and is never fitted on
+#   test   held back for reporting
+reference:
+  train: "path/to/aspirin_train.xyz"
+  valid: "path/to/aspirin_valid.xyz"
+  test:  "path/to/aspirin_test.xyz"
+
+# ── Runs ──────────────────────────────────────────────────────────────────────
+# One entry per simulation. A run is the independent statistical unit, so add
+# more entries here to compare force fields against the same reference set.
+runs:
+  - name: "run_name"
+    # Single frame that fixes the atom ordering and the bond graph.
+    initial_xyz: "path/to/initial.xyz"
+
+    # --- Option A: i-PI XYZ, one file per bead ---
+    # Sorted glob order becomes bead 00..NN. For classical MD, point both of
+    # these at the same single trajectory file.
+    bead_glob: "path/to/aspirin.pos_*.xyz"
+    centroid_xyz: "path/to/aspirin.xc.xyz"
+
+    # --- Option B: one HDF5 file with all beads and the centroid ---
+    # Comment out the two lines above and uncomment this.
+    # hdf5: "path/to/nvt_trajectory.hdf5"
+
+    # frame_time_fs = timestep_fs * stride
+    timestep_fs: 0.2
+    stride: 50
+
+    # --- Optional embedding track, needs pre-computed MLFF descriptors ---
+    # embedding_glob: "path/to/embeddings/bead_*.h5"
+    # centroid_embedding_h5: "path/to/embeddings/centroid.h5"
+
+# ── Descriptor / OOD ─────────────────────────────────────────────────────────
+descriptor:
+  # How much variance the PCA keeps.
+  pca_variance: 0.95
+  # Fixed so runs are reproducible.
+  random_seed: 42
+
+# ── Threshold calibration ─────────────────────────────────────────────────────
+threshold:
+  # Which percentile of the validation-set scores becomes the OOD threshold.
+  percentile: 99.0
+
+# ── Hard-chemistry checks ─────────────────────────────────────────────────────
+chemistry:
+  # A bond longer than this counts as broken (Å).
+  bond_break_cutoff: 2.0
+  # Two non-bonded atoms closer than this count as a close contact (Å).
+  close_contact_cutoff: 1.2
+  # NeighborList multiplier used when building the fixed bond graph.
+  nl_mult: 1.1
+
+# ── Onset detection ──────────────────────────────────────────────────────────
+onset:
+  window_frames: 500
+  step_frames: 50
+  # How much of a window has to be OOD before it counts as onset.
+  fraction_threshold: 0.20
+
+# ── Embedding track, optional ────────────────────────────────────────────────
+# Needs the per-frame MLFF invariant features written to HDF5 first, see
+# scripts/extract_embeddings.py.
+# embedding:
+#   enabled: true
+#   reference_train_h5: "path/to/embeddings/reference_train.h5"
+#   reference_valid_h5: "path/to/embeddings/reference_valid.h5"
+
+# ── Pipeline ─────────────────────────────────────────────────────────────────
+pipeline:
+  # Workers for the per-bead loop. -1 uses every core, which on SLURM means
+  # whatever --cpus-per-task gave you. 1 is serial and easier to debug.
+  n_jobs: -1
+
+# ── I/O ───────────────────────────────────────────────────────────────────────
+io:
+  # Frames read at a time from large bead XYZ files.
+  chunk_size: 5000
+  output_dir: "outputs"
+  # Recompute descriptors instead of reusing the caches.
+  force_recompute: false

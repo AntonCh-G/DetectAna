@@ -1,0 +1,62 @@
+# Demo config. Runs the whole pipeline on data/smoke/ in a few seconds.
+# From the repository root:
+#
+#     python scripts/run_pipeline.py --config config/demo.yaml
+#
+# The geometries are real, but there are far too few of them to mean anything:
+# 64 training frames, 32 validation frames, one bead, 24 trajectory frames.
+# This is here to check the install works. Start from config/example.yaml for
+# a real run.
+
+# ── Reference data ────────────────────────────────────────────────────────────
+# The two files share no frames, so the threshold is calibrated on geometries
+# the PCA never saw.
+reference:
+  train: "data/smoke/reference_train.xyz"
+  valid: "data/smoke/reference_valid.xyz"
+  test:  "data/smoke/reference_valid.xyz"
+
+# ── PIMD run(s) ───────────────────────────────────────────────────────────────
+runs:
+  - name: "demo"
+    initial_xyz: "data/smoke/initial.xyz"
+    # Only one bead here. A real PIMD run has 16 or so.
+    bead_glob: "data/smoke/aspirin.pos_*.xyz"
+    # With one bead, that bead is the centroid.
+    centroid_xyz: "data/smoke/aspirin.xc.xyz"
+    timestep_fs: 0.2
+    stride: 50
+
+# ── Descriptor / OOD ─────────────────────────────────────────────────────────
+descriptor:
+  pca_variance: 0.95
+  random_seed: 42
+
+# ── Threshold calibration ─────────────────────────────────────────────────────
+threshold:
+  # 95th rather than 99th: with only 32 validation frames the 99th percentile
+  # is just the maximum.
+  percentile: 95.0
+
+# ── Hard-chemistry checks ─────────────────────────────────────────────────────
+chemistry:
+  bond_break_cutoff: 2.0
+  close_contact_cutoff: 1.2
+  nl_mult: 1.1
+
+# ── Onset detection ──────────────────────────────────────────────────────────
+onset:
+  # Scaled down to fit a 24-frame trajectory.
+  window_frames: 5
+  step_frames: 1
+  fraction_threshold: 0.20
+
+# ── Pipeline ─────────────────────────────────────────────────────────────────
+pipeline:
+  n_jobs: 1
+
+# ── I/O ───────────────────────────────────────────────────────────────────────
+io:
+  chunk_size: 5000
+  output_dir: "outputs/demo"
+  force_recompute: false

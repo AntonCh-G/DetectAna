@@ -13,7 +13,7 @@ Need a scalar OOD score per frame (bead or centroid) that:
 - Has no dependency on atom-centered symmetry functions (deferred to future work)
 
 Alternatives considered:
-- **SOAP/ACSF descriptors**: More expressive but adds `dscribe`/`librascal` dependency; explicitly listed as future work in AGENTS.md
+- **SOAP/ACSF descriptors**: More expressive but adds `dscribe`/`librascal` dependency; explicitly listed as future work in the project rules
 - **Raw Cartesian RMSD**: Rotation-sensitive; less interpretable for flexible molecule
 - **Isolation Forest / kernel methods**: Black-box; harder to diagnose which coordinate drives the score
 

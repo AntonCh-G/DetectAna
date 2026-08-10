@@ -2,7 +2,7 @@
 
 One MahalanobisScorer is fit per atom index, preserving the stable atom
 ordering validated against initial.xyz. Per-frame scores are reduced to a
-scalar via max over atoms — consistent with the AGENTS.md rule of never
+scalar via max over atoms — consistent with the project rule of never
 averaging away signals. A single threshold is calibrated on the
 max-over-atoms scores from the validation set.
 """

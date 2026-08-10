@@ -1,6 +1,6 @@
 """Aggregate per-bead OOD scores into per-timestep summaries.
 
-Per-timestep aggregates (AGENTS.md requirement):
+Per-timestep aggregates required by the project rules:
 - max bead score
 - 95th-percentile bead score
 - fraction of beads above OOD threshold

@@ -1,6 +1,6 @@
 """Windowed anomaly-onset detector.
 
-Onset definition (AGENTS.md step 9):
+Onset definition (workflow step 9):
     First window W such that fraction of frames in W with score > threshold
     exceeds ``fraction_threshold``.
 

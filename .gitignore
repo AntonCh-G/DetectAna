@@ -16,15 +16,30 @@ htmlcov/
 
 # Local machine and editor/tool state
 .DS_Store
+*.icloud
 .env
 .env.*
-.claude/
 .scratch/
 
-# Private/local scientific data configuration
+# AI coding assistant instructions and state (kept local, not published)
+.claude/
+.cursor/
+.cursorrules
+.windsurfrules
+.aider*
+.github/copilot-instructions.md
+CLAUDE.md
+AGENTS.md
+GEMINI.md
+docs/agents/
+
+# Private/local scientific data configuration (may contain machine-specific paths).
+# The demo and template configs are tracked deliberately.
 config/*.yaml
+!config/demo.yaml
+!config/example.yaml
 
 # Generated workflow outputs and trajectory indexes
 outputs/
-*.frameindex.npz
+*.frameindex*.npz
 *.out
