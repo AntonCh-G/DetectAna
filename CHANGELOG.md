@@ -10,7 +10,7 @@ are called out explicitly whenever they change, because a silent change there
 produces results that still look plausible. See
 [docs/scientific-rules.md](docs/scientific-rules.md).
 
-## Unreleased
+## 0.2.0 — 2026-08-10
 
 ### Added
 - Molecule-agnostic topology. The molecule is defined by the run's `initial.xyz`

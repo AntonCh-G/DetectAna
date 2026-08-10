@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "detectana"
-version = "0.1.0"
+version = "0.2.0"
 description = "Detect the onset of structural anomalies in MD and PIMD trajectories from machine-learned force fields"
 readme = "README.md"
 license = { text = "MIT" }

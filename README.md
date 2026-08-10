@@ -8,7 +8,7 @@
 DetectAna finds the point in an MD or PIMD trajectory where a machine-learned
 force field stops being supported by its training data.
 
-**Status:** v0.1.0, under active development. The geometric scoring track, the
+**Status:** v0.2.0, under active development. The geometric scoring track, the
 onset detector and the evaluation harness are working and tested; the
 [roadmap](#status-and-roadmap) says what is next and what is deliberately not
 supported yet. Interfaces may still change. Scientific definitions, thresholds and
