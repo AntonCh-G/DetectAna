@@ -3,9 +3,17 @@
 [![CI](https://github.com/AntonCh-G/DetectAna/actions/workflows/ci.yml/badge.svg)](https://github.com/AntonCh-G/DetectAna/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 [![Python 3.10+](https://img.shields.io/badge/python-3.10%2B-blue.svg)](https://www.python.org/)
+[![Status: active development](https://img.shields.io/badge/status-active%20development-brightgreen.svg)](#status-and-roadmap)
 
 DetectAna finds the point in an MD or PIMD trajectory where a machine-learned
 force field stops being supported by its training data.
+
+**Status:** v0.1.0, under active development. The geometric scoring track, the
+onset detector and the evaluation harness are working and tested; the
+[roadmap](#status-and-roadmap) says what is next and what is deliberately not
+supported yet. Interfaces may still change. Scientific definitions, thresholds and
+atom indexing will not change silently — see
+[docs/scientific-rules.md](docs/scientific-rules.md).
 
 ## Why
 
@@ -551,6 +559,51 @@ exactly the behaviour the pipeline is looking for.
 
 Only positions go into the descriptor. Forces are read and validated but not
 used for scoring yet.
+
+## Status and roadmap
+
+Everything in the table below is either working and covered by tests, or listed as
+not yet done. Nothing planned is described anywhere in this README as though it
+already worked — if a number appears, a run produced it.
+
+### Working today
+
+| Capability | Evidence |
+|---|---|
+| Geometric OOD scoring, PIMD and classical MD, XYZ and HDF5 input | `pytest`, and the demo pipeline runs in CI |
+| Molecule-agnostic topology, optional ring | [ADR 0003](docs/adr/0003-molecule-agnostic-topology.md), ethanol tests |
+| Onset detection with a stated false-alarm budget | [ADR 0004](docs/adr/0004-detector-evaluation.md), `tests/test_onset_design.py` |
+| Detector benchmark against coverage-labelled distortions | [the result above](#how-well-does-the-detector-work), CI smoke run |
+| Embedding OOD track on pre-computed MLFF descriptors | [ADR 0002](docs/adr/0002-embedding-ood-track.md) |
+| Training-set selection in descriptor space | `scripts/select_configurations.py` |
+
+### Next
+
+1. **Validate the score against force-field error.** The machinery
+   (`scripts/score_vs_error.py`) is written and checked on synthetic controls;
+   it needs forces recomputed with the reference method for a few hundred frames
+   spanning the score range. This is the number that decides whether the score is
+   a reliability estimate or only a novelty measure, and it is the next thing I
+   intend to run.
+2. **Compare the geometric and embedding tracks** on the same benchmark. Two
+   detectors exist and have never been measured against each other.
+3. **Close the active-learning loop**: detect the failure, select new geometries,
+   recompute at the reference level, retrain, re-score. The first two steps are
+   here; the rest lives in adjacent tooling and is not yet wired together.
+4. **Force-based descriptors.** Forces are already loaded and unit-checked. A
+   force-error signal would likely fire earlier than a geometric one.
+5. **Local atomic-environment descriptors** (SOAP or ACSF). Deliberately deferred
+   in [ADR 0001](docs/adr/0001-ood-scoring-method.md) to avoid a heavy dependency;
+   worth revisiting now that the evaluation harness can measure whether they help.
+
+### Deliberately not supported
+
+- **Periodic boundaries and multiple molecules.** Internal coordinates are computed
+  on raw coordinates with no periodic images, so this is a gas-phase
+  single-molecule tool. A disconnected bond graph produces a warning, not support.
+- **MLFF inference.** The force field is an external system; DetectAna reads
+  pre-computed embeddings and never imports a deep-learning framework. That keeps
+  the install CPU-only and the package importable anywhere.
 
 ## License
 
