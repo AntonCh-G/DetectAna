@@ -74,8 +74,9 @@ the same distribution. The quantum-chemical method behind it is a property of
 the dataset, not of DetectAna: the pipeline never reads or records it, and
 swapping reference sets is a configuration change.
 
-The reference set used during development (2500 train / 600 validation / 400
-test aspirin frames) is **not redistributable and is not in this repository**.
+The reference set used during development (a fixed train / validation / test
+split of aspirin frames) belongs to work that is not yet published, so it is
+**not redistributable and is not in this repository**.
 What ships instead is `data/smoke/` — 64 training, 32 validation and 24
 trajectory frames generated synthetically from one equilibrium geometry by
 [../scripts/make_demo_data.py](../scripts/make_demo_data.py). It exercises every
@@ -312,8 +313,9 @@ $$n_\text{eff} = W \cdot \frac{1 - \rho}{1 + \rho} \cdot n_\text{beads}^\text{ef
   images of one molecule; treating 16 as 16 independent draws would understate
   the false-alarm rate by orders of magnitude. Raise it only with evidence.
 
-Measured on the development reference scores, $\rho \approx 0.3$–$0.37$, so a
-500-frame window carries roughly 230 effective trials, not 500.
+Reference scores in this project show a clearly positive $\rho$, so a 500-frame
+window carries appreciably fewer than 500 effective trials. The table below uses
+$\rho = 0.4$ as an illustration.
 
 ### 7.4 False-alarm bound
 
@@ -350,7 +352,7 @@ $\alpha = 1\%$ and a 1 % budget:
 | assumption on $\rho$ | derived fraction | flags needed | bound per run |
 |---|---|---|---|
 | 0 (independence assumed) | 0.038 | 19 of 500 | 0.005 |
-| 0.37 (measured) | 0.057 | 13 of 230 | 0.003 |
+| 0.4 (illustrative) | 0.057 | 12 of 214 | 0.003 |
 
 Compare the shipped default `fraction_threshold: 0.20`, which needs 100 of 500
 frames flagged and has a bound near $10^{-91}$: safe to the point of being
@@ -368,9 +370,9 @@ obvious way to do that is wrong.
 
 The first version of the benchmark rotated whichever torsion divided the
 molecule most evenly, called the rotated frames anomalies, and reported
-AUROC ≈ 0.52 from 5° to 180°. Read naively: a detector blind to conformational
+near chance from 5° to 180°. Read naively: a detector blind to conformational
 change. It was not. The chosen torsion (the ester C1–C6–O12–C11) is fully
-sampled in the reference set — all twelve 30° slices occupied, σ = 92° — so the
+sampled in the reference set — every 30° slice occupied — so the
 rotated frames were *in distribution*, and flagging them would have been the
 error. The benchmark was measuring its own mislabelling
 ([ADR 0004](adr/0004-detector-evaluation.md)).
@@ -436,12 +438,13 @@ so.
 reference training distribution than 99 % of held-out reference frames." "The
 window rule fired here, with a run-level false-alarm bound of $p$." "Training
 coverage and flag rate are strongly anti-correlated on the development reference
-set." "Bond stretches of 0.3–0.5 Å are flagged while the 2.0 Å hard-chemistry
-cutoff is still silent."
+set." "Bond stretches well below the 2.0 Å hard-chemistry cutoff are flagged
+while that cutoff is still silent."
 
-**Not supported.** "This frame is unphysical." A torsion slice holding 5 of 2500
-training frames is flagged every time, and those conformers are chemically
-unremarkable — the benchmark demonstrates this rather than asserting it. "The
+**Not supported.** "This frame is unphysical." A torsion slice holding only a
+handful of training frames is flagged reliably, and those conformers are
+chemically unremarkable — the benchmark demonstrates this rather than asserting
+it. "The
 force field's error is large here": plausible, and the reason the tool exists,
 but **not yet measured**. `scripts/score_vs_error.py` implements the test —
 Spearman correlation between score and per-frame force error, error by score

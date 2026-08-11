@@ -261,7 +261,7 @@ def main() -> None:
 
     # Summarising the scan needs care. Averaging over every visited slice mixes
     # well-sampled regions with ones holding a handful of frames, and the sparse
-    # ones are legitimately flagged — 5 frames in 2500 is not coverage. So report
+    # ones are legitimately flagged — a handful of frames is not coverage. So report
     # the two ends separately, plus the rank correlation, which is the real claim:
     # the flag rate falls monotonically as training density rises.
     scan = df[df["distortion"] == "torsion_scan"]

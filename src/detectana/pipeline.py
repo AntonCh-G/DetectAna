@@ -136,7 +136,7 @@ def run_pipeline(cfg: dict) -> None:
 
     # ── Step 4–5: Descriptors + PCA fit on training data ─────────────────────
     log.info("Computing training descriptors …")
-    X_train = compute_descriptor_batch(train_pos, topo)   # (2500, n_feat)
+    X_train = compute_descriptor_batch(train_pos, topo)   # (n_train, n_feat)
 
     desc_cfg = cfg["descriptor"]
     pipe = DescriptorPipeline(

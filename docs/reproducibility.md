@@ -13,8 +13,8 @@ reference lives in [usage.md](usage.md) and the scientific reasoning in
 | The demo pipeline end to end | Yes | `config/demo.yaml` + `data/smoke/` |
 | The detector benchmark *machinery* | Yes | Runs on the demo data; the numbers are meaningless there and it says so |
 | `data/smoke/` itself | Yes | `scripts/make_demo_data.py`, deterministic given its seeds |
-| The benchmark **numbers** in the README | **No** | Measured on a 2500-frame reference set that cannot be redistributed |
-| The example score-vs-time figure | **No** | A 500 ns PIMD run; the trajectory is not in this repository |
+| The detector benchmark **results** | **No** | Measured on a reference set that cannot be redistributed. Withheld until the associated work is published |
+| Figures from production runs | **No** | Plots of trajectories that are not in this repository, withheld for the same reason |
 
 Nothing in the repository presents an unreproducible number without saying so at
 the point it appears.
@@ -210,10 +210,10 @@ assertion that no trajectory frame leaked into the fit or the calibration.
 
 ## What still cannot be reproduced, and what it would take
 
-- **The benchmark numbers** (Spearman −0.93, 100 % detection in unvisited torsion
-  slices) need the 2500-frame reference set, which is unpublished and cannot be
-  shipped yet. Substituting your own reference set reproduces the *method* and
-  gives numbers for your data, not these numbers.
+- **The benchmark results** need the development reference set, which is
+  unpublished and cannot be shipped yet; the numbers and the figures are withheld
+  until it is, and will be published with the associated work. Substituting your
+  own reference set reproduces the *method* and gives numbers for your data.
 - **The score-versus-force-error validation** has never been run.
   `scripts/score_vs_error.py` implements it and needs the same frames twice —
   once with reference-method forces, once with the force field's:

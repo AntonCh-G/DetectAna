@@ -23,9 +23,9 @@ beads and that signal is gone.
 
 At each timestep the pipeline keeps the maximum, the 95th percentile, and the
 fraction of beads above the threshold. Add other aggregates if they help, but
-those three stay. The example plot in the README shows why: individual beads
-cross the threshold on and off for the entire first half of a 500 ns run, while
-the mean would have looked flat.
+those three stay. Production runs show why: individual beads cross the threshold
+on and off for a long stretch before anything happens collectively, while the mean
+over beads looks flat throughout.
 
 ## Out of distribution is not the same as unphysical
 
@@ -79,7 +79,7 @@ Two consequences worth keeping:
   α = 1 % has a bound near 10⁻⁹¹ — it needs 100 of 500 frames flagged, so it is
   safe and insensitive at once, and a real partial excursion can pass under it.
 - Do not assume frames are independent. Reference scores in this project show a
-  lag-1 autocorrelation near 0.3, and a trajectory is worse. Assuming
+  clearly positive lag-1 autocorrelation, and a trajectory is worse. Assuming
   independence inflates the effective sample size and understates false alarms.
 
 Beads count as one observation per timestep unless you have measured otherwise.
@@ -95,7 +95,7 @@ distribution and flagging it would be the error.
 
 This is not hypothetical. Rotating aspirin's ester torsion by 180° produces a
 perfectly ordinary frame, because the reference set covers that torsion's whole
-circle, and an early version of the benchmark scored the detector at AUROC 0.52 on
+circle, and an early version of the benchmark scored the detector near chance on
 exactly that basis before the mislabelling was found.
 
 So every synthetic positive is labelled by training coverage, and the two regimes
@@ -104,7 +104,7 @@ measurement, flag rate where there is none is a sensitivity measurement. Averagi
 them describes nothing. See [adr/0004-detector-evaluation.md](adr/0004-detector-evaluation.md).
 
 The same benchmark is where "out of distribution is not unphysical" stops being a
-slogan: a torsion slice holding 5 of 2500 training frames is flagged every time,
+slogan: a torsion slice holding a handful of training frames is flagged reliably,
 and those conformers are chemically unremarkable.
 
 ## Report the three levels separately

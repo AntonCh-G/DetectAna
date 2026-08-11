@@ -17,10 +17,10 @@ manufactured, and the obvious approach — distort frames, call them anomalies,
 compute AUROC — is wrong in a way that is easy to miss.
 
 We hit it directly. The first version of the benchmark rotated whichever torsion
-divided the molecule most evenly and reported AUROC ≈ 0.52 across rotations from
-5° to 180°, which reads as a detector blind to conformational change. It was not.
-The chosen torsion (the ester C1-C6-O12-C11) is fully sampled in the reference
-set — all twelve 30° slices occupied, σ = 92° — so the rotated frames were
+divided the molecule most evenly and scored the detector near chance across
+rotations from 5° to 180°, which reads as a detector blind to conformational
+change. It was not. The chosen torsion (the ester) is fully sampled in the
+reference set — every 30° slice occupied — so the rotated frames were
 in-distribution and flagging them would have been the error. The benchmark was
 measuring its own mislabelling.
 
@@ -58,19 +58,19 @@ idealised detector.
 
 ## Consequences
 
-- Measured on the 2500-frame aspirin reference set used during development, which
-  is not redistributable and is not in this repository: Spearman −0.93 between
-  training density and flag rate, 100 % detection in unvisited slices, 4.1 % in
-  well-sampled ones. The detector flags a conformer in proportion to how little
-  training data supports it, which is what the project's definition of OOD asks
-  for. The numbers are therefore not reproducible from a clone; the shipped demo
-  data reproduces the machinery, not the result.
-- The benchmark confirms the "OOD is not unphysical" rule empirically. A slice
-  holding 5 frames out of 2500 is flagged every time, and those conformers are
-  chemically ordinary. The score measures coverage, not correctness.
-- Bond stretches of 0.3–0.5 Å are caught while the 2.0 Å hard-chemistry cutoff is
-  still silent, so the statistical track adds sensitivity rather than duplicating
-  the chemistry check.
+- The benchmark was run on the aspirin reference set used during development.
+  **The quantitative results are withheld**: that set belongs to work which is not
+  yet published, so neither the numbers nor the figures are in this repository and
+  they cannot be reproduced from a clone. Qualitatively, the detector flags a
+  conformer in proportion to how little training data supports it, which is what
+  the project's definition of OOD asks for. The shipped demo data reproduces the
+  machinery, not the result. Results will be published with the associated work.
+- The benchmark confirms the "OOD is not unphysical" rule empirically: sparsely
+  covered torsion slices are flagged reliably, and those conformers are chemically
+  ordinary. The score measures coverage, not correctness.
+- Bond stretches well below the 2.0 Å hard-chemistry cutoff are caught while that
+  cutoff is still silent, so the statistical track adds sensitivity rather than
+  duplicating the chemistry check.
 - A separate question needs external data: whether a high score predicts actual
   force error. `scripts/score_vs_error.py` implements it, and it stays out of CI
   because it needs forces recomputed with the reference method.

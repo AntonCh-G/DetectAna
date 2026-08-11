@@ -28,8 +28,8 @@ independent statistical unit for inter-model comparison. Multiple runs
 (potentially from different MLFFs) will be compared against the same reference
 dataset.
 
-**Bead** — one replica in the ring polymer. 16 beads per PIMD run in the current
-dataset. Bead trajectories are *not* independent replicas; they are quantum
+**Bead** — one replica in the ring polymer, typically 16 per run. Bead
+trajectories are *not* independent replicas; they are quantum
 path-integral images of the same molecule. Bead-level anomaly scores are
 early-warning signals, not standalone measurements.
 
@@ -56,7 +56,8 @@ inverts it, turning a `false_alarm_budget` into the loosest fraction that fits.
 
 **Effective trials** — independent flag opportunities in a window, `window ·
 (1−ρ)/(1+ρ)` for lag-1 autocorrelation ρ, times `n_effective_beads` (default 1,
-since beads are not independent). A 500-frame window at ρ = 0.37 carries ~230.
+since beads are not independent). For illustration, a 500-frame window at
+ρ = 0.4 carries about 210.
 
 **Onset design report** — the block written to `manifest.json` recording α, the
 window, the fraction actually used, ρ, effective trials, flags needed and the
@@ -104,9 +105,9 @@ reliability estimate. Needs forces from the reference method, so it lives in
 - Read via `load_pimd_trajectory_hdf5` → `PIMDTrajectory` namedtuple.
 
 **Reference dataset** — one directory holding a fixed train/valid/test split:
-- `*_train.xyz` — 2500 training frames (fit the standardiser, PCA and covariance)
-- `*_valid.xyz` — 600 validation frames (calibrate the threshold)
-- `*_test.xyz` — 400 test frames (check the calibration held)
+- `*_train.xyz` — training frames (fit the standardiser, PCA and covariance)
+- `*_valid.xyz` — validation frames (calibrate the threshold)
+- `*_test.xyz` — test frames (check the calibration held)
 - Format: extended XYZ (positions Å, forces eV/Å, energy eV)
 - The quantum-chemical method behind the reference forces is a property of the
   dataset, not of DetectAna. The pipeline neither reads nor records it; swapping

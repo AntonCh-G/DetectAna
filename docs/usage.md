@@ -123,7 +123,7 @@ budget:
 | autocorrelation | derived fraction | flags needed | bound per run |
 |---|---|---|---|
 | 0 (assumed independent) | 0.038 | 19 of 500 | 0.005 |
-| 0.37 (measured) | 0.057 | 13 of 230 | 0.003 |
+| 0.4 (illustrative) | 0.057 | 12 of 214 | 0.003 |
 
 Compare the default `fraction_threshold: 0.20`, which needs 100 of 500 frames
 flagged, for a bound near 10⁻⁹¹. That is safe to the point of being insensitive:
@@ -408,5 +408,4 @@ docs/
   scientific-rules.md   The constraints the pipeline is built around
   glossary.md           Terms, units, array shapes
   adr/                  Decision records
-  images/               Figures used in the README
 ```
