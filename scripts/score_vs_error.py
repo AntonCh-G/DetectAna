@@ -10,9 +10,8 @@ real and publishable result, just a different one.
 
 What you need
 -------------
-The same frames twice: once with reference forces (the method you trust — DFT,
-CCSD, whatever the training data came from) and once with the force field's
-predicted forces.
+The same frames twice: once with reference forces (whichever method you trust and
+the training data came from) and once with the force field's predicted forces.
 
     python scripts/score_vs_error.py \\
         --config config/local.yaml \\
