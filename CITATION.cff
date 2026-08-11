@@ -8,8 +8,8 @@ authors:
     alias: "AntonCh-G"
 repository-code: "https://github.com/AntonCh-G/DetectAna"
 license: MIT
-version: "0.2.0"
-date-released: "2026-08-10"
+version: "0.3.0"
+date-released: "2026-08-11"
 keywords:
   - molecular-dynamics
   - path-integral-molecular-dynamics

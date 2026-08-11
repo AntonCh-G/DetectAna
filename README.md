@@ -3,608 +3,355 @@
 [![CI](https://github.com/AntonCh-G/DetectAna/actions/workflows/ci.yml/badge.svg)](https://github.com/AntonCh-G/DetectAna/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 [![Python 3.10+](https://img.shields.io/badge/python-3.10%2B-blue.svg)](https://www.python.org/)
-[![Status: active development](https://img.shields.io/badge/status-active%20development-brightgreen.svg)](#status-and-roadmap)
 
-DetectAna finds the point in an MD or PIMD trajectory where a machine-learned
-force field stops being supported by its training data.
+**Finding the frame where a molecular-dynamics trajectory leaves the region its
+machine-learned force field was trained on — with a false-alarm rate stated in
+advance rather than discovered afterwards.**
 
-**Status:** v0.2.0, under active development. The geometric scoring track, the
-onset detector and the evaluation harness are working and tested; the
-[roadmap](#status-and-roadmap) says what is next and what is deliberately not
-supported yet. Interfaces may still change. Scientific definitions, thresholds and
-atom indexing will not change silently — see
-[docs/scientific-rules.md](docs/scientific-rules.md).
+A machine-learned force field (MLFF) is only reliable near its training data. A
+long simulation drifts away from it and the model keeps returning smooth,
+plausible forces anyway. Nothing crashes. You notice much later, when a bond has
+visibly stretched, and by then an unknown part of the run is unusable.
 
-## Why
+DetectAna scores every frame by how far it sits outside the force field's
+reference training distribution, then decides where the run went out of
+distribution using a **window rule whose false-alarm probability is derived from
+a budget you state**. That frame is where you cut the run; the structures around
+it are the ones worth recomputing at a higher level of theory and adding to the
+training set.
 
-A machine-learned force field (MLFF) is a neural network trained to predict
-energies and forces. It is reliable only for structures similar to the ones it
-was trained on. Long simulations drift away from those structures, and the model
-keeps returning numbers anyway. Nothing crashes. You notice much later, when a
-bond has visibly stretched or the molecule has fallen apart, and by then a large
-part of the trajectory is already unusable.
+**Method.** Internal-coordinate fingerprint → standardise → PCA → Mahalanobis
+distance, fitted on reference *training* frames only, thresholded at a percentile
+of held-out *validation* frames, aggregated across path-integral beads, then a
+windowed onset rule with a binomial false-alarm bound corrected for frame
+autocorrelation.
 
-I wrote this to get a specific number out of a run: the frame where it left the
-training distribution. That is where you cut the trajectory, and it is also a
-good place to look for new structures worth computing at a higher level of
-theory and adding to the training set.
+**Key measured result.** On the aspirin reference set used during development,
+the detector fires in proportion to how little training data supports a
+conformer: **Spearman −0.93** between training density and flag rate, **100 %**
+detection in torsion regions the training set never visits against **0.3–4 %** in
+well-sampled ones, at a threshold calibrated to flag 1 %. Bond stretches are
+caught at **0.3–0.5 Å**, where a hard 2.0 Å "broken bond" check is still silent.
+That reference set is not redistributable, so those numbers are **not**
+reproducible from a clone — see [Results](#results).
 
-## Method
+**Stack.** Python 3.10–3.12 · NumPy · SciPy · scikit-learn · pandas · ASE · h5py
+· joblib · matplotlib · YAML-configured pipelines · pytest (176 tests, ~94 %
+coverage) · ruff · mypy · GitHub Actions on three Python versions. CPU only: the
+force field stays external.
 
-The pipeline does the following:
+**Status:** v0.3.0, in active development. Interfaces may still change.
+Scientific definitions, thresholds and atom indexing will not change silently —
+see [docs/scientific-rules.md](docs/scientific-rules.md).
 
-1. Read the reference train/valid/test sets (extended XYZ, MD17 style).
-2. Build the molecular topology from `initial.xyz`: bonds, angles, dihedrals,
-   benzene ring.
-3. Turn every reference frame into a fingerprint of internal coordinates. Bond
-   lengths, angles, torsions as sin/cos pairs, ring planarity.
-4. Standardize and run PCA, fit on the training frames only. Fit a Mahalanobis
-   distance on the same frames. Pick the threshold as the 99th percentile of the
-   validation-set distances.
-5. Score the trajectory frame by frame. For PIMD that means every bead plus the
-   centroid; for classical MD, the single trajectory.
-6. Collapse the bead scores at each timestep into max, 95th percentile, and the
-   fraction of beads above threshold.
-7. Slide a window over those and report onset at the first window where the
-   fraction stays above the limit.
-8. Write out the score arrays, an onset table, plots, and a manifest recording
-   the config and the threshold.
+---
 
-Mahalanobis distance in a PCA space is a deliberately boring choice. It is
-cheap, it has no hyperparameters worth tuning, and its output is one number per
-frame that is easy to plot against time. The reasoning is written up in
-[docs/adr/0001-ood-scoring-method.md](docs/adr/0001-ood-scoring-method.md).
+## Overview
 
-There is a second, optional scoring track that works in the MLFF's own learned
-embedding space (MlffModel `inv_features`) instead of in geometric coordinates.
-It answers a slightly different question: not "is this structure unusual" but
-"has the model seen anything like this". Both onsets end up in the same table.
-See [docs/adr/0002-embedding-ood-track.md](docs/adr/0002-embedding-ood-track.md).
+Given (a) the reference dataset an MLFF was fitted on and (b) a trajectory that
+MLFF produced, DetectAna produces a per-frame novelty score, a per-timestep
+aggregate across path-integral beads, and a run-level onset table with four
+separately-reported criteria — plus a manifest recording the threshold, the
+topology and the false-alarm arithmetic behind every number.
 
-The pipeline was developed on aspirin but is not tied to it. The molecule comes
-from the run's `initial_xyz`: its atom count, element order and bond graph define
-everything downstream, and every reference and trajectory frame is then checked
-against that file. Point the config at another single molecule and it runs. A
-molecule with no benzene-like ring works too — the ring-planarity feature and
-flag are dropped, which makes the descriptor one column shorter, so the fit, the
-threshold and the scored frames all have to come from the same topology.
+It handles path-integral MD (one trajectory per bead plus a centroid) and
+classical MD, from i-PI XYZ or HDF5 input. Developed on aspirin, but nothing is
+tied to it: the molecule comes from the run's `initial.xyz`, and a molecule with
+no ring simply drops the planarity feature
+([ADR 0003](docs/adr/0003-molecule-agnostic-topology.md)).
 
-Two limitations are still real. There is no periodic-boundary or multi-molecule
-support: internal coordinates are computed on raw coordinates, so this is a
-gas-phase single-molecule tool (a disconnected bond graph only earns a warning).
-And with several candidate rings the auto-detection picks the lowest-indexed one,
-so set `chemistry.ring_atoms` explicitly when the choice matters.
+An optional second track scores in the force field's own embedding space, which
+asks "has the model seen anything like this?" rather than "is this structure
+unusual?" ([ADR 0002](docs/adr/0002-embedding-ood-track.md)).
 
-## An example run
+## Research question
 
-![Mahalanobis OOD score against time for a 500 ns PIMD run](docs/images/example_score_vs_time.png)
+> Given a trajectory and the reference set its force field was fitted on, can we
+> identify the point beyond which the force field is extrapolating, with a
+> false-alarm rate that is stated in advance rather than discovered afterwards?
 
-500 ns of aspirin, 16 beads. For the first 340 ns or so the bead scores sit
-around the threshold (top panel). Then they jump by a factor of five and stay
-there. The dotted line in the top panel is the detected persistent bead onset.
-The one in the bottom panel is the centroid onset, which fires much earlier on a
-brief excursion that the run recovers from.
+Three requirements follow, and they drove every design decision:
 
-The middle panel is the reason bead scores are never averaged. Individual beads
-cross the threshold on and off throughout the first half of the run, long before
-anything happens collectively. Average them and that signal disappears.
+1. **No leakage.** The score's fit and its threshold must come from reference
+   data only. Calibrating on the trajectory would define anomalies relative to
+   the anomalous run and suppress exactly the signal being looked for.
+2. **A computable false-alarm rate.** The decision rule needs a probability
+   under the null hypothesis that the whole run is in distribution — not a
+   threshold that "looked reasonable on the plot".
+3. **Honest levels of aggregation.** Bead, centroid and run are different
+   physical statements and are reported separately. PIMD beads are
+   path-integral images of one molecule, not independent replicas.
 
-## How well does the detector work?
+Deliberately out of scope: predicting the force error directly (that needs
+reference-quality forces — see [Limitations](#limitations-and-future-work)), and
+judging whether a structure is chemically possible (a separate, non-statistical
+check, reported in its own file).
 
-A score that flags frames is not evidence until you know what it catches and what
-it misses, so [scripts/benchmark_detector.py](scripts/benchmark_detector.py)
-measures it against distortions of a known size. Held-out reference frames are the
-negatives; distorted copies of those frames are the positives. Nothing about the
-distorted frames reaches the fit or the threshold.
+## Methodology
 
-![Detection rate against distortion size, and against training coverage](docs/images/detection_benchmark.png)
+Full treatment, with equations and the reasoning behind each choice:
+**[docs/methodology.md](docs/methodology.md)**. In short:
 
-The right panel is the whole argument in one picture: grey bars are how much
-training data sits at each torsion angle, the green line is how often the detector
-flags a frame placed there. Where the training data is, it stays silent. Where the
-training data is absent, it fires every time.
+1. **Topology from the input geometry.** Bonds from covalent-radius cutoffs,
+   then angles, dihedrals and an optional ring. Every frame of every file —
+   including the reference set — is validated against `initial.xyz` for atom
+   count and element order. A mismatch is a hard failure, because internal
+   coordinates are index tuples and a reordered file gives silently wrong
+   descriptors.
+2. **Internal-coordinate fingerprint.** Bond lengths, bond angles, every
+   dihedral as a $(\sin, \cos)$ pair, ring planarity RMSD. 134 columns for
+   aspirin. Torsions are sin/cos encoded so the $0 \to 2\pi$ wrap is continuous;
+   internal coordinates make a high score traceable to the bond, angle or
+   torsion that caused it.
+3. **Fit on training frames only.** Standardise, then PCA at 95 % retained
+   variance (for conditioning — the raw covariance is near-singular), then a
+   Mahalanobis distance from the training mean and covariance.
+4. **Calibrate on held-out validation frames.** The threshold is a percentile
+   (default 99) of validation scores, so "flagged" means "above 99 % of
+   reference frames the fit never saw". Define $\alpha = 1 -$ percentile$/100$.
+5. **Score beads and centroid; aggregate without averaging.** Per timestep: max,
+   95th percentile, and fraction of beads above threshold. Never the mean — a
+   single bead can leave the training region long before the centroid notices.
+6. **Detect onset with a window rule, and bound its false-alarm rate.** A
+   threshold that flags $\alpha$ of in-distribution frames flags ~$\alpha$ of
+   *any* long run, so the first flagged frame is a property of the threshold, not
+   the trajectory. The real detector is the fraction of a window that must be
+   flagged. Under the null, that count is binomial over an AR(1)-corrected
+   effective sample size, unioned over windows — an upper bound, deliberately.
+   Set `false_alarm_budget` and the loosest (most sensitive) rule inside that
+   budget is derived for you and recorded in the manifest.
+7. **Hard-chemistry checks, kept separate.** Broken bonds, close contacts and
+   ring planarity are checked against fixed cutoffs and written to their own
+   file, because "out of distribution" and "unphysical" are different claims.
 
-Measured on the MD17-derived aspirin reference set (2500 training frames, 600
-held-out split into calibration and evaluation, 71 PCA components, α = 1 %):
+Supporting documents: [scientific-rules.md](docs/scientific-rules.md) (the
+constraints that must not break silently), [glossary.md](docs/glossary.md) (terms,
+units, array shapes), [docs/adr/](docs/adr/) (four decision records, including the
+alternatives that were rejected and why).
 
-| distortion | magnitude | detected | also caught by the chemistry flags |
-|---|---|---|---|
-| Gaussian rattle | σ = 0.05 Å | 44 % | 0 % |
-| Gaussian rattle | σ = 0.10 Å | 100 % | 0 % |
-| bond stretch | δ = 0.30 Å | 39 % | 0 % |
-| bond stretch | δ = 0.50 Å | 100 % | 0 % |
+## Repository structure
 
-The bond-stretch rows are the useful ones: at 0.3–0.5 Å the OOD score fires while
-the hard-chemistry bond check is still silent, because its cutoff is 2.0 Å. The
-statistical track sees a strained bond well before it looks broken.
+```
+src/detectana/           the library — typed, tested, no hard-coded paths
+  io.py                  XYZ and HDF5 loaders, MoleculeSpec frame validation
+  xyz_reader.py          byte-offset-indexed reader for multi-GB XYZ files
+  topology.py            bond graph, angles, dihedrals, ring, chemistry checks
+  descriptors.py         internal-coordinate fingerprint + scaler + PCA
+  scorer.py              Mahalanobis scorer, per-track threshold calibration
+  embedding_scorer.py    per-atom Mahalanobis in the force field's embedding space
+  aggregator.py          bead-score aggregation per timestep
+  onset.py               windowed onset detector + false-alarm arithmetic
+  evaluation.py          detection metrics, controlled distortions, coverage
+  pipeline.py            the orchestrator
 
-**The result worth reporting is the torsion scan.** A rotatable torsion is driven
-right around its circle and each target angle is labelled by how often the training
-set visits it. Bond lengths and angles are untouched by construction — asserted in
-[tests/test_evaluation.py](tests/test_evaluation.py), not assumed — so this
-isolates conformational novelty:
+scripts/                 thin CLI entry points, orchestration and plotting only
+  run_pipeline.py            main pipeline (XYZ or HDF5 input)
+  benchmark_detector.py      detector benchmark against known distortions
+  score_vs_error.py          OOD score against force-field error
+  select_configurations.py   training-set selection in descriptor space
+  extract_onset_frames.py    frames around a detected onset
+  extract_embeddings.py      force-field per-atom embeddings → HDF5 (GPU)
+  make_demo_data.py          regenerates data/smoke/
+  run_pipeline_hdf5.py       deprecated wrapper, forwards to the library
 
-| target angle for C4-C11-O12-C6 | training frames in that 30° slice | flagged |
-|---|---|---|
-| ±165° | ~1200 | 0.3 % |
-| ±135° | 29–43 | 6–10 % |
-| −105° to +75° | 0 | 100 % |
+config/
+  demo.yaml              runs on data/smoke/ as-is
+  example.yaml           annotated template for real data
+data/smoke/              synthetic demo dataset (generated, not simulation output)
+tests/                   176 tests; test_smoke.py is the scientific checklist, executable
+docs/
+  methodology.md         problem → assumptions → method → evaluation → interpretation
+  reproducibility.md     environment, data requirements, commands, determinism
+  usage.md               full configuration reference, every script, outputs
+  scientific-rules.md    the constraints the pipeline is built around
+  glossary.md            terms, units, array shapes
+  adr/                   decision records 0001–0004
+  images/                figures used in this README
+```
 
-Spearman correlation between training density and flag rate: **−0.93**. The
-detector flags a conformer in proportion to how little training data supports it,
-which is the behaviour the definition of OOD demands. Note the +105° slice, which
-holds 5 frames out of 2500 and is flagged 100 % of the time: 0.2 % coverage is not
-coverage. That frame is chemically unremarkable, which is exactly why this
-repository insists that out of distribution and unphysical are different claims.
-
-An earlier version of this benchmark rotated whichever torsion split the molecule
-most evenly and reported AUROC ≈ 0.52, which looked like a blind spot. It was not:
-that torsion is fully sampled in the training set, so the rotated frames were
-genuinely in distribution and flagging them would have been an error. Labelling
-distorted frames as anomalies without checking coverage is a mistake worth
-avoiding.
-
-### Does a high score mean the force field is wrong there?
-
-The question that decides whether the score is a usable reliability estimate.
-[scripts/score_vs_error.py](scripts/score_vs_error.py) answers it given the same
-frames twice — once with reference forces, once with the force field's — and
-reports Spearman correlation, force error by score decile, and the top-to-bottom
-decile ratio. It needs recomputed reference forces, so it is not part of the demo;
-the machinery is validated on synthetic controls (no relationship → Spearman
-−0.01; injected relationship → +0.23 with a 2.4× decile ratio).
-
-## Getting started
+## Reproducing the work
 
 ```bash
 git clone https://github.com/AntonCh-G/DetectAna.git
 cd DetectAna
 
-uv venv .venv --python 3.11      # or python -m venv .venv
+uv venv .venv --python 3.11      # or: python -m venv .venv
 source .venv/bin/activate
 uv pip install -e ".[dev]"
 
-pytest tests/ -v
-python scripts/run_pipeline.py --config config/demo.yaml
+pytest tests/ -v                                            # 176 tests, ~8 s
+python scripts/run_pipeline.py --config config/demo.yaml    # full pipeline
+python scripts/benchmark_detector.py --config config/demo.yaml
 ```
 
-The demo runs in a few seconds on the small dataset in `data/smoke/` and writes
-its results to `outputs/demo/`. It is there so you can check the installation
-works and see the shape of the output. It is not a result: 64 training frames,
-32 validation frames and a 24-frame trajectory are nowhere near enough, and
-every frame comes out flagged.
+The demo runs in seconds and writes scores, an onset table, plots and a manifest
+to `outputs/demo/`. It is the same sequence CI runs on Python 3.10, 3.11 and 3.12.
 
-## Your own data
+`data/smoke/` is **synthetic** — thermal-style perturbations of one equilibrium
+geometry, written by [scripts/make_demo_data.py](scripts/make_demo_data.py). It
+exercises every code path and is deliberately too small to mean anything: 64
+training frames against a 134-column descriptor is far below what the covariance
+needs, so every trajectory frame comes out flagged. It stands in for the real
+reference data, which cannot be redistributed until the work this code was
+developed for is published; the intention is to swap it for real frames then.
 
-```bash
-cp config/example.yaml config/local.yaml   # config/local.yaml is git-ignored
-```
+For your own data, environment details and determinism guarantees:
+**[docs/reproducibility.md](docs/reproducibility.md)**. Full configuration
+reference and per-script documentation: **[docs/usage.md](docs/usage.md)**.
 
-Edit the paths in `config/local.yaml`, then:
+## Results
 
-```bash
-python scripts/run_pipeline.py --config config/local.yaml
+### Measured — detector behaviour against training coverage
 
-# more logging
-python scripts/run_pipeline.py --config config/local.yaml --verbose
+A score that flags frames is not evidence until you know what it catches and what
+it misses. [scripts/benchmark_detector.py](scripts/benchmark_detector.py)
+measures the detector against distortions of known size, with every synthetic
+positive **labelled by how much training data actually covers it**, not by how
+large the distortion is.
 
-# ignore the cached descriptors and recompute from the XYZ files
-python scripts/run_pipeline.py --config config/local.yaml --force-recompute
-```
+![Detection rate against distortion size, and against training coverage](docs/images/detection_benchmark.png)
 
-Three input layouts work:
+| Quantity | Value | Reading |
+|---|---|---|
+| Spearman ρ, training density vs flag rate | **−0.93** | The detector fires in proportion to missing training data |
+| Detection rate, never-visited torsion slices | **100 %** | Sensitivity where the force field must extrapolate |
+| Flag rate, well-sampled torsion slices | **0.3–4 %** | Specificity, against a threshold calibrated to flag 1 % |
+| Bond stretch first caught | **0.3–0.5 Å** | The hard 2.0 Å "broken bond" check is still silent here |
 
-- i-PI XYZ, one file per bead (`bead_glob`) plus a centroid file (`centroid_xyz`)
-- one HDF5 file holding all beads and the centroid (`hdf5`)
-- classical MD: point `bead_glob` at the single trajectory and `centroid_xyz` at
-  the same file. With one replica, that replica is the centroid.
+The right-hand panel is the argument: where the training data is, the detector
+stays silent; where it is absent, it fires.
 
-Only `config/demo.yaml` and `config/example.yaml` are tracked by git. Anything
-else you put in `config/` is ignored, so local paths stay local.
+**Provenance and limits.** Measured on a 2500-frame aspirin reference set used
+during development. That set belongs to work that is not yet published, so it is
+not redistributable and is not in this repository, and **these numbers cannot be
+reproduced from a clone** — the shipped demo data reproduces the machinery, not
+the result. The intention is to replace the synthetic demo data with real
+reference frames once the associated work is published. Method and reasoning:
+[ADR 0004](docs/adr/0004-detector-evaluation.md).
 
-### Pulling out frames around the onset
+### Illustrative — one long production run
 
-Once the pipeline has run, this grabs N frames before and M frames after the
-onset, taken from the bead that crossed the threshold first:
+![Mahalanobis OOD score against time for a long PIMD run](docs/images/example_score_vs_time.png)
 
-```bash
-python scripts/extract_onset_frames.py \
-    --config config/local.yaml \
-    --run run_name \
-    --n-before 100 \
-    --n-after 100
-```
+500 ns of aspirin, 16 beads. For the first ~340 ns the bead scores sit near the
+threshold, then jump by roughly a factor of five and stay there. The dotted lines
+mark the detected persistent bead onset (top) and centroid onset (bottom). The
+middle panel is why bead scores are never averaged: individual beads cross the
+threshold on and off long before anything happens collectively — a mean would
+have looked flat.
 
-It writes `outputs/<run>/extraction_bead<NN>_frame<FFFF>_N<N>_M<M>.xyz`.
+This is a single trajectory shown to demonstrate output, not a controlled
+experiment, and the trajectory is not in this repository.
 
-`--onset-type` picks which frame to centre on:
-- `persistent` (default): the first window where the fraction of OOD beads
-  exceeds the threshold. This is the onset the rest of the pipeline means.
-- `first`: the first single frame any bead went over. On a long run this is
-  almost always a false flag produced by the threshold itself — see
-  [Choosing the window rule](#choosing-the-window-rule).
+### Computed — what a window rule costs
 
-### Picking a diverse set of configurations
+Derived from the false-alarm arithmetic in
+[`onset.py`](src/detectana/onset.py), for 200 000 frames at α = 1 % under a 1 %
+run-level budget:
 
-`select_configurations.py` selects N frames from a trajectory that are far from a
-reference structure in descriptor space, while staying inside a radius you set.
-The point is to get a spread of geometries rather than N nearly identical
-snapshots, which is what you want for a candidate set to label and train on.
-
-It has two modes, chosen by whether you pass `--primary-dihedrals`.
-
-#### Primary-dihedral mode
-
-Here `--radius` is a constraint, not a target. Only frames whose chosen
-dihedrals are close to the reference value survive it. Among those, the N frames
-are picked by farthest-point sampling in everything *except* those dihedrals:
-bonds, angles, the remaining torsions, ring planarity.
-
-So you hold one or two dihedrals roughly fixed and let everything else vary as
-much as possible. For aspirin the carboxyl and ester dihedrals are the two
-angles usually worth constraining.
-
-One radius for all of them (a circle):
-
-```bash
-python scripts/select_configurations.py \
-    --reference path/to/initial.xyz \
-    --trajectory path/to/aspirin.xc.xyz \
-    --radius 0.2 \
-    --n-configs 50 \
-    --output outputs/selected.xyz \
-    --pimd \
-    --primary-dihedrals 5 6 12 11
-```
-
-One radius per dihedral (an ellipse). Pass the values in the same order as the
-`--primary-dihedrals` flags. A frame passes when `sum((dᵢ/Rᵢ)²) ≤ 1`, where `dᵢ`
-is the chord distance in sin/cos space for dihedral `i`. The
-`descriptor_distance` written to the output is `sqrt(sum((dᵢ/Rᵢ)²))`, so
-anything at or below 1 is inside the ellipse.
-
-```bash
-# carbonyl held tight (±6°), ester left loose (±23°)
-python scripts/select_configurations.py \
-    --reference path/to/initial.xyz \
-    --trajectory path/to/aspirin.xc.xyz \
-    --radius 0.10 0.40 \
-    --n-configs 50 \
-    --output outputs/selected_ester_scan.xyz \
-    --pimd \
-    --primary-dihedrals 6 5 10 7 \
-    --primary-dihedrals 5 6 12 11
-```
-
-`0.10` goes with the carboxyl dihedral (atoms 6 5 10 7), `0.40` with the ester
-one (atoms 5 6 12 11).
-
-##### What a radius means in degrees
-
-Two angles that differ by Δθ are `2·sin(Δθ/2)` apart in (sin θ, cos θ) space.
-That holds per dihedral in both modes.
-
-```python
-import numpy as np
-radius = 2 * np.sin(np.radians(delta_deg) / 2)   # angle → radius
-delta_deg = np.degrees(2 * np.arcsin(radius / 2)) # radius → angle
-```
-
-| radius per dihedral | ±Δθ |
-|--------------------|------|
-| 0.10 | ±5.7° |
-| 0.20 | ±11.5° |
-| 0.35 | ±20° |
-| 0.52 | ±30° |
-| 1.00 | ±60° |
-| 2.00 | ±180° (everything) |
-
-#### Full-descriptor mode (the default)
-
-Distances are measured in PCA-reduced internal-coordinate space over all bonds,
-angles, dihedrals and ring planarity, with the `DescriptorPipeline` fit on the
-trajectory itself. Note that this PCA is not the one the main pipeline fits on
-the reference set, so these distances are not comparable to the OOD scores.
-
-```bash
-python scripts/select_configurations.py \
-    --reference path/to/initial.xyz \
-    --trajectory path/to/aspirin.xc.xyz \
-    --radius 5.0 \
-    --n-configs 50 \
-    --output outputs/selected.xyz \
-    --pimd
-```
-
-#### Arguments
-
-| Argument | Required | Description |
-|----------|----------|-------------|
-| `--reference` | yes | Single-frame XYZ used as the origin of the distance measurement |
-| `--trajectory` | yes | MD or PIMD centroid trajectory file |
-| `--radius` | yes | One value (circle), or one per `--primary-dihedrals` (ellipse). Full-descriptor mode takes one value only. |
-| `--n-configs` | yes | How many configurations to select |
-| `--output` | yes | Output extxyz path |
-| `--pimd` | no | Pass for i-PI format files such as `aspirin.xc.xyz`; leave it off for extended-XYZ MD files |
-| `--primary-dihedrals I J K L` | no | Constrain this dihedral to within `--radius` of its reference value, and maximise diversity in the remaining coordinates. Repeat for more dihedrals. |
-| `--pca-variance` | no | Full-descriptor mode only. Variance kept by the PCA (default `0.95`) |
-
-The output is one extxyz file. Frame one is the reference (`source=reference`).
-The rest are the selected frames, ordered by decreasing descriptor distance,
-each carrying:
-
-```
-source_frame=<int>  source_step=<int>  descriptor_distance=<float>
-```
-
-What `descriptor_distance` holds depends on the mode:
-- full-descriptor: Euclidean distance in PCA space
-- primary-dihedral, one radius: chord distance in the joint sin/cos space
-- primary-dihedral, several radii: the ellipse distance `sqrt(sum((dᵢ/Rᵢ)²))`
-
-If fewer frames than requested pass the constraint, the script warns and writes
-the ones that did rather than failing.
-
-## Configuration
-
-Everything lives in one YAML file. [config/example.yaml](config/example.yaml) is
-the annotated template; the main sections are:
-
-```yaml
-reference:
-  train: path/to/train.xyz
-  valid: path/to/valid.xyz
-  test:  path/to/test.xyz
-
-runs:
-  - name: run_name
-    initial_xyz: path/to/initial.xyz
-    bead_glob:   "path/to/aspirin.pos_*.xyz"   # sorted → bead 00..15
-    centroid_xyz: path/to/aspirin.xc.xyz
-    timestep_fs: 0.2
-    stride: 50
-
-descriptor:
-  pca_variance: 0.95   # fraction of variance retained
-  random_seed: 42
-
-threshold:
-  percentile: 99.0     # of the validation-set Mahalanobis scores
-
-onset:
-  window_frames: 500
-  step_frames: 50
-  fraction_threshold: 0.20   # how much of the window must be OOD
-  frame_autocorrelation: "auto"
-  # false_alarm_budget: 0.01  # recommended instead of fraction_threshold
-```
-
-Add another entry under `runs:` for a second run.
-
-### Choosing the window rule
-
-The `onset` block, not `threshold.percentile`, is what controls false alarms. A
-threshold calibrated to flag 1 % of in-distribution frames flags about 1 % of any
-long run as well: ~2000 frames out of 200,000, the first of them after ~100
-frames. `first_bead_anomaly` in the output is therefore a property of the
-threshold rather than of the trajectory — read it as a diagnostic, not an onset.
-Only the windowed criteria carry evidence.
-
-Every run now logs and records what its rule costs, so this is visible rather
-than implicit:
-
-```
-Onset rule: 13/230 effective flags per 500-frame window (fraction 0.0565);
-false-alarm bound 0.00306 per run (0.000306 counting disjoint windows only)
-```
-
-Two numbers because the first counts every window start as a separate test, even
-though windows that overlap by 90 % are nearly the same test. The truth is between
-them; the pipeline works from the pessimistic one.
-
-The 500-frame window is not 500 independent chances to flag, because consecutive
-frames are correlated; `frame_autocorrelation: "auto"` measures the lag-1
-correlation on the first `stable_fraction` of the run and converts the window to
-an effective sample size. Setting it to 0 assumes independence and makes the
-bound optimistic.
-
-Set `false_alarm_budget` and the fraction is derived from it — the loosest, most
-sensitive rule that keeps the run-level false-alarm probability inside the
-budget. This is the recommended direction: you state the false-alarm rate you can
-live with, rather than guessing a fraction. For 200,000 frames, a 1 % threshold
-and a 1 % budget:
-
-| autocorrelation | derived fraction | flags needed | bound per run |
+| Assumption on frame autocorrelation ρ | Derived fraction | Flags needed | Bound per run |
 |---|---|---|---|
-| 0 (assumed independent) | 0.038 | 19 of 500 | 0.005 |
+| 0 (independence assumed) | 0.038 | 19 of 500 | 0.005 |
 | 0.37 (measured) | 0.057 | 13 of 230 | 0.003 |
+| — shipped default `fraction_threshold: 0.20` | 0.20 | 100 of 500 | ~10⁻⁹¹ |
 
-Compare the default `fraction_threshold: 0.20`, which needs 100 of 500 frames
-flagged for a bound near 10⁻⁹¹. That is safe to the point of being insensitive: it
-will miss a real but partial excursion. The defaults are unchanged, so nothing
-moves unless you set the budget, but the logged bound tells you where you stand.
+The default is safe to the point of being insensitive: it can miss a real but
+partial excursion. Stating a budget instead of guessing a fraction is the
+recommended direction, and the bound is logged for every run either way.
 
-The arithmetic assumes flags inside a window are Bernoulli(α), corrects for
-frame correlation with an effective sample size, and unions over overlapping
-windows, so the reported probability is an upper bound. Beads count as one
-observation per timestep by default (`n_effective_beads: 1`), because beads are
-path-integral images of the same molecule and far from independent.
+### Preliminary / not yet measured
 
-## Parallelism
+Whether a high score predicts actual force-field error is **not answered**. The
+machinery exists ([`score_vs_error.py`](scripts/score_vs_error.py)) and is
+validated on synthetic controls, but it needs forces recomputed with the
+reference method for the frames analysed, which has not been run. Until then the
+score is a statement about training coverage only, which is all this repository
+claims for it.
 
-The per-bead loop is parallelised with `joblib`:
+## Technical highlights
 
-```yaml
-pipeline:
-  n_jobs: -1   # all cores, the default
-  # n_jobs: 1  # serial, easier to debug on a laptop
-```
+- **Leakage-proof calibration, enforced by a test.** Scaler, PCA, mean and
+  covariance from `train`; threshold from held-out `valid`; `test` to confirm the
+  calibration held. `tests/test_smoke.py` asserts no trajectory frame reaches
+  either step.
+- **A detector with an analytic false-alarm bound.** Binomial window statistics
+  over an AR(1)-corrected effective sample size, union-bounded over overlapping
+  windows, invertible so you state a budget and get the most sensitive rule
+  inside it. Both a conservative and an optimistic bound are reported, so the
+  width of the approximation is visible instead of assumed.
+- **An evaluation design that survived being wrong.** The first benchmark scored
+  AUROC 0.52 by rotating a torsion the training set fully samples. Those frames
+  were in distribution; flagging them would have been the error. Positives are
+  now labelled by training coverage, and specificity and sensitivity are reported
+  separately rather than pooled ([ADR 0004](docs/adr/0004-detector-evaluation.md)).
+- **Periodicity handled in the representation.** Torsions enter as
+  $(\sin\theta, \cos\theta)$ rather than as unwrapped angles, with the chord↔arc
+  conversion documented for anyone setting a radius in that space.
+- **Molecule-agnostic by construction.** The molecule comes from `initial.xyz`;
+  a ring-less molecule drops one descriptor column instead of failing.
+  `tests/test_molecule_generality.py` pins this down.
+- **Scales to multi-GB trajectories.** Byte-offset frame indexing for O(1)
+  random access, chunked streaming, NPZ descriptor caching so re-scoring is
+  seconds instead of hours, and `joblib` parallelism over beads that respects a
+  SLURM allocation.
+- **Reproducible by default.** Fixed seeds, YAML-configured everything, no
+  hard-coded paths, and a `manifest.json` per run holding config, code version,
+  threshold, topology and the full onset design report.
+- **Engineering hygiene.** 176 tests at ~94 % coverage with an 85 % floor
+  enforced in CI, `ruff` and `mypy` clean across the repository, a PEP 561
+  `py.typed` marker, three-version test matrix, and the demo pipeline plus
+  benchmark run end to end on every push.
+- **Documented decisions, including rejected ones.** Four ADRs record what was
+  chosen, what was not, and why — including a mistake that changed the
+  evaluation design.
 
-On SLURM, `-1` follows `--cpus-per-task` on its own. Do not set it higher than
-the cores you were allocated; oversubscribing makes it slower, not faster.
+## Limitations and future work
 
-```bash
-#SBATCH --cpus-per-task=16   # joblib spawns 16 workers, one per bead
-```
+**Limitations**
 
-## What comes out
+- **Positions only.** Forces are loaded and unit-checked (i-PI writes
+  Hartree/Bohr, reference sets eV/Å, factor 51.4221) but never enter the
+  descriptor. A force-based descriptor would likely catch some failures earlier.
+- **Out of distribution is not unphysical.** A flag says the force field is
+  extrapolating. The benchmark demonstrates this directly: a torsion slice
+  holding 5 of 2500 training frames is flagged every time, and those conformers
+  are chemically unremarkable.
+- **The reliability claim is unvalidated.** See
+  [Preliminary](#preliminary--not-yet-measured).
+- **The two tracks have not been compared.** Geometric and embedding scores are
+  reported side by side but never benchmarked against each other.
+- **Global descriptor.** Local atomic-environment descriptors (SOAP, ACSF) would
+  be more expressive; left out to avoid a heavy dependency
+  ([ADR 0001](docs/adr/0001-ood-scoring-method.md)).
+- **The covariance needs data.** Roughly ten training frames per retained PCA
+  component is the floor; the benchmark warns below it.
+- **Beads are not independent replicas.** They are path-integral images of one
+  molecule, so bead scores are early warnings and the run is the unit you compare
+  across models.
 
-```
-outputs/
-  manifest.json                    # config, version, threshold
-  onset_table.csv                  # run-level onset summary
-  models/
-    descriptor_pipeline.pkl        # fitted scaler + PCA
-    scorer.pkl                     # fitted Mahalanobis scorer
-  <run_name>/
-    bead_scores.npy                # (n_beads, n_frames)
-    centroid_scores.npy            # (n_frames,)
-    frame_aggregate.csv            # aggregated scores per timestep
-    chemistry_flags_bead00.csv     # hard-chemistry flags, bead 00
-    descriptor_cache/              # raw descriptor NPZ caches, per bead
-    plots/
-      score_vs_time.png            # bead max/p95, fraction OOD, centroid
-```
+**Next**
 
-## Tests
+- Validate the score against force-field error — the result that decides whether
+  this is a reliability estimate or only a novelty measure.
+- Compare the geometric and embedding tracks on one benchmark.
+- Close the active-learning loop: detect, select, recompute, retrain.
+- Add force-based and local atomic-environment descriptors.
 
-```bash
-pytest tests/ -v          # 33 tests, about 3 seconds
-```
-
-`tests/test_smoke.py` is the checklist from
-[docs/scientific-rules.md](docs/scientific-rules.md), in executable form:
-
-- topology: bond count, benzene ring found, feature names consistent
-- descriptor shape, and no NaNs or infinities
-- a frame with a broken bond scores higher than a normal one
-- torsions survive the 0 ↔ 2π wrap thanks to the sin/cos encoding
-- bead-stack shapes and the expected aggregate columns
-- nothing outside the training set touches the PCA or the scorer fit
-
-`tests/test_units.py` covers the modules one at a time: chemistry checks,
-saving and loading the scorer and the descriptor pipeline, aggregation, onset
-detection across a range of window scenarios, and the embedding pipeline.
-
-Both use the small dataset in `data/smoke/`, so nothing external is needed. CI
-runs them on Python 3.10, 3.11 and 3.12, and runs the demo pipeline end to end.
-
-## Layout
-
-```
-src/detectana/
-  io.py               XYZ and HDF5 loaders, MoleculeSpec frame validation
-  topology.py         Bond graph, angles, dihedrals, ring, hard-chemistry checks
-  descriptors.py      Internal-coordinate fingerprint + StandardScaler + PCA
-  scorer.py           Mahalanobis scorer and threshold calibration
-  embedding_scorer.py Per-atom Mahalanobis scorer in MLFF embedding space
-  aggregator.py       Bead-score aggregation per timestep
-  onset.py            Windowed fraction onset detector + false-alarm arithmetic
-  evaluation.py       Detection metrics, error correlation, controlled distortions
-  pipeline.py         The orchestrator
-scripts/
-  run_pipeline.py             Main pipeline, XYZ input
-  run_pipeline_hdf5.py        Same pipeline, HDF5 input
-  extract_onset_frames.py     Frames around the onset
-  select_configurations.py    Training-set selection in descriptor space
-  benchmark_detector.py       Detector benchmark against known distortions
-  score_vs_error.py           OOD score against force-field error
-  extract_embeddings.py       MlffModel inv_features to HDF5
-config/
-  demo.yaml       Runs on data/smoke/ as-is
-  example.yaml    Annotated template for real data
-data/smoke/       Small aspirin dataset for the tests and the demo
-tests/
-  test_smoke.py               Validation checklist
-  test_units.py               Per-module unit tests
-  test_molecule_generality.py Nothing is tied to aspirin
-  test_onset_design.py        False-alarm arithmetic
-  test_evaluation.py          Metrics and distortion invariants
-docs/
-  scientific-rules.md   The constraints the pipeline is built around
-  adr/                  Decision records
-```
+**Out of scope by design:** periodic boundaries and multiple molecules (this is a
+gas-phase single-molecule tool), and MLFF inference — the force field stays
+external, which is what keeps the install CPU-only.
 
 ## Further reading
 
-- [docs/scientific-rules.md](docs/scientific-rules.md) is the one to read if you
-  plan to change anything. The constraints the pipeline is built around, why
-  each exists, and the checklist a change has to pass.
-- [CONTEXT.md](CONTEXT.md) is the glossary. What a bead, centroid, descriptor,
-  threshold or onset means here, with units and array shapes.
-- [docs/adr/0001-ood-scoring-method.md](docs/adr/0001-ood-scoring-method.md):
-  why Mahalanobis distance on PCA-reduced internal coordinates.
-- [docs/adr/0002-embedding-ood-track.md](docs/adr/0002-embedding-ood-track.md):
-  why there is a second track in embedding space.
-- [docs/adr/0003-molecule-agnostic-topology.md](docs/adr/0003-molecule-agnostic-topology.md):
-  why the molecule comes from `initial.xyz` and how the optional ring works.
-- [docs/adr/0004-detector-evaluation.md](docs/adr/0004-detector-evaluation.md):
-  how the detector is benchmarked, and why coverage-labelled torsions rather than
-  arbitrary distortions.
+- [docs/methodology.md](docs/methodology.md) — the full method, with equations
+- [docs/reproducibility.md](docs/reproducibility.md) — environment, data, determinism
+- [docs/usage.md](docs/usage.md) — configuration reference, every script, outputs
+- [docs/scientific-rules.md](docs/scientific-rules.md) — constraints; read before changing anything
+- [docs/glossary.md](docs/glossary.md) — terms, units, array shapes
+- [docs/adr/](docs/adr/) — decision records, including rejected alternatives
+- [CHANGELOG.md](CHANGELOG.md) — what changed, with scientific changes called out
 
-## Caveats worth repeating
+## License and citation
 
-Beads are not independent replicas. They are path-integral images of the same
-molecule, so their scores are early warnings, not independent measurements. The
-run is the unit you compare across models.
-
-Out of distribution does not mean unphysical. A flagged frame says the MLFF is
-extrapolating past what it was trained on. It does not say the structure is
-chemically impossible, and the two are separate questions: the hard-chemistry
-flags answer the second one.
-
-The threshold comes from the validation set and never from the trajectory being
-scored. That is deliberate. Calibrating on the trajectory would quietly hide
-exactly the behaviour the pipeline is looking for.
-
-Only positions go into the descriptor. Forces are read and validated but not
-used for scoring yet.
-
-## Status and roadmap
-
-Everything in the table below is either working and covered by tests, or listed as
-not yet done. Nothing planned is described anywhere in this README as though it
-already worked — if a number appears, a run produced it.
-
-### Working today
-
-| Capability | Evidence |
-|---|---|
-| Geometric OOD scoring, PIMD and classical MD, XYZ and HDF5 input | `pytest`, and the demo pipeline runs in CI |
-| Molecule-agnostic topology, optional ring | [ADR 0003](docs/adr/0003-molecule-agnostic-topology.md), ethanol tests |
-| Onset detection with a stated false-alarm budget | [ADR 0004](docs/adr/0004-detector-evaluation.md), `tests/test_onset_design.py` |
-| Detector benchmark against coverage-labelled distortions | [the result above](#how-well-does-the-detector-work), CI smoke run |
-| Embedding OOD track on pre-computed MLFF descriptors | [ADR 0002](docs/adr/0002-embedding-ood-track.md) |
-| Training-set selection in descriptor space | `scripts/select_configurations.py` |
-
-### Next
-
-1. **Validate the score against force-field error.** The machinery
-   (`scripts/score_vs_error.py`) is written and checked on synthetic controls;
-   it needs forces recomputed with the reference method for a few hundred frames
-   spanning the score range. This is the number that decides whether the score is
-   a reliability estimate or only a novelty measure, and it is the next thing I
-   intend to run.
-2. **Compare the geometric and embedding tracks** on the same benchmark. Two
-   detectors exist and have never been measured against each other.
-3. **Close the active-learning loop**: detect the failure, select new geometries,
-   recompute at the reference level, retrain, re-score. The first two steps are
-   here; the rest lives in adjacent tooling and is not yet wired together.
-4. **Force-based descriptors.** Forces are already loaded and unit-checked. A
-   force-error signal would likely fire earlier than a geometric one.
-5. **Local atomic-environment descriptors** (SOAP or ACSF). Deliberately deferred
-   in [ADR 0001](docs/adr/0001-ood-scoring-method.md) to avoid a heavy dependency;
-   worth revisiting now that the evaluation harness can measure whether they help.
-
-### Deliberately not supported
-
-- **Periodic boundaries and multiple molecules.** Internal coordinates are computed
-  on raw coordinates with no periodic images, so this is a gas-phase
-  single-molecule tool. A disconnected bond graph produces a warning, not support.
-- **MLFF inference.** The force field is an external system; DetectAna reads
-  pre-computed embeddings and never imports a deep-learning framework. That keeps
-  the install CPU-only and the package importable anywhere.
-
-## License
-
-MIT, see [LICENSE](LICENSE).
+MIT, see [LICENSE](LICENSE). Citation metadata in
+[CITATION.cff](CITATION.cff).

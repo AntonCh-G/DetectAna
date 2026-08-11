@@ -16,8 +16,8 @@ preserving full frame provenance.
 Usage
 -----
     python scripts/extract_onset_frames.py \\
-        --config config/default.yaml \\
-        --run ccsd_naive \\
+        --config config/local.yaml \\
+        --run run_name \\
         --n-before 100 \\
         --n-after 100
 """
@@ -40,7 +40,6 @@ sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
 from detectana.aggregator import aggregate_bead_scores
 from detectana.onset import detect_onset
 from detectana.xyz_reader import load_or_build_index
-
 
 # NIST 2018 CODATA: 1 Hartree/Bohr = 51.4221 eV/Å
 _HARTREE_BOHR_TO_EV_ANG: float = 51.4221

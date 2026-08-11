@@ -99,7 +99,7 @@ def run_pipeline(cfg: dict) -> None:
 
     Parameters
     ----------
-    cfg : dict loaded from YAML config (see config/default.yaml).
+    cfg : dict loaded from YAML config (see config/example.yaml).
     """
     out_root = Path(cfg["io"]["output_dir"])
     out_root.mkdir(parents=True, exist_ok=True)

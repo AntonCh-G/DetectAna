@@ -1,4 +1,4 @@
-"""Per-atom Mahalanobis OOD scorer for MlffModel inv_features.
+"""Per-atom Mahalanobis OOD scorer for MLFF invariant per-atom embeddings.
 
 One MahalanobisScorer is fit per atom index, preserving the stable atom
 ordering validated against initial.xyz. Per-frame scores are reduced to a
@@ -18,7 +18,7 @@ from detectana.scorer import MahalanobisScorer
 
 
 class EmbeddingPipeline:
-    """Per-atom embedding OOD scorer built on MlffModel inv_features.
+    """Per-atom embedding OOD scorer built on MLFF invariant per-atom features.
 
     Usage
     -----

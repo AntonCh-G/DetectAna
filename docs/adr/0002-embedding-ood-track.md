@@ -1,4 +1,4 @@
-# ADR 0002 — Embedding OOD Track: MlffModel inv_features + Per-atom Mahalanobis
+# ADR 0002 — Embedding OOD Track: MLFF invariant features + Per-atom Mahalanobis
 
 **Status:** Proposed
 **Date:** 2026-05-18
@@ -14,8 +14,10 @@ A frame can be structurally unusual but still within the model's accuracy domain
 or structurally normal but in a region of configuration space the model has not
 seen. The geometric track cannot distinguish these cases.
 
-MlffModel exposes `inv_features` — invariant per-atom embeddings of shape
-`(n_atoms, n_features)` — via `return_descriptors=True` in the forward pass.
+The MLFF exposes invariant per-atom embeddings of shape
+`(n_atoms, n_features)` — via `return_descriptors=True` in the forward pass. The
+architecture is part of unpublished work and is deliberately not named here; only
+its interface matters to this decision.
 These embeddings are shaped by the same training distribution as the MLFF weights.
 A frame that is OOD in this space is, by construction, a frame the model had to
 extrapolate on when predicting energy/forces. This is a tighter coupling between
@@ -27,8 +29,9 @@ Add a second, fully independent OOD track alongside the geometric track.
 
 ### Architecture
 
-1. **Decoupled inference** — MlffModel runs separately (GPU node) and writes
-   per-atom embeddings to HDF5 files. DetectAna never imports `mlff_torch`.
+1. **Decoupled inference** — the MLFF runs separately (GPU node) and writes
+   per-atom embeddings to HDF5 files. DetectAna never imports the MLFF codebase;
+   `scripts/extract_embeddings.py` takes its Python package as an argument.
    This preserves DetectAna's CPU-only install footprint.
 
 2. **File schema** — one HDF5 per bead trajectory, one for the centroid, one for
@@ -55,9 +58,9 @@ Add a second, fully independent OOD track alongside the geometric track.
    the other. The comparison — does the MLFF enter extrapolation before or after
    the geometry becomes anomalous? — is a first-class output.
 
-7. **One checkpoint per method** — PBE0/CCSD/RPA/VMC/VD each have one MlffModel
-   checkpoint shared across all replica runs of that method. The checkpoint path
-   is used by the extraction script only, not by DetectAna.
+7. **One checkpoint per method** — each quantum-chemical reference method has one
+   MLFF checkpoint, shared across all replica runs of that method. The
+   checkpoint path is used by the extraction script only, not by DetectAna.
 
 ### New config fields (under `embedding:`)
 
@@ -74,7 +77,7 @@ embedding:
 Per run:
 ```yaml
 runs:
-  - name: "jax_PBE0"
+  - name: "run_a"
     ...
     embedding_glob: path/to/aspirin.emb_*.h5   # expands to 16 bead files
     centroid_embedding_h5: path/to/aspirin.emb_xc.h5
@@ -95,7 +98,7 @@ runs:
   embedding OOD is model-reliability-oriented.
 - **Mean-pool atoms before scoring** — rejected; averaging washes out single
   rogue atoms, violating the "never average away signals" rule.
-- **Hard dependency on mlff_torch** — rejected; would break DetectAna on
+- **Hard dependency on the MLFF package** — rejected; would break DetectAna on
   CPU-only nodes and couples two codebases with different release cycles.
 - **Centroid approximated from bead embeddings** — rejected; mean of embeddings
   ≠ embedding of mean positions for a nonlinear model; the approximation error
@@ -109,7 +112,7 @@ runs:
 - The output table gains `geometric_onset` and `embedding_onset` columns, making
   the lead/lag relationship between structural and model-reliability anomalies a
   primary scientific output.
-- GPU inference (MlffModel) and CPU analysis (DetectAna) remain on separate nodes
+- GPU inference (the MLFF) and CPU analysis (DetectAna) remain on separate nodes
   with a clean HDF5 handoff.
 - `embedding_stride` and `frame_range` give control over the compute budget
   without affecting the geometric track.

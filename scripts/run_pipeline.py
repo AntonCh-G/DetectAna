@@ -3,9 +3,13 @@
 
 Usage
 -----
-    python scripts/run_pipeline.py --config config/default.yaml
-    python scripts/run_pipeline.py --config config/default.yaml --verbose
-    python scripts/run_pipeline.py --config config/default.yaml --force-recompute
+    python scripts/run_pipeline.py --config config/demo.yaml
+    python scripts/run_pipeline.py --config config/local.yaml --verbose
+    python scripts/run_pipeline.py --config config/local.yaml --force-recompute
+
+``config/demo.yaml`` runs on the synthetic data shipped in ``data/smoke/``.
+Copy ``config/example.yaml`` for a real run; anything under ``config/`` other
+than those two is git-ignored, so local paths stay local.
 """
 
 from __future__ import annotations
@@ -20,12 +24,14 @@ import yaml
 
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(
-        description="Detect anomaly onset in aspirin PIMD trajectories."
+        description="Detect anomaly onset in MD and PIMD trajectories."
     )
+    # No default: the old one named a local, untracked config, so a fresh clone
+    # got "config file not found" instead of a usage message.
     p.add_argument(
         "--config", "-c",
-        default="config/default.yaml",
-        help="Path to YAML configuration file (default: config/default.yaml)",
+        required=True,
+        help="Path to YAML configuration file (start from config/demo.yaml)",
     )
     p.add_argument(
         "--verbose", "-v",

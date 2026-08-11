@@ -3,10 +3,12 @@
 #
 #     python scripts/run_pipeline.py --config config/demo.yaml
 #
-# The geometries are real, but there are far too few of them to mean anything:
-# 64 training frames, 32 validation frames, one bead, 24 trajectory frames.
-# This is here to check the install works. Start from config/example.yaml for
-# a real run.
+# The geometries are synthetic — thermal-style perturbations of one equilibrium
+# structure, written by scripts/make_demo_data.py, with no simulation and no force
+# field behind them. There are also far too few: 64 training frames, 32 validation
+# frames, one bead, 24 trajectory frames. This checks that the install works and
+# shows the shape of the output; it is not a result. Start from config/example.yaml
+# for a real run.
 
 # ── Reference data ────────────────────────────────────────────────────────────
 # The two files share no frames, so the threshold is calibrated on geometries

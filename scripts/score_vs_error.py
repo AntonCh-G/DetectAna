@@ -114,7 +114,7 @@ def _load_forces_and_positions(
                 raise ValueError(
                     f"{path.name}: frame {i} carries no forces. The reference file "
                     "must have forces; use --predicted for the model's forces."
-                )
+                ) from None
             forces.append(np.asarray(info_forces, dtype=np.float64))
     if not positions:
         raise ValueError(f"No frames found in {path}")

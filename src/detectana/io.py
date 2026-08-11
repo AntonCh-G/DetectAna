@@ -246,13 +246,13 @@ def load_reference_frames(
 
 
 # ---------------------------------------------------------------------------
-# Pre-computed MlffModel embedding reader (HDF5)
+# Pre-computed MLFF embedding reader (HDF5)
 # ---------------------------------------------------------------------------
 
 def load_embeddings_h5(
     h5_path: str | Path,
 ) -> tuple[np.ndarray, np.ndarray]:
-    """Load pre-computed MlffModel inv_features from an HDF5 file.
+    """Load pre-computed MLFF invariant per-atom features from an HDF5 file.
 
     Expected HDF5 layout (written by scripts/extract_embeddings.py):
     - ``inv_features`` : (n_frames, n_atoms, n_features)  float32 or float64

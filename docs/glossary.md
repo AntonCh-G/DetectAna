@@ -85,7 +85,7 @@ reliability estimate. Needs forces from the reference method, so it lives in
 
 ## Data Files
 
-**PIMD trajectory data (iPI XYZ format)** — `CCSD_newdata/`:
+**PIMD trajectory data (iPI XYZ format)** — one directory per run:
 - `aspirin.pos_NN.xyz` — bead NN positions (Å), 16 files (NN = 00–15)
 - `aspirin.for_NN.xyz` — bead NN forces (atomic units), 16 files
 - `aspirin.xc.xyz` — centroid positions (Å)
@@ -103,50 +103,69 @@ reliability estimate. Needs forces from the reference method, so it lives in
 - Steps are frame indices `0…n_frames−1`; no physical time metadata stored.
 - Read via `load_pimd_trajectory_hdf5` → `PIMDTrajectory` namedtuple.
 
-**Reference dataset** — `aspirin_md17_pimd_pbe_mbd_tight/`:
-- `aspirin_md_pimd_pbe0_mbd_train2500.xyz` — 2500 training frames
-- `aspirin_md_pimd_pbe0_mbd_valid600.xyz` — 600 validation frames
-- `aspirin_md_pimd_pbe0_mbd_test400.xyz` — 400 test frames
+**Reference dataset** — one directory holding a fixed train/valid/test split:
+- `*_train.xyz` — 2500 training frames (fit the standardiser, PCA and covariance)
+- `*_valid.xyz` — 600 validation frames (calibrate the threshold)
+- `*_test.xyz` — 400 test frames (check the calibration held)
 - Format: extended XYZ (positions Å, forces eV/Å, energy eV)
+- The quantum-chemical method behind the reference forces is a property of the
+  dataset, not of DetectAna. The pipeline neither reads nor records it; swapping
+  the reference set is a config change.
+- Not in this repository: the set belongs to work that is not yet published and
+  cannot be redistributed until then. `data/smoke/` stands in for it.
 
 **Unit mismatch** — PIMD forces in atomic units (Hartree/Bohr); reference forces
 in eV/Å. Conversion required: 1 Hartree/Bohr ≈ 51.4221 eV/Å.
+
+**Demo data** — `data/smoke/`, the only data in the repository. Synthetic:
+`scripts/make_demo_data.py` builds it from the single equilibrium geometry in
+`initial.xyz` by perturbing the two flexible torsions and rattling every atom with
+an element-dependent amplitude. No simulation, no force field, no reference
+calculation, and therefore no forces — positions only, which is all the geometric
+pipeline reads. It exercises every code path and means nothing scientifically:
+64 training frames against the 134-dimensional aspirin descriptor is far below
+what the covariance needs, and every trajectory frame comes out flagged.
 
 ## MLFF
 
 **MLFF (machine learning force field)** — a neural network trained to predict
 energies and forces from atomic positions. Produces the PIMD trajectories
 DetectAna analyses. The MLFF is an external system; DetectAna does not load or
-call it during the main pipeline. One trained MLFF per quantum-chemical method
-(PBE0, CCSD, RPA, VMC, VD); multiple PIMD runs with the same method share one
-checkpoint.
+call it during the main pipeline. One trained MLFF per quantum-chemical reference
+method; multiple PIMD runs sharing a method share one checkpoint.
 
-**MlffModel** — the specific MLFF architecture used in this project. A message-
-passing equivariant graph neural network with SO(3)-symmetric transformer blocks.
-Relevant output: `inv_features`, the invariant per-atom embedding after the last
-transformer layer. Shape `(n_atoms, n_features)`, e.g. `(21, 128)`. Extracted
-via `return_descriptors=True` in the forward pass. Lives in a separate codebase
-(`mlff_torch`); DetectAna never imports it.
+**MLFF architecture (unnamed here)** — the specific model used during
+development is part of unpublished work and is deliberately not named in this
+repository. What matters to DetectAna is only the interface: an equivariant
+message-passing network that exposes *invariant* per-atom features from its last
+layer, of shape `(n_atoms, n_features)` — e.g. `(21, 128)` for aspirin — obtained
+with `return_descriptors=True` in the forward pass. It lives in a separate
+codebase that DetectAna never imports. `scripts/extract_embeddings.py` takes the
+model's Python package as a `--model-package` argument, so any model meeting that
+interface works.
 
-**Atomic embedding** — the `inv_features` tensor produced by MlffModel for one
-frame. Rotation-invariant; encodes the local chemical environment of each atom
-as learned by the MLFF during training. Used as the basis for the embedding OOD
-track.
+**Atomic embedding** — the invariant per-atom feature tensor for one frame,
+stored under the HDF5 dataset name `inv_features`. Rotation-invariant, which is
+required: an equivariant tensor would make the OOD score depend on molecular
+orientation. It encodes the local chemical environment of each atom as learned by
+the MLFF during training, and is the basis of the embedding OOD track.
 
-**Pre-computed embeddings** — MlffModel inference results written to HDF5 files
-before DetectAna runs. One HDF5 file per bead trajectory (`embedding_glob`),
-one for the centroid (`centroid_embedding_h5`), one for the reference training
-set. DetectAna reads these files; it does not trigger MLFF inference.
+**Pre-computed embeddings** — MLFF inference results written to HDF5 files before
+DetectAna runs. One HDF5 file per bead trajectory (`embedding_glob`), one for the
+centroid (`centroid_embedding_h5`), one for the reference training set. DetectAna
+reads these files; it does not trigger MLFF inference.
 
 ## Descriptors
 
 **Internal coordinate fingerprint** — the primary descriptor for the geometric
-OOD track.
-Composed of: all pairwise bond lengths, bond angles, dihedral torsions (encoded
-as sin/cos pairs to handle periodicity), and ring planarity deviation for the
-benzene ring. Computed for every frame (bead or centroid). Feature vector is
-standardized (zero mean, unit variance) using statistics from the training set
-only.
+OOD track. Column order, which `topology.feature_names` is the authority on:
+bonded lengths, then bond angles, then every dihedral's sine, then every
+dihedral's cosine, then ring planarity if the molecule has a ring. Sin and cos
+are separate blocks rather than interleaved pairs, and the periodicity of a
+torsion is handled by encoding it that way rather than by unwrapping the angle.
+For aspirin that is 21 + 32 + 40 + 40 + 1 = 134 columns. Computed for every frame
+(bead or centroid) and standardized (zero mean, unit variance) with statistics
+from the training set only.
 
 **PCA projection** — dimensionality reduction applied to the standardized
 internal coordinate fingerprint. Fit on training reference frames only. Used to
@@ -195,14 +214,15 @@ directly comparable.
 **Mahalanobis distance** — OOD score used by both tracks. Computed from a fitted
 mean and inverse covariance. Higher = more out-of-distribution. In the geometric
 track: computed in PCA-reduced internal-coordinate space. In the embedding track:
-computed per atom in the 128-dimensional `inv_features` space.
+computed per atom in the (e.g. 128-dimensional) invariant embedding space.
 
 ## Anomaly Detection
 
-**OOD threshold** — 99th percentile of scores computed on the validation set.
-Fit on training set only; calibrated on held-out validation set. No PIMD
-trajectory frames leak into threshold calibration. One threshold per track
-(geometric and embedding).
+**OOD threshold** — a percentile of the validation-set scores,
+`threshold.percentile`, default 99. Fit on the training set only, calibrated on
+the held-out validation set: no trajectory frame reaches either. One threshold per
+track (geometric and embedding). The demo config uses 95 instead, because with 32
+validation frames the 99th percentile is just the maximum.
 
 **OOD (out-of-distribution)** — a frame whose descriptor falls outside the
 distribution of the reference training set. OOD does *not* automatically imply
@@ -216,8 +236,8 @@ A frame can be OOD without failing chemical validity and vice versa.
 space. Flags structural outliers: unusual bonds, angles, dihedrals, ring
 planarity. One scalar per frame (bead or centroid).
 
-**Embedding OOD score** — per-atom Mahalanobis distance in MlffModel `inv_features`
-space. Flags model-reliability outliers: frames the MLFF has not encountered
+**Embedding OOD score** — per-atom Mahalanobis distance in the MLFF's invariant
+per-atom embedding space. Flags model-reliability outliers: frames the MLFF has not encountered
 during training, where energy/force predictions are likely extrapolating. One
 scalar per atom per frame; aggregated to one scalar per frame via max over all 21
 atoms. Computed at a configurable stride and optional frame range.
@@ -234,7 +254,7 @@ by a sliding window: onset = first window where fraction of frames above OOD
 threshold exceeds a configured fraction threshold. Window size, step size, and
 fraction threshold are versioned config parameters.
 
-**Embedding stride** — frames between successive MlffModel inference calls.
+**Embedding stride** — frames between successive MLFF inference calls.
 Independent of the geometric pipeline stride. Configured per-run to manage GPU
 inference cost.
 

@@ -185,7 +185,7 @@ def _complementary_feature_mask(
             raise ValueError(
                 f"Primary dihedral {quad} (canonical {canonical}) not found in "
                 f"topology. Check 0-based atom indices."
-            )
+            ) from None
         # sin column: offset n_bonds + n_angles + dih_idx
         # cos column: offset n_bonds + n_angles + n_dih + dih_idx
         mask[n_bonds + n_angles + dih_idx] = False

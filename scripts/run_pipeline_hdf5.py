@@ -11,7 +11,7 @@ library.
 
 Usage (unchanged)
 -----------------
-    python scripts/run_pipeline_hdf5.py --config config/pimd6_s4_hdf5.yaml
+    python scripts/run_pipeline_hdf5.py --config config/local.yaml
 
 Config shape
 ------------
@@ -46,10 +46,12 @@ log = logging.getLogger("detectana.run_hdf5")
 
 def _parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="DetectAna — HDF5 pipeline (deprecated wrapper)")
+    # No default: the old one named a local, untracked config, so a fresh clone
+    # got a confusing FileNotFoundError instead of a usage message.
     p.add_argument(
         "--config",
-        default="config/pimd6_s4_hdf5.yaml",
-        help="YAML config file",
+        required=True,
+        help="YAML config file, with an hdf5: key per run",
     )
     p.add_argument("--force-recompute", action="store_true")
     p.add_argument("--verbose", action="store_true")

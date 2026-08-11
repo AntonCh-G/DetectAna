@@ -9,9 +9,12 @@ build/
 dist/
 *.egg-info/
 
-# Test and coverage artifacts
+# Test, lint, type-check and coverage artifacts
 .pytest_cache/
+.ruff_cache/
+.mypy_cache/
 .coverage
+coverage.xml
 htmlcov/
 
 # Local machine and editor/tool state

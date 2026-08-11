@@ -58,10 +58,13 @@ idealised detector.
 
 ## Consequences
 
-- Measured on the aspirin reference set: Spearman −0.93 between training density
-  and flag rate, 100 % detection in unvisited slices, 4.1 % in well-sampled ones.
-  The detector flags a conformer in proportion to how little training data
-  supports it, which is what the project's definition of OOD asks for.
+- Measured on the 2500-frame aspirin reference set used during development, which
+  is not redistributable and is not in this repository: Spearman −0.93 between
+  training density and flag rate, 100 % detection in unvisited slices, 4.1 % in
+  well-sampled ones. The detector flags a conformer in proportion to how little
+  training data supports it, which is what the project's definition of OOD asks
+  for. The numbers are therefore not reproducible from a clone; the shipped demo
+  data reproduces the machinery, not the result.
 - The benchmark confirms the "OOD is not unphysical" rule empirically. A slice
   holding 5 frames out of 2500 is flagged every time, and those conformers are
   chemically ordinary. The score measures coverage, not correctness.
@@ -73,8 +76,9 @@ idealised detector.
   because it needs forces recomputed with the reference method.
 - The benchmark warns when training frames number fewer than ten per PCA
   component, since the estimated covariance is then dominated by noise. The demo
-  configuration is deliberately in that regime, and its benchmark output is a
-  smoke test of the machinery rather than a measurement.
+  configuration is deliberately in that regime — 64 synthetic frames, 134 descriptor
+  columns — and its benchmark output is a smoke test of the machinery rather than a
+  measurement.
 
 ## Alternatives considered
 

@@ -1,11 +1,34 @@
-"""Extract MlffModel inv_features and write per-bead HDF5 embedding files.
+"""Extract per-atom force-field embeddings and write per-bead HDF5 files.
 
 This script is intentionally kept outside the detectana package so that
-detectana itself has no dependency on mlff_torch or PyTorch.
+detectana itself has no dependency on any force-field code or on PyTorch.
+It is the only file in the repository that touches the model.
 
 Run on a GPU node before executing run_pipeline.py.  The HDF5 files it
 produces are consumed by detectana when ``embedding.enabled: true`` in the
 YAML config.
+
+The force field is not named here and is not a dependency of this project:
+``--model-package`` names the Python package to load it from, so any model
+satisfying the contract below works. The MLFF used during development is part
+of unpublished work and is deliberately left unnamed.
+
+Adapter contract
+----------------
+Given ``--model-package PKG``, this script expects:
+
+- ``PKG.modules.models`` to expose the model classes. The class is chosen by
+  ``--model-class``, or by a case-insensitive match against the checkpoint's
+  ``hyper_parameters["model_type"]``.
+- ``PKG.data.utils.atoms_to_graph`` to convert one ASE ``Atoms`` to a graph
+  object that ``torch_geometric.data.Batch.from_data_list`` can collate.
+- the model to accept ``model(batch, return_descriptors=True,
+  compute_force=False)`` and return a mapping containing ``--feature-key``
+  (default ``inv_features``): invariant per-atom features of shape
+  ``(n_batch_atoms, n_features)``.
+
+Only invariant (rotation-invariant) per-atom features are usable — an
+equivariant tensor would make the OOD score orientation-dependent.
 
 Output layout (mirrors bead_glob / centroid_xyz paths in the config):
 
@@ -25,9 +48,12 @@ Each HDF5 file contains:
 Usage
 -----
 python scripts/extract_embeddings.py \\
-    --config configs/default_pbe0_pimd_1.yaml \\
-    --checkpoint /path/to/mlff_pbe0.ckpt \\
+    --config config/your_run.yaml \\
+    --checkpoint path/to/checkpoint.ckpt \\
+    --model-package your_mlff_package \\
     --output-dir outputs/embeddings \\
+    [--model-class ModelClassName] \\
+    [--feature-key inv_features] \\
     [--stride 10] \\
     [--frame-start 0] \\
     [--frame-end 100000] \\
@@ -51,30 +77,90 @@ log = logging.getLogger(__name__)
 
 _STEP_RE = re.compile(r"Step:\s*(\d+)", re.IGNORECASE)
 
+# Key of the invariant per-atom features in the model's output mapping. Also the
+# dataset name in the HDF5 files this script writes, which is part of the format
+# detectana reads (``io.load_embeddings_h5``) and is not affected by
+# ``--feature-key``.
+DEFAULT_FEATURE_KEY = "inv_features"
+H5_FEATURE_DATASET = "inv_features"
+
 
 # ---------------------------------------------------------------------------
 # Model loading
 # ---------------------------------------------------------------------------
 
-def load_model(checkpoint: str, device: str):
-    """Load a MlffModel model from a checkpoint file."""
+def _import_attr(module_path: str, attr: str):
+    """Import ``attr`` from ``module_path``, with a message that names the fix."""
+    import importlib
+
+    try:
+        module = importlib.import_module(module_path)
+    except ImportError as exc:
+        raise ImportError(
+            f"Cannot import {module_path}. Check --model-package and that the "
+            f"force-field package is installed in this environment.\n{exc}"
+        ) from None
+    try:
+        return getattr(module, attr)
+    except AttributeError:
+        raise AttributeError(
+            f"{module_path} has no attribute {attr!r}. Available: "
+            f"{sorted(n for n in dir(module) if not n.startswith('_'))}"
+        ) from None
+
+
+def _resolve_model_class(models_module: str, model_class: str | None, model_type: str | None):
+    """Pick the model class: an explicit name, else a match on ``model_type``.
+
+    ``model_type`` comes from the checkpoint and is matched case-insensitively,
+    so a checkpoint recording e.g. ``"mymodel"`` finds the class ``MyModel``.
+    """
+    import importlib
+
+    if model_class is not None:
+        return _import_attr(models_module, model_class)
+    if model_type is None:
+        raise ValueError(
+            f"The checkpoint records no 'model_type', so the class cannot be "
+            f"inferred. Pass --model-class with one of the classes in {models_module}."
+        )
+    module = importlib.import_module(models_module)
+    for name in dir(module):
+        if name.lower() == str(model_type).lower().replace("_", ""):
+            return getattr(module, name)
+    raise ValueError(
+        f"No class in {models_module} matches the checkpoint's model_type "
+        f"{model_type!r}. Pass --model-class explicitly. Available: "
+        f"{sorted(n for n in dir(module) if not n.startswith('_'))}"
+    )
+
+
+def load_model(checkpoint: str, device: str, model_package: str, model_class: str | None = None):
+    """Load a force-field model from a Lightning-style checkpoint.
+
+    Parameters
+    ----------
+    model_package : Python package holding the model, e.g. the MLFF codebase.
+        ``<model_package>.modules.models`` must expose the model classes.
+    model_class : class name to instantiate. Inferred from the checkpoint's
+        ``model_type`` when omitted.
+    """
     import torch
-    from mlff_torch.modules.models import MlffModel, MlffModelLR
 
     state = torch.load(checkpoint, map_location=device)
 
-    # Support both raw state-dicts and Lightning-style checkpoints
-    if "hyper_parameters" in state:
-        cfg = state["hyper_parameters"]
-        # Instantiate the correct model class
-        model_cls = MlffModelLR if cfg.get("model_type", "mlff") == "mlff_lr" else MlffModel
-        model = model_cls(**{k: v for k, v in cfg.items() if k != "model_type"})
-        model.load_state_dict(state["state_dict"])
-    else:
+    if "hyper_parameters" not in state:
         raise ValueError(
             f"Unrecognised checkpoint format in {checkpoint}. "
             "Expected a Lightning checkpoint with 'hyper_parameters' key."
         )
+
+    cfg = state["hyper_parameters"]
+    model_cls = _resolve_model_class(
+        f"{model_package}.modules.models", model_class, cfg.get("model_type")
+    )
+    model = model_cls(**{k: v for k, v in cfg.items() if k != "model_type"})
+    model.load_state_dict(state["state_dict"])
 
     model = model.to(device).eval()
     return model
@@ -84,10 +170,9 @@ def load_model(checkpoint: str, device: str):
 # Inference helpers
 # ---------------------------------------------------------------------------
 
-def _atoms_to_batch(atoms_list, device: str):
-    """Convert a list of ASE Atoms to a MlffModel-compatible batch dict."""
-    import torch
-    from mlff_torch.data.utils import atoms_to_graph
+def _atoms_to_batch(atoms_list, device: str, model_package: str):
+    """Convert a list of ASE Atoms into one batch the model can consume."""
+    atoms_to_graph = _import_attr(f"{model_package}.data.utils", "atoms_to_graph")
 
     graphs = [atoms_to_graph(a) for a in atoms_list]
     # Collate into a single batched dict expected by the model
@@ -101,8 +186,16 @@ def extract_embeddings_from_frames(
     atoms_list,
     batch_size: int,
     device: str,
+    model_package: str,
+    feature_key: str = DEFAULT_FEATURE_KEY,
 ) -> np.ndarray:
-    """Run MlffModel forward pass on a list of ASE Atoms and return inv_features.
+    """Run the model forward and return its invariant per-atom features.
+
+    Parameters
+    ----------
+    feature_key : key of the invariant per-atom features in the model's output
+        mapping. Must be rotation-invariant: an equivariant tensor would make
+        the OOD score depend on molecular orientation.
 
     Returns
     -------
@@ -114,12 +207,17 @@ def extract_embeddings_from_frames(
 
     for start in range(0, len(atoms_list), batch_size):
         batch_atoms = atoms_list[start : start + batch_size]
-        batch = _atoms_to_batch(batch_atoms, device)
+        batch = _atoms_to_batch(batch_atoms, device, model_package)
 
         with torch.no_grad():
             output = model(batch, return_descriptors=True, compute_force=False)
 
-        inv_feat = output["inv_features"]  # (n_batch_atoms, n_features)
+        if feature_key not in output:
+            raise KeyError(
+                f"The model output has no {feature_key!r}. Pass --feature-key with "
+                f"one of: {sorted(output)}"
+            )
+        inv_feat = output[feature_key]  # (n_batch_atoms, n_features)
         n_atoms = batch_atoms[0].get_positions().shape[0]
         n_frames = len(batch_atoms)
         inv_feat = inv_feat.reshape(n_frames, n_atoms, -1).cpu().numpy().astype(np.float32)
@@ -151,8 +249,10 @@ def load_xyz_frames(xyz_path: str, stride: int, frame_start: int | None, frame_e
             break
         if (frame_idx - (frame_start or 0)) % stride == 0:
             atoms_list.append(atoms)
-            # Parse step from comment if available, else use frame index
-            comment = atoms.info.get("comment", "")
+            # Parse the step out of the frame's metadata if it is there, else use
+            # the frame index. The whole info dict is searched rather than the
+            # "comment" key alone, because extxyz readers split the comment line
+            # into keys and the step may end up under any of them.
             m = _STEP_RE.search(str(atoms.info))
             steps.append(int(m.group(1)) if m else frame_idx)
         frame_idx += 1
@@ -199,7 +299,9 @@ def write_h5(path: str | Path, embeddings: np.ndarray, steps: np.ndarray) -> Non
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
     with h5py.File(path, "w") as fh:
-        fh.create_dataset("inv_features", data=embeddings, compression="gzip", compression_opts=4)
+        fh.create_dataset(
+            H5_FEATURE_DATASET, data=embeddings, compression="gzip", compression_opts=4
+        )
         fh.create_dataset("steps", data=steps)
     log.info("Wrote %s  shape=%s", path, embeddings.shape)
 
@@ -211,10 +313,21 @@ def write_h5(path: str | Path, embeddings: np.ndarray, steps: np.ndarray) -> Non
 def main() -> None:
     logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
 
-    parser = argparse.ArgumentParser(description="Extract MlffModel embeddings to HDF5")
+    parser = argparse.ArgumentParser(
+        description="Extract per-atom force-field embeddings to HDF5"
+    )
     parser.add_argument("--config",      required=True, help="DetectAna YAML config file")
-    parser.add_argument("--checkpoint",  required=True, help="MlffModel model checkpoint (.ckpt)")
+    parser.add_argument("--checkpoint",  required=True, help="Model checkpoint (.ckpt)")
     parser.add_argument("--output-dir",  required=True, help="Directory for output HDF5 files")
+    parser.add_argument("--model-package", required=True,
+                        help="Python package holding the force field (see the adapter "
+                             "contract in this file's docstring)")
+    parser.add_argument("--model-class",  default=None,
+                        help="Model class to instantiate (default: inferred from the "
+                             "checkpoint's model_type)")
+    parser.add_argument("--feature-key",  default=DEFAULT_FEATURE_KEY,
+                        help=f"Key of the invariant per-atom features in the model "
+                             f"output (default: {DEFAULT_FEATURE_KEY})")
     parser.add_argument("--stride",      type=int, default=10,
                         help="Extract every Nth frame (default: 10)")
     parser.add_argument("--frame-start", type=int, default=None,
@@ -233,15 +346,18 @@ def main() -> None:
     out_root = Path(args.output_dir)
     out_root.mkdir(parents=True, exist_ok=True)
 
-    log.info("Loading model from %s …", args.checkpoint)
-    model = load_model(args.checkpoint, args.device)
+    log.info("Loading model from %s (package %s) …", args.checkpoint, args.model_package)
+    model = load_model(args.checkpoint, args.device, args.model_package, args.model_class)
 
     # ── Reference embeddings ──────────────────────────────────────────────────
     for split, key in [("train", "train"), ("valid", "valid")]:
         ref_path = cfg["reference"][key]
         log.info("Processing reference %s: %s", split, ref_path)
         atoms_list, steps = load_xyz_frames(ref_path, stride=1, frame_start=None, frame_end=None)
-        embeddings = extract_embeddings_from_frames(model, atoms_list, args.batch_size, args.device)
+        embeddings = extract_embeddings_from_frames(
+            model, atoms_list, args.batch_size, args.device,
+            args.model_package, args.feature_key,
+        )
         write_h5(out_root / f"ref_{split}_embeddings.h5", embeddings, steps)
 
     # ── Per-run bead + centroid embeddings ────────────────────────────────────
@@ -265,7 +381,8 @@ def main() -> None:
                 log.warning("No frames extracted from bead %02d — skipping", bead_idx)
                 continue
             embeddings = extract_embeddings_from_frames(
-                model, atoms_list, args.batch_size, args.device
+                model, atoms_list, args.batch_size, args.device,
+                args.model_package, args.feature_key,
             )
             out_path = run_out / f"aspirin.emb_{bead_idx:02d}.h5"
             write_h5(out_path, embeddings, steps)
@@ -278,7 +395,8 @@ def main() -> None:
         )
         if atoms_list:
             embeddings = extract_embeddings_from_frames(
-                model, atoms_list, args.batch_size, args.device
+                model, atoms_list, args.batch_size, args.device,
+                args.model_package, args.feature_key,
             )
             write_h5(run_out / "aspirin.emb_xc.h5", embeddings, steps)
 
