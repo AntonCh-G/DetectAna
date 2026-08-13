@@ -55,6 +55,66 @@ def _stable_segment(scores: np.ndarray, stable_fraction: float) -> np.ndarray:
     return scores[:n]
 
 
+def _stack_beads_on_common_frames(
+    results: list[tuple[int, np.ndarray, np.ndarray]],
+    label: str,
+) -> tuple[np.ndarray, np.ndarray, dict]:
+    """Stack per-bead score arrays, trimming to the frame range every bead covers.
+
+    Beads of one run should cover the same frames, but a simulation killed
+    mid-write leaves some of them short. Refusing to analyse the run at all costs
+    more than it saves, so the common range is used and the trim is reported.
+
+    The trim is safe only because it removes frames from the tail, which leaves
+    frame *i* the same timestep in every bead. That is the property the
+    aggregates rest on, so it is checked rather than assumed: step numbers that
+    disagree over the common range mean the arrays are misaligned, and no amount
+    of trimming makes them comparable.
+
+    Returns ``(bead_scores, steps, report)`` where ``bead_scores`` is
+    (n_beads, n_frames_used) and ``report`` is the manifest block describing what
+    was kept.
+    """
+    counts = [int(scores.shape[0]) for _, scores, _ in results]
+    n_used = min(counts)
+    if n_used == 0:
+        empty = [f"{results[i][0]:02d}" for i, c in enumerate(counts) if c == 0]
+        raise ValueError(
+            f"{label} {', '.join(empty)} scored 0 frames — nothing to align against."
+        )
+
+    # Steps of a shortest bead are the canonical axis; every other bead must
+    # reproduce them over the range that survives the trim.
+    ref_steps = np.asarray(results[counts.index(n_used)][2][:n_used])
+    for bead_idx, _, steps in results:
+        if not np.array_equal(np.asarray(steps[:n_used]), ref_steps):
+            first_bad = int(np.argmax(np.asarray(steps[:n_used]) != ref_steps))
+            raise ValueError(
+                f"{label} {bead_idx:02d} disagrees on step numbering at frame "
+                f"{first_bad}: step {steps[first_bad]} vs {ref_steps[first_bad]} in "
+                f"the shortest bead. Frame indices do not line up across beads, so "
+                f"per-timestep aggregates would mix different times — this is a "
+                f"stride or frame-range mismatch, not a truncated file."
+            )
+
+    truncated = max(counts) != n_used
+    if truncated:
+        log.warning(
+            "%s frame counts differ (%d…%d) — using the first %d frames, the range "
+            "every bead covers. Per-bead counts: %s",
+            label, n_used, max(counts), n_used, counts,
+        )
+
+    report = {
+        "n_frames_used": n_used,
+        "frame_counts": counts,
+        "truncated_to_common_range": truncated,
+        "n_frames_dropped": max(counts) - n_used,
+    }
+    bead_scores = np.stack([scores[:n_used] for _, scores, _ in results])
+    return bead_scores, ref_steps, report
+
+
 class _NumpyEncoder(json.JSONEncoder):
     """JSON encoder that converts numpy scalar types to Python natives."""
     def default(self, obj):
@@ -228,7 +288,7 @@ def run_pipeline(cfg: dict) -> None:
         run_out = out_root / run_name
         run_out.mkdir(parents=True, exist_ok=True)
         log.info("=== Processing run: %s ===", run_name)
-        onset, onset_design = _process_run(
+        onset, onset_design, frame_report = _process_run(
             run_cfg=run_cfg,
             topo=topo,
             spec=spec,
@@ -256,6 +316,9 @@ def run_pipeline(cfg: dict) -> None:
             **manifest_base,
             "run": run_name,
             "onset_design": onset_design,
+            # How many frames every result in this run actually rests on, and
+            # whether that is fewer than some of the input files carry.
+            "frame_alignment": frame_report,
             "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S"),
         }
         with open(run_out / "manifest.json", "w") as fh:
@@ -287,7 +350,7 @@ def _process_run(
     emb_cfg: dict,
     cfg: dict,
     out_root: Path,
-) -> tuple[OnsetResult, dict]:
+) -> tuple[OnsetResult, dict, dict]:
     run_name = run_cfg["name"]
     run_out = out_root / run_name
     run_out.mkdir(parents=True, exist_ok=True)
@@ -334,18 +397,9 @@ def _process_run(
         )
         results.sort(key=lambda r: r[0])
 
-        n_frames_ref = results[0][1].shape[0]
-        for bead_idx, scores, _ in results:
-            if scores.shape[0] != n_frames_ref:
-                raise ValueError(
-                    f"Bead {bead_idx:02d} has {scores.shape[0]} frames; "
-                    f"expected {n_frames_ref} (same as bead 00)."
-                )
-
-        bead_score_arrays = [scores for _, scores, _ in results]
-        step_arrays = results[0][2]
-
-        bead_scores = np.stack(bead_score_arrays)
+        bead_scores, step_arrays, frame_report = _stack_beads_on_common_frames(
+            results, label="Bead"
+        )
         np.save(run_out / "bead_scores.npy", bead_scores)
 
         centroid_scores, centroid_steps = _score_centroid_array(
@@ -388,19 +442,9 @@ def _process_run(
         )
         results.sort(key=lambda r: r[0])
 
-        n_frames_ref = results[0][1].shape[0]
-        for bead_idx, scores, _ in results:
-            if scores.shape[0] != n_frames_ref:
-                raise ValueError(
-                    f"Bead {bead_idx:02d} has {scores.shape[0]} frames; "
-                    f"expected {n_frames_ref} (same as bead 00). "
-                    "Check for truncated bead files."
-                )
-
-        bead_score_arrays = [scores for _, scores, _ in results]
-        step_arrays = results[0][2]
-
-        bead_scores = np.stack(bead_score_arrays)
+        bead_scores, step_arrays, frame_report = _stack_beads_on_common_frames(
+            results, label="Bead"
+        )
         np.save(run_out / "bead_scores.npy", bead_scores)
 
         centroid_scores, centroid_steps = _score_centroid(
@@ -417,6 +461,7 @@ def _process_run(
         np.save(run_out / "centroid_scores.npy", centroid_scores)
 
     # Align step arrays (bead and centroid should match; warn if not)
+    frame_report["centroid_frame_count"] = int(len(centroid_steps))
     if len(step_arrays) != len(centroid_steps):
         log.warning(
             "Bead step count %d ≠ centroid step count %d — truncating to min",
@@ -426,6 +471,18 @@ def _process_run(
         step_arrays = step_arrays[:n]
         bead_scores = bead_scores[:, :n]
         centroid_scores = centroid_scores[:n]
+        frame_report["n_frames_used"] = int(n)
+        frame_report["truncated_to_common_range"] = True
+
+    log.info(
+        "Frames analysed for run '%s': %d (beads %s, centroid %d)",
+        run_name,
+        frame_report["n_frames_used"],
+        f"{min(frame_report['frame_counts'])}…{max(frame_report['frame_counts'])}"
+        if min(frame_report["frame_counts"]) != max(frame_report["frame_counts"])
+        else str(frame_report["frame_counts"][0]),
+        frame_report["centroid_frame_count"],
+    )
 
     # ── Step 8: Aggregate ─────────────────────────────────────────────────────
     agg_df = aggregate_bead_scores(
@@ -447,7 +504,7 @@ def _process_run(
 
         if emb_bead_glob and emb_centroid_h5:
             log.info("Scoring embedding track for run '%s' …", run_name)
-            agg_df = _add_embedding_track(
+            agg_df, frame_report["embedding"] = _add_embedding_track(
                 agg_df=agg_df,
                 emb_bead_glob=emb_bead_glob,
                 emb_centroid_h5=emb_centroid_h5,
@@ -527,7 +584,7 @@ def _process_run(
     except Exception as exc:
         log.warning("Plotting failed (non-fatal): %s", exc)
 
-    return onset, onset_design
+    return onset, onset_design, frame_report
 
 
 # ---------------------------------------------------------------------------
@@ -792,8 +849,11 @@ def _add_embedding_track(
     emb_cfg: dict,
     run_out: Path,
     n_jobs: int,
-) -> pd.DataFrame:
-    """Score all bead and centroid embedding HDF5 files and merge into agg_df."""
+) -> tuple[pd.DataFrame, dict]:
+    """Score all bead and centroid embedding HDF5 files and merge into agg_df.
+
+    Returns the merged table and the frame-alignment report for the track.
+    """
     bead_h5_files = sorted(glob.glob(emb_bead_glob))
     if not bead_h5_files:
         raise FileNotFoundError(f"No embedding bead files matched: {emb_bead_glob}")
@@ -805,17 +865,10 @@ def _add_embedding_track(
     )
     emb_results.sort(key=lambda r: r[0])
 
-    # Guard against mismatched frame counts across bead embedding files
-    n_emb_frames_ref = emb_results[0][1].shape[0]
-    for bead_idx, scores, _ in emb_results:
-        if scores.shape[0] != n_emb_frames_ref:
-            raise ValueError(
-                f"Embedding bead {bead_idx:02d} has {scores.shape[0]} frames; "
-                f"expected {n_emb_frames_ref}. Check for mismatched HDF5 files."
-            )
-
-    emb_bead_scores = np.stack([s for _, s, _ in emb_results])  # (n_beads, n_emb_frames)
-    emb_steps = emb_results[0][2]
+    # (n_beads, n_emb_frames), trimmed to the frames every embedding file covers
+    emb_bead_scores, emb_steps, emb_report = _stack_beads_on_common_frames(
+        emb_results, label="Embedding bead"
+    )
     np.save(run_out / "emb_bead_scores.npy", emb_bead_scores)
 
     # Centroid
@@ -824,6 +877,7 @@ def _add_embedding_track(
     np.save(run_out / "emb_centroid_scores.npy", emb_centroid_scores)
 
     # Align bead and centroid step arrays
+    emb_report["centroid_frame_count"] = int(len(emb_centroid_steps))
     if len(emb_steps) != len(emb_centroid_steps):
         log.warning(
             "Embedding bead step count %d ≠ centroid step count %d — truncating to min",
@@ -833,6 +887,8 @@ def _add_embedding_track(
         emb_steps = emb_steps[:n]
         emb_bead_scores = emb_bead_scores[:, :n]
         emb_centroid_scores = emb_centroid_scores[:n]
+        emb_report["n_frames_used"] = int(n)
+        emb_report["truncated_to_common_range"] = True
 
     return add_embedding_scores(
         agg_df=agg_df,
@@ -840,7 +896,7 @@ def _add_embedding_track(
         emb_centroid_scores=emb_centroid_scores,
         emb_steps=emb_steps,
         emb_threshold=emb_threshold,
-    )
+    ), emb_report
 
 
 # ---------------------------------------------------------------------------

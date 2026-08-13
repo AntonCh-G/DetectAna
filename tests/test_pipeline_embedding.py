@@ -169,13 +169,28 @@ def test_an_embedding_glob_that_matches_nothing_fails_loudly(embedding_config, t
         run_pipeline(embedding_config)
 
 
-def test_mismatched_embedding_bead_lengths_are_detected(embedding_config, embedding_files):
-    """Bead embedding files must cover the same frames, as bead trajectories do."""
-    emb_dir, n_frames, _ = embedding_files
+def test_mismatched_embedding_bead_lengths_trim_the_track(embedding_config, embedding_files):
+    """A short embedding file costs the track frames, as on the geometric side."""
+    emb_dir, n_frames, n_beads = embedding_files
     _write_embeddings(emb_dir / "bead_01.h5", n_frames - 2, seed=77, shift=3.0)
 
-    with pytest.raises(ValueError, match="Check for mismatched HDF5 files"):
-        run_pipeline(embedding_config)
+    run_pipeline(embedding_config)
+    _, run_dir = _outputs(embedding_config)
+
+    emb_bead = np.load(run_dir / "emb_bead_scores.npy")
+    assert emb_bead.shape == (n_beads, n_frames - 2)
+
+    # The geometric track keeps all its frames; the embedding columns go NaN on
+    # the two frames the embedding files no longer cover.
+    agg = pd.read_csv(run_dir / "frame_aggregate.csv")
+    assert len(agg) == n_frames
+    assert agg["emb_bead_max"].notna().sum() == n_frames - 2
+
+    alignment = json.loads((run_dir / "manifest.json").read_text())["frame_alignment"]
+    assert alignment["truncated_to_common_range"] is False  # geometric track intact
+    assert alignment["embedding"]["truncated_to_common_range"] is True
+    assert alignment["embedding"]["n_frames_used"] == n_frames - 2
+    assert alignment["embedding"]["frame_counts"][1] == n_frames - 2
 
 
 def test_embedding_frames_outside_the_trajectory_are_left_unscored(

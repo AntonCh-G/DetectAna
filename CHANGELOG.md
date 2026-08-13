@@ -10,6 +10,22 @@ are called out explicitly whenever they change, because a silent change there
 produces results that still look plausible. See
 [docs/scientific-rules.md](docs/scientific-rules.md).
 
+## Unreleased
+
+### Changed
+- Bead files of unequal length no longer abort the run. The analysis uses the
+  frame range every bead covers — the shortest bead's extent — and reports it: a
+  warning naming the per-bead counts, and a `frame_alignment` block in
+  `manifest.json` recording `n_frames_used`, the counts found on disk, the
+  centroid count and how many frames were dropped. The same applies to the
+  embedding track, under `frame_alignment.embedding`. A simulation killed
+  mid-write is ordinary, and losing the whole analysis to it cost more than the
+  strictness bought. See [docs/scientific-rules.md](docs/scientific-rules.md).
+- Beads whose step numbers disagree over the common frame range are still a hard
+  failure, and now say so specifically. Trimming is safe only because it drops
+  frames from the tail, leaving frame *i* the same timestep in every bead; when
+  that does not hold, per-timestep aggregates would mix different times.
+
 ## 0.3.0 — 2026-08-11
 
 No change to the detection code. This release makes the repository standalone —

@@ -134,9 +134,19 @@ reference set, the other runs' initial geometries and every trajectory frame are
 validated against it. The binary XYZ reader and the HDF5 files carry no element
 symbols, so on those paths only the atom count can be checked.
 
-The same applies to bead counts and frame counts across bead files. A truncated
-bead file gives a shorter score array, and silently trimming it would misalign
-every timestep after that point.
+Frame counts across bead files are treated differently, because a run killed
+mid-write is ordinary rather than pathological. The analysis uses the frame range
+every bead covers, and records the trim: `n_frames_used`, the per-bead counts
+found on disk and the number of frames dropped go into the `frame_alignment`
+block of `manifest.json`, and the trim is logged as a warning. The danger was
+never the trimming — it was trimming quietly, which would let an onset measured
+on half a trajectory read like one measured on all of it.
+
+Trimming is defensible only because it drops frames from the tail, which leaves
+frame *i* the same timestep in every bead. That is checked rather than assumed: if
+the step numbers disagree over the common range, the beads are on different
+strides or frame ranges, per-timestep aggregates would mix different times, and
+the run fails. No trim repairs that.
 
 ## Be explicit about units
 

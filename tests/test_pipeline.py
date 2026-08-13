@@ -562,8 +562,8 @@ def test_a_bead_glob_that_matches_nothing_fails_loudly(demo_config_template, tmp
         _run(cfg, tmp_path / "outputs")
 
 
-def test_a_truncated_bead_file_is_detected(demo_config_template, tmp_path):
-    """Beads of one run must cover the same frames — a short file is an error."""
+def _run_with_a_short_bead(demo_config_template, tmp_path) -> tuple[Path, int, int]:
+    """Two-bead run where bead 01 stops halfway. Returns (out_dir, full, short)."""
     source = Path(demo_config_template["runs"][0]["bead_glob"]).parent / "aspirin.pos_00.xyz"
     lines = source.read_text().splitlines(keepends=True)
 
@@ -572,12 +572,71 @@ def test_a_truncated_bead_file_is_detected(demo_config_template, tmp_path):
     (bead_dir / "aspirin.pos_00.xyz").write_text("".join(lines))
     # Half the frames, cut on a frame boundary.
     n_frames = len(lines) // LINES_PER_FRAME
-    keep = (n_frames // 2) * LINES_PER_FRAME
-    (bead_dir / "aspirin.pos_01.xyz").write_text("".join(lines[:keep]))
+    n_short = n_frames // 2
+    (bead_dir / "aspirin.pos_01.xyz").write_text("".join(lines[: n_short * LINES_PER_FRAME]))
 
     cfg = copy.deepcopy(demo_config_template)
     cfg["runs"][0]["bead_glob"] = str(bead_dir / "aspirin.pos_*.xyz")
-    with pytest.raises(ValueError, match="frames"):
+    out = tmp_path / "outputs"
+    _run(cfg, out)
+    return out, n_frames, n_short
+
+
+def test_a_truncated_bead_file_costs_frames_not_the_run(demo_config_template, tmp_path):
+    """A short bead file trims the analysis to the common range instead of failing."""
+    out, _, n_short = _run_with_a_short_bead(demo_config_template, tmp_path)
+    outputs = _read_outputs(out, "demo")
+
+    assert outputs["bead_scores"].shape == (2, n_short)
+    assert len(outputs["agg"]) == n_short
+    assert len(outputs["onset"]) == 1
+
+
+def test_the_truncation_is_reported_in_the_manifest(demo_config_template, tmp_path):
+    """The trim is provenance: how many frames were used, and what was on disk."""
+    out, n_frames, n_short = _run_with_a_short_bead(demo_config_template, tmp_path)
+    alignment = _read_outputs(out, "demo")["manifest"]["frame_alignment"]
+
+    assert alignment["truncated_to_common_range"] is True
+    assert alignment["n_frames_used"] == n_short
+    assert alignment["frame_counts"] == [n_frames, n_short]
+    assert alignment["n_frames_dropped"] == n_frames - n_short
+    assert alignment["centroid_frame_count"] == n_frames
+
+
+def test_the_truncation_is_warned_about(demo_config_template, tmp_path, caplog):
+    """A quiet trim would read as a complete analysis, so it has to be logged."""
+    with caplog.at_level("WARNING", logger="detectana.pipeline"):
+        _run_with_a_short_bead(demo_config_template, tmp_path)
+    assert any("frame counts differ" in rec.getMessage() for rec in caplog.records)
+
+
+def test_equal_length_beads_report_no_truncation(demo_outputs):
+    """The report is written on every run, not only the trimmed ones."""
+    alignment = demo_outputs["manifest"]["frame_alignment"]
+    assert alignment["truncated_to_common_range"] is False
+    assert alignment["n_frames_dropped"] == 0
+    assert alignment["n_frames_used"] == len(demo_outputs["agg"])
+
+
+def test_beads_that_disagree_on_step_numbering_still_fail(demo_config_template, tmp_path):
+    """Trimming cannot rescue beads whose frame *i* is a different timestep."""
+    source = Path(demo_config_template["runs"][0]["bead_glob"]).parent / "aspirin.pos_00.xyz"
+    lines = source.read_text().splitlines(keepends=True)
+
+    bead_dir = tmp_path / "beads"
+    bead_dir.mkdir()
+    (bead_dir / "aspirin.pos_00.xyz").write_text("".join(lines))
+    # The same trajectory at twice the stride: shorter *and* differently numbered.
+    n_frames = len(lines) // LINES_PER_FRAME
+    strided: list[str] = []
+    for frame in range(0, n_frames, 2):
+        strided += lines[frame * LINES_PER_FRAME:(frame + 1) * LINES_PER_FRAME]
+    (bead_dir / "aspirin.pos_01.xyz").write_text("".join(strided))
+
+    cfg = copy.deepcopy(demo_config_template)
+    cfg["runs"][0]["bead_glob"] = str(bead_dir / "aspirin.pos_*.xyz")
+    with pytest.raises(ValueError, match="disagrees on step numbering"):
         _run(cfg, tmp_path / "outputs")
 
 
