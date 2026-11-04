@@ -63,6 +63,37 @@ since beads are not independent). For illustration, a 500-frame window at
 window, the fraction actually used, ρ, effective trials, flags needed and the
 false-alarm bounds per window and per run.
 
+## Planned: library interface (ADR 0005–0007, not built)
+
+**Reference bundle** — the saved fit for one force field, with a versioned
+manifest: atom order and topology, units, feature order per track, fitted state,
+calibrated thresholds, DetectAna version and descriptor code hashes. Replaces the
+pickled `pipeline.pkl` / `scorer.pkl` pair as the thing a caller loads.
+
+**Descriptor registry** — descriptors as functions marked `@descriptor("name")`,
+each returning named numbers with their atoms and a group ID (a dihedral's sin and
+cos share one). Built-ins plus user modules named in the config.
+
+**Track** — a set of descriptor numbers fitted, scored and thresholded together,
+as the embedding track is. Default (provisional): bonds, angles, dihedrals, ring.
+
+**Threshold role** — proposed name for what `MahalanobisScorer.thresholds` keys
+today (`bead`, `centroid`): different thresholds inside one track. Not a track.
+
+**T²** — Hotelling's statistic, the squared Mahalanobis distance in the kept PCA
+space: unusual within the motions the training data showed. The current code
+returns its square root, the distance.
+
+**SPE (Q)** — squared prediction error of the PCA residual: a new kind of motion
+the training data never showed. Inactive when PCA keeps every direction.
+
+**Attribution strength (RBC)** — reconstruction-based contribution: how much a
+score would drop if one descriptor group were reconstructed to its expected value.
+Values overlap and do not sum to the score; never call them shares.
+
+**Mark, alarm** — a mark is one frame above a threshold; an alarm is the window
+rule firing, i.e. the anomaly persisted.
+
 ## Evaluation
 
 **Detection rate** — fraction of known-abnormal frames whose score exceeds the
