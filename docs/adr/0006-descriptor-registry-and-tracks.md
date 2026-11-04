@@ -42,8 +42,10 @@ direction leaves no residual, so SPE (ADR 0007) is identically zero.
    hash of its code; loading refuses a bundle whose descriptors have changed.
 6. **Naming.** "Track" means a separately fitted scoring group. The existing
    `MahalanobisScorer.thresholds[track]` keys (`bead`, `centroid`) are a different
-   idea, a threshold role inside one track; rename them to *threshold role* when
-   this is built. (Proposed; to confirm.)
+   idea, a threshold role inside one track; they are renamed *threshold role*
+   (`track=` becomes `role=` in `MahalanobisScorer.calibrate`) when this is built.
+   Confirmed 2026-11-04: "track" always means something with its own fitted model
+   and its own score.
 
 ## Consequences
 

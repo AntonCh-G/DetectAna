@@ -77,8 +77,9 @@ cos share one). Built-ins plus user modules named in the config.
 **Track** — a set of descriptor numbers fitted, scored and thresholded together,
 as the embedding track is. Default (provisional): bonds, angles, dihedrals, ring.
 
-**Threshold role** — proposed name for what `MahalanobisScorer.thresholds` keys
-today (`bead`, `centroid`): different thresholds inside one track. Not a track.
+**Threshold role** — what `MahalanobisScorer.thresholds` keys today (`bead`,
+`centroid`, still called "track" in the code until ADR 0006 is built): different
+cut-offs on the same score inside one track. Not a track.
 
 **T²** — Hotelling's statistic, the squared Mahalanobis distance in the kept PCA
 space: unusual within the motions the training data showed. The current code
