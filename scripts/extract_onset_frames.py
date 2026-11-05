@@ -144,6 +144,22 @@ def _write_extxyz_frame(
 # CLI
 # ---------------------------------------------------------------------------
 
+def saved_score_units(run_manifest: Path) -> str:
+    """Units of a run's bead_scores.npy, from its manifest.
+
+    ``"exceedance"`` (score ÷ threshold over the tests; current runs) or ``"T2"``
+    (runs written before tracks). Runs that saved distances, or record neither,
+    raise ``ValueError``: a threshold would be compared on the wrong scale.
+    """
+    statistic = json.loads(run_manifest.read_text()).get("statistic") if run_manifest.exists() else None
+    if statistic in ("exceedance", "T2"):
+        return str(statistic)
+    raise ValueError(
+        f"{run_manifest} records neither exceedance nor T² scores (it has {statistic!r}): "
+        "rerun run_pipeline.py before overriding the threshold."
+    )
+
+
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(
         description="Extract frames around anomaly onset from the first-anomaly bead.",
@@ -165,9 +181,10 @@ def parse_args() -> argparse.Namespace:
                    ))
     p.add_argument("--threshold", type=float, default=None, metavar="SCORE",
                    help=(
-                       "Override the OOD threshold, in T² units (squared Mahalanobis "
-                       "distance, e.g. 225.0). "
-                       "Read the value directly from the score_vs_time.png plot. "
+                       "Override the threshold, in the units of the run's saved scores: "
+                       "exceedance for current runs (1 = the calibrated thresholds, "
+                       "2 = every test at twice its threshold), T² for runs written "
+                       "before tracks. Read the value from score_vs_time.png. "
                        "Re-detects onset from saved bead_scores.npy. "
                        "If omitted, uses onset frame from onset_table.csv as-is."
                    ))
@@ -227,16 +244,10 @@ def main() -> None:
 
     # ── Optional: re-detect onset at a different T² threshold ────────────────
     if args.threshold is not None:
-        # Runs written before scores became T² saved distances; a T² threshold
-        # would be compared against them on the wrong scale.
-        run_manifest = run_out / "manifest.json"
-        if run_manifest.exists():
-            statistic = json.loads(run_manifest.read_text()).get("statistic")
-            if statistic != "T2":
-                sys.exit(
-                    f"{run_manifest} records no T² statistic: its saved scores are "
-                    "distances. Rerun run_pipeline.py before overriding the threshold."
-                )
+        try:
+            units = saved_score_units(run_out / "manifest.json")
+        except ValueError as exc:
+            sys.exit(str(exc))
         bead_scores_path = run_out / "bead_scores.npy"
         centroid_scores_path = run_out / "centroid_scores.npy"
         agg_csv_path = run_out / "frame_aggregate.csv"
@@ -246,7 +257,7 @@ def main() -> None:
                 sys.exit(f"Required file not found: {p}. Run run_pipeline.py first.")
 
         new_threshold = args.threshold
-        print(f"Threshold override: {new_threshold:.4f}")
+        print(f"Threshold override: {new_threshold:.4f} ({units})")
 
         bead_scores = np.load(bead_scores_path)       # (n_beads, n_frames)
         centroid_scores = np.load(centroid_scores_path)
