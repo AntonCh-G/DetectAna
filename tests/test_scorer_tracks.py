@@ -117,3 +117,19 @@ def test_a_scorer_instance_pickled_before_named_tracks_still_unpickles(fitted_sc
     revived = pickle.loads(pickle.dumps(legacy))
     assert revived.threshold == 2.5
     np.testing.assert_array_equal(revived.score(X), scorer.score(X))
+
+
+def test_one_feature_input_fits_and_scores():
+    """A one-number input (e.g. ring planarity alone) used to crash in fit():
+    ``np.cov`` returns a 0-d scalar for a single column (issue 02)."""
+    rng = np.random.default_rng(3)
+    X = rng.normal(loc=2.0, scale=0.5, size=(200, 1))
+    scorer = MahalanobisScorer().fit(X)
+    scores = scorer.score(X)
+    assert scores.shape == (200,)
+    assert np.all(np.isfinite(scores))
+    # One dimension: the distance is |x - mean| / std (sample std, ddof=1).
+    expected = np.abs(X[:, 0] - X[:, 0].mean()) / X[:, 0].std(ddof=1)
+    np.testing.assert_allclose(scores, expected, rtol=1e-6)
+    threshold = scorer.calibrate(X, percentile=99.0)
+    assert np.isfinite(threshold)

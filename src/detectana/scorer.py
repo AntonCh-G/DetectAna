@@ -69,7 +69,9 @@ class MahalanobisScorer:
         X_train_pca : (n_train, n_components)
         """
         self._mean = X_train_pca.mean(axis=0)
-        cov = np.cov(X_train_pca, rowvar=False)
+        # atleast_2d: with one column np.cov returns a 0-d scalar, which has no
+        # shape[0] and cannot be inverted as a matrix.
+        cov = np.atleast_2d(np.cov(X_train_pca, rowvar=False))
         # Regularise slightly for numerical stability
         cov += np.eye(cov.shape[0]) * 1e-8
         self._inv_cov = np.linalg.inv(cov)
