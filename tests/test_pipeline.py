@@ -51,8 +51,13 @@ def _read_outputs(out_dir, run_name: str) -> dict:
         "agg": pd.read_csv(run_dir / "frame_aggregate.csv"),
         "bead_scores": np.load(run_dir / "bead_scores.npy"),
         "centroid_scores": np.load(run_dir / "centroid_scores.npy"),
+        "bead_tests": dict(np.load(run_dir / "bead_test_scores.npz")),
+        "centroid_tests": dict(np.load(run_dir / "centroid_test_scores.npz")),
         "manifest": json.loads((run_dir / "manifest.json").read_text()),
     }
+
+
+JOINED = {"geometric": ["bonds", "angles", "dihedrals", "ring"]}
 
 
 # ---------------------------------------------------------------------------
@@ -71,6 +76,16 @@ def demo_run(demo_config_template, tmp_path_factory):
 def demo_outputs(demo_run):
     out, _ = demo_run
     return _read_outputs(out, "demo")
+
+
+@pytest.fixture(scope="module")
+def joined_run(demo_config_template, tmp_path_factory):
+    """The demo run pinned to the pre-3b detector: one joined track, T² only."""
+    cfg = copy.deepcopy(demo_config_template)
+    cfg["tracks"], cfg["scores"] = JOINED, ["T2"]
+    out = tmp_path_factory.mktemp("joined_run") / "outputs"
+    cfg = _run(cfg, out)
+    return out, cfg, _read_outputs(out, "demo")
 
 
 @pytest.fixture(scope="module")
@@ -104,6 +119,8 @@ def test_demo_run_writes_every_documented_output(demo_run):
         "demo/manifest.json",
         "demo/bead_scores.npy",
         "demo/centroid_scores.npy",
+        "demo/bead_test_scores.npz",
+        "demo/centroid_test_scores.npz",
         "demo/chemistry_flags_bead00.csv",
         "demo/descriptor_cache/bead_00_descriptors.npz",
         "demo/descriptor_cache/centroid_descriptors.npz",
@@ -121,10 +138,13 @@ def test_demo_run_no_longer_writes_the_geometric_pickles(demo_run):
 
 def test_frame_aggregate_schema_and_length(demo_outputs):
     agg = demo_outputs["agg"]
+    tests = demo_outputs["manifest"]["tests"]
     assert list(agg.columns) == [
         "step", "time_ps", "bead_max", "bead_p95", "bead_frac_ood",
-        "centroid_score", "centroid_ood",
+        "centroid_score", "centroid_ood", "centroid_top_test",
+        *[f"centroid_{t.replace('/', '_')}" for t in tests],
     ]
+    assert set(agg["centroid_top_test"]) <= set(tests)
     # data/smoke ships 24 trajectory frames.
     assert len(agg) == 24
     assert agg["bead_frac_ood"].between(0.0, 1.0).all()
@@ -146,7 +166,8 @@ def test_bead_aggregates_match_the_saved_score_matrix(demo_outputs):
     """bead_max / bead_p95 / bead_frac_ood are reductions of bead_scores.npy."""
     agg = demo_outputs["agg"]
     bead_scores = demo_outputs["bead_scores"]
-    threshold = demo_outputs["manifest"]["ood_threshold"]
+    threshold = demo_outputs["manifest"]["signal_threshold"]
+    assert threshold == 1.0
 
     assert bead_scores.shape == (1, len(agg))  # one bead in the demo data
     np.testing.assert_allclose(agg["bead_max"].to_numpy(), bead_scores.max(axis=0))
@@ -242,22 +263,32 @@ def test_manifest_molecule_block_describes_the_molecule_that_was_used(demo_outpu
     assert molecule["initial_xyz"].endswith("initial.xyz")
 
 
-def test_manifest_threshold_block_is_consistent(demo_outputs):
-    manifest = demo_outputs["manifest"]
-    # demo.yaml sets a single `percentile`, so both tracks share it.
-    assert manifest["bead_percentile"] == manifest["centroid_percentile"] == 95.0
-    assert manifest["ood_threshold"] == manifest["bead_ood_threshold"]
-    assert manifest["ood_threshold"] == manifest["centroid_ood_threshold"]
-    assert manifest["pca_n_components"] > 0
-    assert 0.0 < manifest["pca_variance_explained"] <= 1.0
-    assert manifest["n_features"] > 0
+def test_manifest_threshold_block_is_consistent(demo_run, demo_outputs):
+    import detectana
 
-
-def test_manifest_says_scores_are_t2_and_names_the_bundle(demo_run, demo_outputs):
     out, _ = demo_run
     manifest = demo_outputs["manifest"]
-    assert manifest["statistic"] == "T2"
+    bundle = detectana.load(out / "models" / "geometric.bundle")
+    assert manifest["tests"] == [f"{t}/{s}" for t, s in bundle.tests]
+    for test in manifest["tests"]:
+        track, score = test.split("/")
+        assert manifest["thresholds"][test] == bundle.thresholds(track)[score]
+    assert manifest["budget"]["n_tests"] == len(manifest["tests"])
+    assert set(manifest["tracks"]) == set(bundle.tracks)
+    assert manifest["n_features"] == len(bundle.all_feature_names)
+
+
+def test_manifest_says_scores_are_exceedance_and_names_the_bundle(demo_run, demo_outputs):
+    out, _ = demo_run
+    manifest = demo_outputs["manifest"]
+    assert manifest["statistic"] == "exceedance"
     assert Path(manifest["reference_bundle"]) == out / "models" / "geometric.bundle"
+
+
+def test_default_config_uses_the_library_default_tracks(demo_outputs):
+    from detectana.bundle import DEFAULT_TRACKS
+
+    assert set(demo_outputs["manifest"]["tracks"]) == set(DEFAULT_TRACKS)
 
 
 def test_manifest_onset_design_records_the_window_rule_arithmetic(demo_outputs):
@@ -285,6 +316,10 @@ def test_manifest_onset_design_records_the_window_rule_arithmetic(demo_outputs):
 # 3. Saved models
 # ---------------------------------------------------------------------------
 
+def _exceedance(bundle, raw, role):
+    return np.max([raw[f"{t}/{s}"] / bundle.thresholds(t)[s][role] for t, s in bundle.tests], axis=0)
+
+
 def test_saved_bundle_reproduces_the_saved_scores(demo_run, demo_outputs):
     """Loading the bundle and re-scoring the cached descriptors is exact.
 
@@ -295,28 +330,65 @@ def test_saved_bundle_reproduces_the_saved_scores(demo_run, demo_outputs):
 
     out, _ = demo_run
     bundle = detectana.load(out / "models" / "geometric.bundle")
+    run_dir = demo_outputs["run_dir"]
 
-    cache = np.load(demo_outputs["run_dir"] / "descriptor_cache" / "bead_00_descriptors.npz")
-    rescored = bundle.score_features(cache["descriptors"])["geometric"]["T2"]
-    np.testing.assert_array_equal(rescored, demo_outputs["bead_scores"][0])
-
-    centroid_cache = np.load(
-        demo_outputs["run_dir"] / "descriptor_cache" / "centroid_descriptors.npz"
-    )
-    np.testing.assert_array_equal(
-        bundle.score_features(centroid_cache["descriptors"])["geometric"]["T2"],
-        demo_outputs["centroid_scores"],
-    )
+    for name, tests, signal, role in (
+        ("bead_00", {k: v[0] for k, v in demo_outputs["bead_tests"].items()}, demo_outputs["bead_scores"][0], "bead"),
+        ("centroid", demo_outputs["centroid_tests"], demo_outputs["centroid_scores"], "centroid"),
+    ):
+        cache = np.load(run_dir / "descriptor_cache" / f"{name}_descriptors.npz")
+        rescored = bundle.score_features(cache["descriptors"])
+        for t, s in bundle.tests:
+            np.testing.assert_array_equal(rescored[t][s], tests[f"{t}/{s}"])
+        np.testing.assert_array_equal(_exceedance(bundle, tests, role), signal)
 
 
-def test_saved_scores_are_t2_of_the_old_scorer(demo_run, demo_outputs):
-    """Same fit as before, squared: T² = distance² up to rounding."""
+def test_marked_means_some_test_is_above_its_threshold(demo_run, demo_outputs):
+    import detectana
+
+    out, _ = demo_run
+    bundle = detectana.load(out / "models" / "geometric.bundle")
+    above = np.any([demo_outputs["centroid_tests"][f"{t}/{s}"] > bundle.thresholds(t)[s]["centroid"]
+                    for t, s in bundle.tests], axis=0)
+    np.testing.assert_array_equal(above, demo_outputs["agg"]["centroid_ood"].to_numpy())
+    bead_above = np.any([demo_outputs["bead_tests"][f"{t}/{s}"] > bundle.thresholds(t)[s]["bead"]
+                         for t, s in bundle.tests], axis=0)
+    np.testing.assert_array_equal(bead_above.mean(axis=0), demo_outputs["agg"]["bead_frac_ood"].to_numpy())
+
+
+def test_joined_t2_config_reproduces_the_pre_track_pipeline(joined_run):
+    """Pinning the joined T² track gives the old detector: thresholds at the
+    configured percentile and every flag and onset of a T²-thresholded run."""
+    import detectana
+    from detectana.aggregator import aggregate_bead_scores
+    from detectana.onset import detect_onset
+
+    out, cfg, outputs = joined_run
+    bundle = detectana.load(out / "models" / "geometric.bundle")
+    assert bundle.tests == (("geometric", "T2"),)
+    thr = bundle.thresholds("geometric")["T2"]
+    t2_beads, t2_centroid = outputs["bead_tests"]["geometric/T2"], outputs["centroid_tests"]["geometric/T2"]
+    old = aggregate_bead_scores(t2_beads, t2_centroid, outputs["agg"]["step"].to_numpy(), thr["bead"],
+                                frame_time_fs=cfg["runs"][0]["timestep_fs"] * cfg["runs"][0]["stride"])
+    old["centroid_ood"] = t2_centroid > thr["centroid"]
+    for col in ("bead_frac_ood", "centroid_ood"):
+        np.testing.assert_array_equal(old[col].to_numpy(), outputs["agg"][col].to_numpy())
+    onset = detect_onset(old, thr["bead"], cfg["onset"]["window_frames"], cfg["onset"]["step_frames"],
+                         fraction_threshold=cfg["onset"]["fraction_threshold"])
+    row = outputs["onset"].iloc[0]
+    for key, value in onset.to_dict().items():
+        if key.startswith(("first_bead", "persistent", "centroid", "collective")):
+            assert (pd.isna(row[key]) and value is None) or row[key] == value, key
+
+
+def test_saved_scores_are_t2_of_the_old_scorer(joined_run):
+    """Joined track: the raw T² equals the step-1 scorer's distance squared."""
     from detectana.descriptors import DescriptorPipeline, compute_descriptor_batch
     from detectana.io import load_reference_frames
     from detectana.scorer import MahalanobisScorer
     from detectana.topology import build_topology
 
-    _, cfg = demo_run
+    _, cfg, outputs = joined_run
     topo = build_topology(cfg["runs"][0]["initial_xyz"], nl_mult=cfg["chemistry"]["nl_mult"])
     train, _, _ = load_reference_frames(cfg["reference"]["train"])
     X_train = compute_descriptor_batch(train, topo)
@@ -324,30 +396,20 @@ def test_saved_scores_are_t2_of_the_old_scorer(demo_run, demo_outputs):
         pca_variance=cfg["descriptor"]["pca_variance"], random_seed=cfg["descriptor"]["random_seed"],
     ).fit(X_train)
     scorer = MahalanobisScorer().fit(pipe.transform(X_train))
-    cache = np.load(demo_outputs["run_dir"] / "descriptor_cache" / "bead_00_descriptors.npz")
+    cache = np.load(outputs["run_dir"] / "descriptor_cache" / "bead_00_descriptors.npz")
     distance = scorer.score(pipe.transform(cache["descriptors"]))
-    np.testing.assert_allclose(demo_outputs["bead_scores"][0], distance**2, rtol=1e-6)
+    np.testing.assert_allclose(outputs["bead_tests"]["geometric/T2"][0], distance**2, rtol=1e-6)
 
 
-def test_saved_bundle_carries_both_thresholds(demo_run, demo_outputs):
-    import detectana
-
-    out, _ = demo_run
-    thresholds = detectana.load(out / "models" / "geometric.bundle").thresholds("geometric")["T2"]
-    manifest = demo_outputs["manifest"]
-    assert thresholds["bead"] == pytest.approx(manifest["bead_ood_threshold"])
-    assert thresholds["centroid"] == pytest.approx(manifest["centroid_ood_threshold"])
-    assert manifest["ood_threshold"] == pytest.approx(thresholds["bead"])
-
-
-def test_loaded_bundle_flags_the_same_frames_as_the_aggregate_table(demo_run, demo_outputs):
-    """The reloaded centroid threshold must agree with centroid_ood in the CSV."""
-    import detectana
-
-    out, _ = demo_run
-    thr = detectana.load(out / "models" / "geometric.bundle").thresholds("geometric")["T2"]["centroid"]
-    flags = demo_outputs["centroid_scores"] > thr
-    np.testing.assert_array_equal(flags, demo_outputs["agg"]["centroid_ood"].to_numpy())
+def test_a_track_subset_caches_its_own_descriptors(demo_config, tmp_path):
+    """Numbers other than the joined built-ins get a tagged cache file."""
+    demo_config["tracks"] = {"bonds": ["bonds"]}
+    _run(demo_config, tmp_path / "out")
+    outputs = _read_outputs(tmp_path / "out", "demo")
+    assert outputs["manifest"]["tests"] == ["bonds/T2", "bonds/SPE"]
+    caches = sorted(p.name for p in (outputs["run_dir"] / "descriptor_cache").iterdir())
+    assert all(name.startswith(("bead_00_descriptors_", "centroid_descriptors_")) for name in caches), caches
+    assert np.load(outputs["run_dir"] / "descriptor_cache" / caches[0])["descriptors"].shape[1] == 21
 
 
 # ---------------------------------------------------------------------------
@@ -526,10 +588,8 @@ def test_split_percentiles_flag_the_two_tracks_differently(hdf5_config, tmp_path
     assert (
         strict_out["agg"]["centroid_ood"].sum() <= loose_out["agg"]["centroid_ood"].sum()
     )
-    assert (
-        strict_out["manifest"]["centroid_ood_threshold"]
-        > strict_out["manifest"]["bead_ood_threshold"]
-    )
+    for test, thr in strict_out["manifest"]["thresholds"].items():
+        assert thr["centroid"] > thr["bead"], test
 
 
 def test_split_percentiles_record_both_tracks_in_the_onset_design(hdf5_config, tmp_path):
@@ -625,15 +685,7 @@ def test_plot_failure_does_not_lose_the_results(demo_config_template, tmp_path, 
     assert not (out / "demo" / "plots" / "score_vs_time.png").exists()
 
 
-@pytest.mark.parametrize("key, value", [
-    ("tracks", {"bonds": ["bonds"]}),
-    ("scores", ["T2", "SPE"]),
-])
-def test_pipeline_refuses_track_settings_it_cannot_honour_yet(demo_config, key, value):
-    """The batch pipeline scores one joined track by T² until step 3b; a config
-    asking for tracks or SPE is refused, not silently ignored."""
-    from detectana.pipeline import run_pipeline
-
-    demo_config[key] = value
-    with pytest.raises(ValueError, match="step 3b"):
+def test_pipeline_refuses_tracks_that_are_not_a_mapping(demo_config):
+    demo_config["tracks"] = ["bonds"]
+    with pytest.raises(ValueError, match="tracks"):
         run_pipeline(demo_config)

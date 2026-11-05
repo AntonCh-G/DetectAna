@@ -148,7 +148,8 @@ def test_manifest_still_describes_the_geometric_run(embedding_config):
     _, run_dir = _outputs(embedding_config)
     manifest = json.loads((run_dir / "manifest.json").read_text())
     assert manifest["config"]["embedding"]["enabled"] is True
-    assert manifest["ood_threshold"] > 0
+    assert manifest["statistic"] == "exceedance"
+    assert all(thr["bead"] > 0 for thr in manifest["thresholds"].values())
 
 
 def test_embedding_enabled_without_run_paths_skips_the_track(embedding_config):

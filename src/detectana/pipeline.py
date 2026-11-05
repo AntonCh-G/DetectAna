@@ -15,6 +15,7 @@ Step 10. Save tables, plots, and manifest.
 from __future__ import annotations
 
 import glob
+import hashlib
 import json
 import logging
 import time
@@ -26,7 +27,7 @@ from joblib import Parallel, delayed
 
 from detectana import __version__
 from detectana.aggregator import add_embedding_scores, aggregate_bead_scores
-from detectana.bundle import JOINED_TRACKS, ReferenceBundle
+from detectana.bundle import SCORES, ReferenceBundle
 from detectana.bundle import fit as fit_bundle
 from detectana.descriptors import compute_descriptor_batch
 from detectana.embedding_scorer import EmbeddingPipeline
@@ -91,6 +92,63 @@ def resolve_threshold_percentiles(threshold_cfg: dict) -> tuple[float, float]:
     return float(bead), float(centroid)
 
 
+#: Exceedance above this marks a frame: some test is above its own threshold.
+SIGNAL_THRESHOLD = 1.0
+
+
+def _test_key(track: str, score: str) -> str:
+    return f"{track}/{score}"
+
+
+def _test_keys(bundle: ReferenceBundle) -> list[str]:
+    return [_test_key(t, s) for t, s in bundle.tests]
+
+
+def _test_scores(bundle: ReferenceBundle, features: np.ndarray) -> dict[str, np.ndarray]:
+    """Raw score of every active test, keyed ``track/score`` (T² or SPE units)."""
+    scores = bundle.score_features(features)
+    return {_test_key(t, s): scores[t][s] for t, s in bundle.tests}
+
+
+def _exceedance(
+    bundle: ReferenceBundle, raw: dict[str, np.ndarray], role: str
+) -> tuple[np.ndarray, np.ndarray]:
+    """Largest score ÷ threshold over the tests, and the index of that test.
+
+    Works on arrays of any shape (beads × frames or frames). Above 1 = marked.
+    """
+    ratios = np.stack([
+        raw[_test_key(t, s)] / bundle.thresholds(t)[s][role] for t, s in bundle.tests
+    ])
+    return ratios.max(axis=0), ratios.argmax(axis=0)
+
+
+def _save_arrays(path: Path, arrays: dict[str, np.ndarray]) -> None:
+    """Named arrays to a compressed .npz (keys such as ``bonds/T2``)."""
+    np.savez_compressed(path, **arrays)  # type: ignore[arg-type]
+
+
+def _builtin_layout(bundle: ReferenceBundle, topo: MoleculeTopology) -> bool:
+    """True when the bundle's numbers are the joined built-in descriptor, so
+    ``compute_descriptor_batch`` and its existing cache files serve it."""
+    return bundle.all_feature_names == tuple(topo.feature_names)
+
+
+def _features(bundle: ReferenceBundle, topo: MoleculeTopology, positions: np.ndarray) -> np.ndarray:
+    if _builtin_layout(bundle, topo):
+        return compute_descriptor_batch(positions, topo)
+    return bundle.compute_features(positions)
+
+
+def _cache_file(cache_dir: Path, name: str, bundle: ReferenceBundle, topo: MoleculeTopology) -> Path:
+    """Descriptor cache path; other descriptor sets get their own tagged file."""
+    if _builtin_layout(bundle, topo):
+        return cache_dir / f"{name}_descriptors.npz"
+    descriptors = bundle.manifest["descriptors"]
+    key = json.dumps({n: [d["code_sha256"], d["feature_names"]] for n, d in descriptors.items()})
+    return cache_dir / f"{name}_descriptors_{hashlib.sha256(key.encode()).hexdigest()[:10]}.npz"
+
+
 # ---------------------------------------------------------------------------
 # Public entry point
 # ---------------------------------------------------------------------------
@@ -102,13 +160,6 @@ def run_pipeline(cfg: dict) -> None:
     ----------
     cfg : dict loaded from YAML config (see config/example.yaml).
     """
-    unsupported = [key for key in ("tracks", "scores") if key in cfg]
-    if unsupported:
-        raise ValueError(
-            f"config sets {', '.join(unsupported)}: the batch pipeline scores one joined "
-            "track by T² only until multi-track scoring reaches it (step 3b). Remove the "
-            "key(s), or use detectana.fit / scripts/benchmark_tracks.py for tracks and SPE."
-        )
     out_root = Path(cfg["io"]["output_dir"])
     out_root.mkdir(parents=True, exist_ok=True)
 
@@ -158,12 +209,15 @@ def run_pipeline(cfg: dict) -> None:
             "onset.fraction_threshold not set (false_alarm_budget mode): the bundle "
             "records the default 0.20; each run derives its own fraction."
         )
-    # One joined track scored by T² only until multi-track scoring reaches the
-    # batch pipeline (step 3b); its outputs are unchanged by the registry.
+    # Tracks and scores come from the config (absent → the library default,
+    # ADR 0006). Every test is thresholded at its share of each role's budget.
+    tracks_cfg = cfg.get("tracks")
+    if tracks_cfg is not None and not isinstance(tracks_cfg, dict):
+        raise ValueError("config 'tracks' must map track names to lists of descriptors")
     bundle = fit_bundle(
         train_pos, valid_pos, topo,
-        tracks=JOINED_TRACKS,
-        scores=("T2",),
+        tracks=tracks_cfg,
+        scores=tuple(cfg.get("scores", SCORES)),
         pca_variance=desc_cfg["pca_variance"],
         random_seed=desc_cfg["random_seed"],
         percentiles={"bead": bead_percentile, "centroid": centroid_percentile},
@@ -171,20 +225,23 @@ def run_pipeline(cfg: dict) -> None:
         step_frames=onset_cfg_global["step_frames"],
         fraction_threshold=onset_cfg_global.get("fraction_threshold", 0.20),
     )
-    track_manifest = bundle.manifest["tracks"]["geometric"]
-    log.info(
-        "PCA: %d components explain %.1f%% variance",
-        track_manifest["n_components"], track_manifest["pca_variance_explained"] * 100,
-    )
-    thresholds = bundle.thresholds("geometric")["T2"]
-    threshold, centroid_threshold = thresholds["bead"], thresholds["centroid"]
-    if centroid_percentile == bead_percentile:
-        log.info("OOD threshold (%.1f-th pct of validation T²): %.4f", bead_percentile, threshold)
-    else:
+    for track in bundle.tracks:
+        t = bundle.manifest["tracks"][track]
         log.info(
-            "OOD thresholds (T²) — bead (%.1f-th pct): %.4f, centroid (%.1f-th pct): %.4f",
-            bead_percentile, threshold, centroid_percentile, centroid_threshold,
+            "Track %-10s %3d numbers → %3d PCA components (%.1f%% variance)",
+            track, t["n_features"], t["n_components"], t["pca_variance_explained"] * 100,
         )
+    for name, why in bundle.manifest["dropped_tracks"].items():
+        log.info("Track %s dropped: %s", name, why)
+    thresholds = {
+        _test_key(t, s): bundle.thresholds(t)[s] for t, s in bundle.tests
+    }
+    log.info(
+        "%d tests; thresholds at %.1f-th (bead) / %.1f-th (centroid) percentile of "
+        "validation in total, split equally: %s",
+        len(thresholds), bead_percentile, centroid_percentile,
+        ", ".join(f"{k} {v['bead']:.3g}/{v['centroid']:.3g}" for k, v in thresholds.items()),
+    )
 
     # Save the fit
     models_dir = out_root / "models"
@@ -220,20 +277,26 @@ def run_pipeline(cfg: dict) -> None:
     manifest_base = {
         "detectana_version": __version__,
         "config": cfg,
-        # Every score and threshold in this run is T², the squared Mahalanobis
-        # distance (geometric and embedding tracks alike).
-        "statistic": "T2",
+        # bead_scores.npy / centroid_scores.npy and the score columns hold the
+        # exceedance (largest score ÷ threshold over the tests; > 1 = marked) for
+        # the bead and centroid roles. Raw per-test scores (T², SPE) are in
+        # bead_test_scores.npz / centroid_test_scores.npz.
+        "statistic": "exceedance",
+        "signal_threshold": SIGNAL_THRESHOLD,
+        "test_score_files": {"bead": "bead_test_scores.npz", "centroid": "centroid_test_scores.npz"},
         "reference_bundle": str(bundle_path),
-        # ood_threshold is the bead threshold; the two are equal unless the config
-        # sets bead_percentile / centroid_percentile apart.
-        "ood_threshold": threshold,
-        "bead_ood_threshold": threshold,
-        "centroid_ood_threshold": centroid_threshold,
+        "tests": list(thresholds),
+        "thresholds": thresholds,
+        "budget": bundle.manifest["budget"],
+        "tracks": {
+            t: {k: bundle.manifest["tracks"][t][k]
+                for k in ("descriptors", "n_features", "n_components", "pca_variance_explained")}
+            for t in bundle.tracks
+        },
+        "dropped_tracks": bundle.manifest["dropped_tracks"],
         "bead_percentile": bead_percentile,
         "centroid_percentile": centroid_percentile,
-        "pca_n_components": track_manifest["n_components"],
-        "pca_variance_explained": track_manifest["pca_variance_explained"],
-        "n_features": topo.n_features,
+        "n_features": len(bundle.all_feature_names),
         "molecule": {
             "n_atoms": topo.n_atoms,
             "atom_types": list(topo.atom_types),
@@ -253,8 +316,6 @@ def run_pipeline(cfg: dict) -> None:
             topo=topo,
             spec=spec,
             bundle=bundle,
-            threshold=threshold,
-            centroid_threshold=centroid_threshold,
             bead_percentile=bead_percentile,
             centroid_percentile=centroid_percentile,
             emb_pipe=emb_pipe,
@@ -296,8 +357,6 @@ def _process_run(
     topo: MoleculeTopology,
     spec: MoleculeSpec,
     bundle: ReferenceBundle,
-    threshold: float,
-    centroid_threshold: float,
     bead_percentile: float,
     centroid_percentile: float,
     emb_pipe: EmbeddingPipeline | None,
@@ -321,8 +380,9 @@ def _process_run(
     force_recompute = io_cfg["force_recompute"]
     n_jobs = cfg.get("pipeline", {}).get("n_jobs", -1)
 
-    # (bead_idx, scores, steps) per bead, from whichever reader the run uses.
-    results: list[tuple[int, np.ndarray, np.ndarray]]
+    # (bead_idx, raw test scores, steps) per bead, from whichever reader the run uses.
+    results: list[tuple[int, dict[str, np.ndarray], np.ndarray]]
+    keys = _test_keys(bundle)
 
     if "hdf5" in run_cfg:
         # ── HDF5 path ─────────────────────────────────────────────────────────
@@ -345,34 +405,29 @@ def _process_run(
                 chem_cfg=chem_cfg,
                 force_recompute=force_recompute,
                 run_out=run_out,
-                threshold=threshold,
             )
             for bead_idx in range(n_beads)
         )
         results.sort(key=lambda r: r[0])
 
-        n_frames_ref = results[0][1].shape[0]
-        for bead_idx, scores, _ in results:
-            if scores.shape[0] != n_frames_ref:
+        n_frames_ref = len(results[0][2])
+        for bead_idx, _, bead_steps in results:
+            if len(bead_steps) != n_frames_ref:
                 raise ValueError(
-                    f"Bead {bead_idx:02d} has {scores.shape[0]} frames; "
+                    f"Bead {bead_idx:02d} has {len(bead_steps)} frames; "
                     f"expected {n_frames_ref} (same as bead 00)."
                 )
 
-        bead_score_arrays = [scores for _, scores, _ in results]
+        bead_raw = {k: np.stack([raw[k] for _, raw, _ in results]) for k in keys}
         step_arrays = results[0][2]
 
-        bead_scores = np.stack(bead_score_arrays)
-        np.save(run_out / "bead_scores.npy", bead_scores)
-
-        centroid_scores, centroid_steps = _score_centroid_array(
+        centroid_raw, centroid_steps = _score_centroid_array(
             centroid_positions=traj.centroid_positions,
             topo=topo,
             bundle=bundle,
             force_recompute=force_recompute,
             cache_dir=desc_cache_dir,
         )
-        np.save(run_out / "centroid_scores.npy", centroid_scores)
         del traj  # release RAM early
 
     else:
@@ -397,28 +452,24 @@ def _process_run(
                 stride=stride,
                 force_recompute=force_recompute,
                 run_out=run_out,
-                threshold=threshold,
             )
             for bead_idx, bead_path in enumerate(bead_files)
         )
         results.sort(key=lambda r: r[0])
 
-        n_frames_ref = results[0][1].shape[0]
-        for bead_idx, scores, _ in results:
-            if scores.shape[0] != n_frames_ref:
+        n_frames_ref = len(results[0][2])
+        for bead_idx, _, bead_steps in results:
+            if len(bead_steps) != n_frames_ref:
                 raise ValueError(
-                    f"Bead {bead_idx:02d} has {scores.shape[0]} frames; "
+                    f"Bead {bead_idx:02d} has {len(bead_steps)} frames; "
                     f"expected {n_frames_ref} (same as bead 00). "
                     "Check for truncated bead files."
                 )
 
-        bead_score_arrays = [scores for _, scores, _ in results]
+        bead_raw = {k: np.stack([raw[k] for _, raw, _ in results]) for k in keys}
         step_arrays = results[0][2]
 
-        bead_scores = np.stack(bead_score_arrays)
-        np.save(run_out / "bead_scores.npy", bead_scores)
-
-        centroid_scores, centroid_steps = _score_centroid(
+        centroid_raw, centroid_steps = _score_centroid(
             centroid_xyz=run_cfg["centroid_xyz"],
             topo=topo,
             spec=spec,
@@ -428,7 +479,6 @@ def _process_run(
             force_recompute=force_recompute,
             cache_dir=desc_cache_dir,
         )
-        np.save(run_out / "centroid_scores.npy", centroid_scores)
 
     # Align step arrays (bead and centroid should match; warn if not)
     if len(step_arrays) != len(centroid_steps):
@@ -438,21 +488,30 @@ def _process_run(
         )
         n = min(len(step_arrays), len(centroid_steps))
         step_arrays = step_arrays[:n]
-        bead_scores = bead_scores[:, :n]
-        centroid_scores = centroid_scores[:n]
+        bead_raw = {k: v[:, :n] for k, v in bead_raw.items()}
+        centroid_raw = {k: v[:n] for k, v in centroid_raw.items()}
+
+    # ── Exceedance: one signal per role, threshold 1 ──────────────────────────
+    # Beads use the bead role, the centroid the centroid role. A frame is marked
+    # when some test is above its own (budget-split) threshold.
+    bead_scores, _ = _exceedance(bundle, bead_raw, "bead")
+    centroid_scores, centroid_top = _exceedance(bundle, centroid_raw, "centroid")
+    np.save(run_out / "bead_scores.npy", bead_scores)
+    np.save(run_out / "centroid_scores.npy", centroid_scores)
+    _save_arrays(run_out / "bead_test_scores.npz", bead_raw)
+    _save_arrays(run_out / "centroid_test_scores.npz", centroid_raw)
 
     # ── Step 8: Aggregate ─────────────────────────────────────────────────────
     agg_df = aggregate_bead_scores(
         bead_scores=bead_scores,
         centroid_scores=centroid_scores,
         steps=np.array(step_arrays),
-        threshold=threshold,
+        threshold=SIGNAL_THRESHOLD,
         frame_time_fs=frame_time_fs,
     )
-    if centroid_threshold != threshold:
-        # aggregate_bead_scores flags both tracks with one threshold; the centroid
-        # track has its own when the config asks for it.
-        agg_df["centroid_ood"] = centroid_scores > centroid_threshold
+    agg_df["centroid_top_test"] = [keys[i] for i in centroid_top]
+    for k in keys:
+        agg_df[f"centroid_{k.replace('/', '_')}"] = centroid_raw[k]
 
     # ── Embedding track (optional) ────────────────────────────────────────────
     if emb_pipe is not None and emb_threshold is not None:
@@ -518,14 +577,14 @@ def _process_run(
         )
     onset = detect_onset(
         aggregate_df=agg_df,
-        threshold=threshold,
+        threshold=SIGNAL_THRESHOLD,
         window_frames=onset_cfg["window_frames"],
         step_frames=onset_cfg["step_frames"],
         fraction_threshold=fraction_threshold,
     )
 
     # Which bead first crossed the threshold (earliest first-OOD frame across beads)
-    ood_mask = bead_scores > threshold  # (n_beads, n_frames)
+    ood_mask = bead_scores > SIGNAL_THRESHOLD  # (n_beads, n_frames)
     if ood_mask.any():
         # argmax on bool returns index of first True; inf sentinel for beads with no OOD frame
         first_ood_frame = np.where(
@@ -537,7 +596,7 @@ def _process_run(
 
     # ── Step 10: Plots ────────────────────────────────────────────────────────
     try:
-        _make_plots(agg_df, onset, threshold, centroid_threshold, run_name, run_out)
+        _make_plots(agg_df, onset, SIGNAL_THRESHOLD, SIGNAL_THRESHOLD, run_name, run_out)
     except Exception as exc:
         log.warning("Plotting failed (non-fatal): %s", exc)
 
@@ -560,18 +619,18 @@ def _process_bead(
     stride: int,
     force_recompute: bool,
     run_out: Path,
-    threshold: float,
-) -> tuple[int, np.ndarray, np.ndarray]:
+) -> tuple[int, dict[str, np.ndarray], np.ndarray]:
     """Load/compute descriptors, run chemistry check (bead 0 only), and score.
 
-    Returns (bead_idx, scores, steps).
+    Returns (bead_idx, raw score per test, steps).
     """
     bead_name = f"bead_{bead_idx:02d}"
-    cache_path = desc_cache_dir / f"{bead_name}_descriptors.npz"
+    cache_path = _cache_file(desc_cache_dir, bead_name, bundle, topo)
 
     steps_all, descs_all = _load_or_compute_descriptors(
         bead_path=bead_path,
         cache_path=cache_path,
+        bundle=bundle,
         topo=topo,
         spec=spec,
         chunk_size=chunk_size,
@@ -599,10 +658,11 @@ def _process_bead(
             chem_df["broken_bond"].sum(), chem_df["close_contact"].sum(),
         )
 
-    scores = bundle.score_features(descs_all)["geometric"]["T2"]
-    log.info("Bead %02d scored: max=%.3f, frac_ood=%.4f",
-             bead_idx, scores.max(), (scores > threshold).mean())
-    return bead_idx, scores, steps_all
+    raw = _test_scores(bundle, descs_all)
+    signal, _ = _exceedance(bundle, raw, "bead")
+    log.info("Bead %02d scored: max exceedance=%.3f, fraction marked=%.4f",
+             bead_idx, signal.max(), (signal > SIGNAL_THRESHOLD).mean())
+    return bead_idx, raw, steps_all
 
 
 # ---------------------------------------------------------------------------
@@ -612,6 +672,7 @@ def _process_bead(
 def _load_or_compute_descriptors(
     bead_path: str,
     cache_path: Path,
+    bundle: ReferenceBundle,
     topo: MoleculeTopology,
     spec: MoleculeSpec,
     chunk_size: int,
@@ -620,10 +681,9 @@ def _load_or_compute_descriptors(
     bead_name: str,
 ) -> tuple[np.ndarray, np.ndarray]:
     """Return (steps, descriptors) from cache or by parsing the XYZ."""
-    if cache_path.exists() and not force_recompute:
-        log.info("Loading descriptor cache: %s", cache_path.name)
-        data = np.load(cache_path)
-        return data["steps"], data["descriptors"]
+    cached = _read_cache(cache_path, bundle, force_recompute)
+    if cached is not None:
+        return cached
 
     log.info("Computing descriptors for %s …", bead_name)
     all_steps: list[np.ndarray] = []
@@ -632,7 +692,7 @@ def _load_or_compute_descriptors(
     for steps_chunk, pos_chunk in iter_bead_positions(
         bead_path, chunk_size=chunk_size, stride=stride, spec=spec
     ):
-        descs_chunk = compute_descriptor_batch(pos_chunk, topo)
+        descs_chunk = _features(bundle, topo, pos_chunk)
         all_steps.append(steps_chunk)
         all_descs.append(descs_chunk)
 
@@ -644,6 +704,20 @@ def _load_or_compute_descriptors(
     return steps, descs
 
 
+def _read_cache(
+    cache_path: Path, bundle: ReferenceBundle, force_recompute: bool
+) -> tuple[np.ndarray, np.ndarray] | None:
+    """(steps, descriptors) from a cache file whose width fits the bundle, else None."""
+    if force_recompute or not cache_path.exists():
+        return None
+    data = np.load(cache_path)
+    if data["descriptors"].shape[1] != len(bundle.all_feature_names):
+        log.info("Descriptor cache %s does not fit the bundle; recomputing", cache_path.name)
+        return None
+    log.info("Loading descriptor cache: %s", cache_path.name)
+    return data["steps"], data["descriptors"]
+
+
 def _process_bead_array(
     bead_idx: int,
     bead_positions: np.ndarray,
@@ -653,19 +727,17 @@ def _process_bead_array(
     chem_cfg: dict,
     force_recompute: bool,
     run_out: Path,
-    threshold: float,
-) -> tuple[int, np.ndarray, np.ndarray]:
+) -> tuple[int, dict[str, np.ndarray], np.ndarray]:
     """Score one bead from an in-memory position array (HDF5 path)."""
     bead_name = f"bead_{bead_idx:02d}"
-    cache_path = desc_cache_dir / f"{bead_name}_descriptors.npz"
+    cache_path = _cache_file(desc_cache_dir, bead_name, bundle, topo)
 
-    if cache_path.exists() and not force_recompute:
-        log.info("Loading descriptor cache: %s", cache_path.name)
-        data = np.load(cache_path)
-        descs, steps = data["descriptors"], data["steps"]
+    cached = _read_cache(cache_path, bundle, force_recompute)
+    if cached is not None:
+        steps, descs = cached
     else:
         log.info("Computing descriptors for %s …", bead_name)
-        descs = compute_descriptor_batch(bead_positions, topo)
+        descs = _features(bundle, topo, bead_positions)
         steps = np.arange(len(bead_positions), dtype=np.int64)
         np.savez_compressed(cache_path, steps=steps, descriptors=descs)
         log.info("Cached %d frames → %s", len(steps), cache_path.name)
@@ -685,10 +757,11 @@ def _process_bead_array(
             chem_df["broken_bond"].sum(), chem_df["close_contact"].sum(),
         )
 
-    scores = bundle.score_features(descs)["geometric"]["T2"]
-    log.info("Bead %02d scored: max=%.3f, frac_ood=%.4f",
-             bead_idx, scores.max(), (scores > threshold).mean())
-    return bead_idx, scores, steps
+    raw = _test_scores(bundle, descs)
+    signal, _ = _exceedance(bundle, raw, "bead")
+    log.info("Bead %02d scored: max exceedance=%.3f, fraction marked=%.4f",
+             bead_idx, signal.max(), (signal > SIGNAL_THRESHOLD).mean())
+    return bead_idx, raw, steps
 
 
 def _score_centroid_array(
@@ -697,23 +770,21 @@ def _score_centroid_array(
     bundle: ReferenceBundle,
     force_recompute: bool,
     cache_dir: Path,
-) -> tuple[np.ndarray, np.ndarray]:
+) -> tuple[dict[str, np.ndarray], np.ndarray]:
     """Score centroid from an in-memory position array (HDF5 path)."""
-    cache_path = cache_dir / "centroid_descriptors.npz"
+    cache_path = _cache_file(cache_dir, "centroid", bundle, topo)
 
-    if cache_path.exists() and not force_recompute:
-        log.info("Loading descriptor cache: centroid_descriptors.npz")
-        data = np.load(cache_path)
-        descs, steps = data["descriptors"], data["steps"]
+    cached = _read_cache(cache_path, bundle, force_recompute)
+    if cached is not None:
+        steps, descs = cached
     else:
         log.info("Computing descriptors for centroid …")
-        descs = compute_descriptor_batch(centroid_positions, topo)
+        descs = _features(bundle, topo, centroid_positions)
         steps = np.arange(len(centroid_positions), dtype=np.int64)
         np.savez_compressed(cache_path, steps=steps, descriptors=descs)
-        log.info("Cached %d frames → centroid_descriptors.npz", len(steps))
+        log.info("Cached %d frames → %s", len(steps), cache_path.name)
 
-    scores = bundle.score_features(descs)["geometric"]["T2"]
-    return scores, steps
+    return _test_scores(bundle, descs), steps
 
 
 def _score_centroid(
@@ -725,11 +796,12 @@ def _score_centroid(
     stride: int,
     force_recompute: bool,
     cache_dir: Path,
-) -> tuple[np.ndarray, np.ndarray]:
-    cache_path = cache_dir / "centroid_descriptors.npz"
+) -> tuple[dict[str, np.ndarray], np.ndarray]:
+    cache_path = _cache_file(cache_dir, "centroid", bundle, topo)
     steps, descs = _load_or_compute_descriptors(
         bead_path=centroid_xyz,
         cache_path=cache_path,
+        bundle=bundle,
         topo=topo,
         spec=spec,
         chunk_size=chunk_size,
@@ -737,8 +809,7 @@ def _score_centroid(
         force_recompute=force_recompute,
         bead_name="centroid",
     )
-    scores = bundle.score_features(descs)["geometric"]["T2"]
-    return scores, steps
+    return _test_scores(bundle, descs), steps
 
 
 # ---------------------------------------------------------------------------
@@ -880,7 +951,7 @@ def _make_plots(
     ax.plot(time_ps, agg_df["bead_p95"], lw=0.5, label="bead p95", color="cornflowerblue")
     ax.axhline(threshold, color="red", ls="--", lw=1, label=f"threshold={threshold:.2f}")
     _mark_onset(ax, time_ps, onset.persistent_bead_anomaly_frame, "geo bead onset", "orange")
-    ax.set_ylabel("T² (squared Mahalanobis)")
+    ax.set_ylabel("exceedance (score ÷ threshold)")
     ax.legend(fontsize=7)
     ax.set_title(f"{run_name} — geometric track")
 
@@ -899,7 +970,7 @@ def _make_plots(
             label=f"centroid threshold={centroid_threshold:.2f}",
         )
     _mark_onset(ax, time_ps, onset.centroid_anomaly_frame, "geo centroid onset", "purple")
-    ax.set_ylabel("T² (squared Mahalanobis)")
+    ax.set_ylabel("exceedance (score ÷ threshold)")
     ax.legend(fontsize=7)
     if not has_emb:
         ax.set_xlabel("Time (ps)")

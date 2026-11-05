@@ -598,10 +598,20 @@ class ReferenceBundle:
 
         Raises ``BundleError`` if ``score`` is inactive for ``track``.
         """
+        return self.attribute_features(
+            self.compute_features(positions, length_unit=length_unit), track, score
+        )
+
+    def attribute_features(self, features: np.ndarray, track: str, score: str = "T2") -> Attribution:
+        """As ``attribute``, from ``compute_features`` output (for callers that cache it)."""
         info = self._track(track)
         if not info["scores"].get(score, {}).get("active"):
             raise BundleError(f"track {track!r}: {score} is inactive or was not fitted")
-        X = self.compute_features(positions, length_unit=length_unit)[:, self._columns(track)]
+        X = np.asarray(features, dtype=np.float64)
+        width = len(self.all_feature_names)
+        if X.ndim != 2 or X.shape[1] != width:
+            raise BundleError(f"features have shape {X.shape}; expected (n_frames, {width})")
+        X = X[:, self._columns(track)]
         state = self._track_state(track)
         P = state["pca_components"]
         # Shift so zᵀ M_T2 z is exactly the stored T² (the fitted mean of the PCA
