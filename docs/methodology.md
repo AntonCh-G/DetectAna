@@ -176,16 +176,22 @@ directions.
 
 ### 4.4 OOD statistic and threshold
 
-The score is the Mahalanobis distance in PCA space, with mean $\mu$ and
-covariance $\Sigma$ estimated on the training projections:
+The score is Hotelling's $T^2$, the squared Mahalanobis distance in PCA space,
+with mean $\mu$ and covariance $\Sigma$ estimated on the training projections:
 
-$$s(x) = \sqrt{(z(x) - \mu)^\top \Sigma^{-1} (z(x) - \mu)}, \qquad
+$$s(x) = T^2(x) = (z(x) - \mu)^\top \Sigma^{-1} (z(x) - \mu), \qquad
 \Sigma \leftarrow \Sigma + 10^{-8} I$$
 
 where $z(\cdot)$ is standardise-then-project. The ridge term is numerical
-stabilisation, not regularisation of a fit.
+stabilisation, not regularisation of a fit. "Distance" is only a display label
+for $\sqrt{T^2}$; every stored score and threshold is $T^2$. Releases up to
+0.3.0 stored the distance; since squaring keeps the order of frames, rank-based
+results (AUROC, average precision, conformal detection rates, Spearman
+correlations) are the same, but stored values, thresholds and Pearson
+correlations are not, and old and new outputs must not be mixed. A run's
+`manifest.json` says which it holds (`"statistic": "T2"`).
 
-The threshold is a **percentile of the scores on the held-out validation set**
+The threshold is a **percentile of the $T^2$ scores on the held-out validation set**
 (`threshold.percentile`, default 99). This gives it an operational meaning: a
 frame is flagged when it scores above 99 % of reference frames the fit never
 saw. Define

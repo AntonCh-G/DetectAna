@@ -161,13 +161,12 @@ cores you were allocated; oversubscribing makes it slower, not faster.
 outputs/
   onset_summary.csv                # one row per run
   models/
-    descriptor_pipeline.pkl        # fitted scaler + PCA
-    scorer.pkl                     # fitted Mahalanobis scorer
+    geometric.bundle/              # reference bundle: manifest.json + state.npz
   <run_name>/
-    manifest.json                  # config, version, threshold, onset design
+    manifest.json                  # config, version, statistic, threshold, onset design
     onset_table.csv                # run-level onset summary
-    bead_scores.npy                # (n_beads, n_frames)
-    centroid_scores.npy            # (n_frames,)
+    bead_scores.npy                # (n_beads, n_frames), T²
+    centroid_scores.npy            # (n_frames,), T²
     frame_aggregate.csv            # aggregated scores per timestep
     chemistry_flags_bead00.csv     # hard-chemistry flags, bead 00
     descriptor_cache/              # raw descriptor NPZ caches, per bead
@@ -211,8 +210,17 @@ frames with another atom count, element order or unit. Every refusal is a
 `detectana.BundleError`.
 
 The bundle stores **T²**, the squared Mahalanobis distance, and its thresholds
-are percentiles of validation T². The batch pipeline below still reports the
-distance √T²; the two are not interchangeable numbers.
+are percentiles of validation T². The batch pipeline fits the same bundle and
+reports the same T² (`outputs/models/geometric.bundle`).
+
+`validate_frame` also returns a `FrameCheck` with two diagnostics against the
+geometry the topology was built from: bonds stretched past 1.5× their reference
+length (catches swaps between atoms bonded to different partners) and possible
+same-element swaps from rigid alignment plus Hungarian matching (catches swaps
+the bond graph cannot see, such as two hydrogens on one carbon, but only while
+the frame is near the reference: a methyl group turned by 120° looks the same as
+a swap). Neither proves atom identity; starting the run from the bundle's
+reference frame, in its atom order, does.
 
 ## Scripts
 

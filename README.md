@@ -85,8 +85,9 @@ Other entry points, all with `--help`:
    index tuples and a reordered file gives silently wrong descriptors.
 2. **Descriptor**: bond lengths, bond angles, every dihedral as a $(\sin, \cos)$
    pair so the $0 \to 2\pi$ wrap is continuous, plus ring planarity.
-3. **Fit on training frames only** — standardise, PCA, then a Mahalanobis
-   distance from the training mean and covariance.
+3. **Fit on training frames only** — standardise, PCA, then T², the squared
+   Mahalanobis distance from the training mean and covariance. The fit is saved
+   as a reference bundle (`outputs/models/geometric.bundle`).
 4. **Calibrate on held-out validation frames.** The threshold is a percentile of
    validation scores, so "flagged" means "above 99 % of reference frames the fit
    never saw". Nothing from the trajectory touches the fit or the threshold.

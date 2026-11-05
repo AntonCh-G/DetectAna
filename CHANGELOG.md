@@ -23,16 +23,37 @@ produces results that still look plausible. See
 - `MahalanobisScorer.score_t2()` — Hotelling's T², the squared distance.
 - `onset.WindowRule` and `WindowRule.stream()` — the window onset rule one frame
   at a time, equal to `detect_onset` on the same frames.
-- `build_topology` accepts an ase `Atoms` as well as a path.
+- `build_topology` accepts an ase `Atoms` as well as a path, and keeps the
+  geometry it was built from (`MoleculeTopology.reference_positions`).
+- `ReferenceBundle.validate_frame` returns a `FrameCheck`: bonds stretched past
+  1.5× their reference length, and possible same-element atom swaps found by
+  rigid alignment plus Hungarian matching against the bundle's reference
+  geometry. Diagnostics only; they do not prove atom identity.
+- `ReferenceBundle.score_features` scores descriptors computed elsewhere.
 
 ### Changed
 - Core dependencies are `numpy`, `scipy`, `scikit-learn`, `ase`. `pandas`,
   `matplotlib`, `h5py`, `pyyaml`, `joblib` moved to a `[pipeline]` extra, which
   `[dev]` includes. Install with `pip install "detectana[pipeline]"` to run the
   batch pipeline and scripts.
-- **Scientific definition:** the bundle's statistic is **T²**, not the distance
-  √T² the batch pipeline reports; its thresholds are percentiles of validation
-  T². Batch pipeline outputs are unchanged.
+- **Scientific definition: every OOD score is now T²**, the squared Mahalanobis
+  distance, not the distance √T² — in the bundle, the batch pipeline
+  (`bead_scores.npy`, `centroid_scores.npy`, the score columns of
+  `frame_aggregate.csv`, thresholds, plots) and the embedding track. Thresholds
+  are percentiles of validation T². Column and file names are unchanged; each
+  run's `manifest.json` records `"statistic": "T2"`. Rank-based results (AUROC,
+  average precision, conformal detection rates, Spearman) are unchanged; stored
+  values, thresholds, medians and Pearson correlations are not. On the demo data
+  every flag and onset is the same as in 0.3.0. With
+  `frame_autocorrelation: auto`, ρ is now measured on the centroid T² series.
+- The batch pipeline fits a reference bundle and saves it to
+  `outputs/models/geometric.bundle`; it no longer writes
+  `descriptor_pipeline.pkl` or `scorer.pkl`. `benchmark_detector.py` and
+  `score_vs_error.py` fit the same way.
+- `EmbeddingPipeline` pickles record their statistic; one saved before T² is
+  refused on load. `score_vs_error.py --reuse-scan` refuses a pre-T² scan, and
+  `extract_onset_frames.py --threshold` (now in T² units) refuses a run whose
+  manifest does not record T².
 
 ### Fixed
 - Fitting a one-feature input crashed `MahalanobisScorer.fit` (`np.cov` returns

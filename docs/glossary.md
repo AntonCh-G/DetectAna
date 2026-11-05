@@ -75,8 +75,13 @@ feature names, PCA parameters, thresholds, onset rule, descriptor code hash) and
 `state.npz` (fitted arrays, no pickle). Callers use its metadata API and
 `score`, never the fitted state. It refuses a bundle of another format version,
 changed descriptor code or other units, and frames of another atom count,
-element order or unit. One track today, `geometric`. The batch pipeline still
-writes `pipeline.pkl` / `scorer.pkl`.
+element order or unit. One track today, `geometric`. The batch pipeline fits one
+and saves it to `outputs/models/geometric.bundle`; it no longer writes the
+`descriptor_pipeline.pkl` / `scorer.pkl` pair.
+
+**Frame check** — what `validate_frame` returns for a first frame that passed
+the hard checks: stretched bonds and possible same-element swaps against the
+bundle's reference geometry. Diagnostics, not proof of atom identity.
 
 *Planned (not built):*
 
@@ -92,9 +97,10 @@ as the embedding track is. Default (provisional): bonds, angles, dihedrals, ring
 cut-offs on the same score inside one track. Not a track.
 
 **T²** — Hotelling's statistic, the squared Mahalanobis distance in the kept PCA
-space: unusual within the motions the training data showed. The reference bundle
-stores and thresholds T² (`MahalanobisScorer.score_t2`); the batch pipeline still
-reports its square root, the distance (`MahalanobisScorer.score`).
+space: unusual within the motions the training data showed. Every stored score
+and threshold is T² (`MahalanobisScorer.score_t2`), in the bundle, the batch
+pipeline and the embedding track; "distance" is only a label for √T²
+(`MahalanobisScorer.score`). Up to 0.3.0 the pipeline stored the distance.
 
 **SPE (Q)** — squared prediction error of the PCA residual: a new kind of motion
 the training data never showed. Inactive when PCA keeps every direction.
@@ -255,14 +261,14 @@ itself; this space is distinct from the training-set-fitted descriptor space
 used by the main OOD pipeline, and distances between the two are not
 directly comparable.
 
-**Mahalanobis distance** — OOD score used by both tracks. Computed from a fitted
-mean and inverse covariance. Higher = more out-of-distribution. In the geometric
+**Mahalanobis distance** — √T². Both tracks score its square, T², computed from
+a fitted mean and inverse covariance. Higher = more out-of-distribution. In the geometric
 track: computed in PCA-reduced internal-coordinate space. In the embedding track:
 computed per atom in the (e.g. 128-dimensional) invariant embedding space.
 
 ## Anomaly Detection
 
-**OOD threshold** — a percentile of the validation-set scores,
+**OOD threshold** — a percentile of the validation-set T² scores,
 `threshold.percentile`, default 99. Fit on the training set only, calibrated on
 the held-out validation set: no trajectory frame reaches either. One threshold per
 track (geometric and embedding). The demo config uses 95 instead, because with 32
@@ -276,11 +282,11 @@ chemically impossible; it means the MLFF is being asked to extrapolate.
 torsions, ring planarity, and close contacts. Separate from OOD score.
 A frame can be OOD without failing chemical validity and vice versa.
 
-**Geometric OOD score** — Mahalanobis distance in PCA-reduced internal-coordinate
+**Geometric OOD score** — T² (squared Mahalanobis distance) in PCA-reduced internal-coordinate
 space. Flags structural outliers: unusual bonds, angles, dihedrals, ring
 planarity. One scalar per frame (bead or centroid).
 
-**Embedding OOD score** — per-atom Mahalanobis distance in the MLFF's invariant
+**Embedding OOD score** — per-atom T² (squared Mahalanobis distance) in the MLFF's invariant
 per-atom embedding space. Flags model-reliability outliers: frames the MLFF has not encountered
 during training, where energy/force predictions are likely extrapolating. One
 scalar per atom per frame; aggregated to one scalar per frame via max over all 21

@@ -63,8 +63,7 @@ Writes to `outputs/demo/`, in seconds:
 outputs/demo/
   onset_summary.csv            # one row per run
   models/
-    descriptor_pipeline.pkl    # fitted scaler + PCA
-    scorer.pkl                 # fitted Mahalanobis scorer
+    geometric.bundle/          # reference bundle: manifest.json + state.npz
   demo/
     manifest.json              # config, version, threshold, topology, onset design
     onset_table.csv            # the four onset criteria
