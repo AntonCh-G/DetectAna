@@ -32,6 +32,7 @@ reported probability is an upper bound rather than an estimate.
 from __future__ import annotations
 
 import logging
+from collections import deque
 from dataclasses import dataclass
 
 import numpy as np
@@ -199,6 +200,84 @@ def _windowed_onset(
         if signal[start : start + window].mean() >= frac:
             return start
     return None
+
+
+# ---------------------------------------------------------------------------
+# The same rule, one frame at a time
+# ---------------------------------------------------------------------------
+
+@dataclass(frozen=True)
+class WindowRule:
+    """The window onset rule: fires on the first window whose mean signal >= fraction.
+
+    Windows start at frames 0, step, 2·step, … and hold ``window_frames`` frames.
+    The per-frame signal is ``bead_frac_ood`` (fraction of beads above threshold)
+    or a 0/1 centroid flag. ``detect_onset`` applies it to a whole run;
+    ``stream()`` applies it one frame at a time with exactly the same result.
+    """
+
+    window_frames: int
+    step_frames: int
+    fraction_threshold: float
+
+    def __post_init__(self) -> None:
+        if self.window_frames < 1:
+            raise ValueError(f"window_frames must be >= 1, got {self.window_frames}")
+        if self.step_frames < 1:
+            raise ValueError(f"step_frames must be >= 1, got {self.step_frames}")
+        if not 0.0 < self.fraction_threshold <= 1.0:
+            raise ValueError(
+                f"fraction_threshold must be in (0, 1], got {self.fraction_threshold}"
+            )
+
+    @property
+    def history_frames(self) -> int:
+        """How many past frames a streaming caller must keep: one window."""
+        return self.window_frames
+
+    def stream(self) -> WindowStream:
+        """A fresh one-frame-at-a-time evaluator of this rule."""
+        return WindowStream(self)
+
+    def to_dict(self) -> dict:
+        return {
+            "window_frames": int(self.window_frames),
+            "step_frames": int(self.step_frames),
+            "fraction_threshold": float(self.fraction_threshold),
+        }
+
+
+class WindowStream:
+    """Feed one frame's signal at a time; reports the onset frame once the rule fires.
+
+    Equal to ``_windowed_onset`` on the same frames: it tests the same window
+    starts, and averages the same values in the same order with ``np.mean``, so
+    the comparison with the fraction is bit-for-bit the batch one. The first
+    onset latches: later frames never move or clear it.
+    """
+
+    def __init__(self, rule: WindowRule) -> None:
+        self.rule = rule
+        self._buffer: deque[float] = deque(maxlen=rule.window_frames)
+        self.n_seen = 0
+        self.onset_frame: int | None = None
+
+    def push(self, value: float) -> int | None:
+        """Add the next frame's signal; return the onset frame (0-based) or None.
+
+        The returned index is the *start* of the first window that fired, as in
+        ``detect_onset``; it becomes known when that window's last frame arrives.
+        """
+        self.n_seen += 1
+        if self.onset_frame is not None:
+            return self.onset_frame
+        self._buffer.append(float(value))
+        start = self.n_seen - self.rule.window_frames
+        if start >= 0 and start % self.rule.step_frames == 0:
+            window = np.fromiter(self._buffer, dtype=np.float64, count=self.rule.window_frames)
+            if window.mean() >= self.rule.fraction_threshold:
+                self.onset_frame = start
+        return self.onset_frame
 
 
 # ---------------------------------------------------------------------------
