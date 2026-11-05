@@ -21,6 +21,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 import numpy as np
+from ase import Atoms
 from ase.neighborlist import NeighborList, natural_cutoffs
 
 log = logging.getLogger(__name__)
@@ -119,7 +120,7 @@ AspirinTopology = MoleculeTopology
 # ---------------------------------------------------------------------------
 
 def build_topology(
-    initial_xyz: str | Path,
+    initial_xyz: str | Path | Atoms,
     nl_mult: float = 1.1,
     ring_atoms: Sequence[int] | None = None,
     ring_size: int = 6,
@@ -128,7 +129,8 @@ def build_topology(
 
     Parameters
     ----------
-    initial_xyz : path to the initial geometry. Its atom count and element order
+    initial_xyz : path to the initial geometry, or an ase ``Atoms`` already in
+        memory (e.g. the first training frame). Its atom count and element order
         define the molecule for the whole run.
     nl_mult : NeighborList covalent-radii multiplier (default 1.1).
     ring_atoms : explicit 0-based indices of the ring used for the planarity
@@ -140,7 +142,12 @@ def build_topology(
     """
     from detectana.io import load_single_frame
 
-    atoms = load_single_frame(initial_xyz)
+    if isinstance(initial_xyz, Atoms):
+        atoms = initial_xyz
+        source = "Atoms"
+    else:
+        atoms = load_single_frame(initial_xyz)
+        source = Path(initial_xyz).name
     topo = MoleculeTopology(
         n_atoms=len(atoms),
         atom_types=list(atoms.get_chemical_symbols()),
@@ -161,7 +168,7 @@ def build_topology(
 
     if not topo.bonds:
         raise ValueError(
-            f"No bonds detected in {Path(initial_xyz).name} with nl_mult={nl_mult}"
+            f"No bonds detected in {source} with nl_mult={nl_mult}"
         )
 
     # ── Adjacency dict ───────────────────────────────────────────────────────
@@ -176,7 +183,7 @@ def build_topology(
             "%s: bond graph has %d disconnected fragments. Internal coordinates "
             "are computed on raw positions with no periodic images, so results "
             "are only meaningful for a single gas-phase molecule.",
-            Path(initial_xyz).name, n_fragments,
+            source, n_fragments,
         )
 
     # ── Angles ───────────────────────────────────────────────────────────────
