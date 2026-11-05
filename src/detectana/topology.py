@@ -71,6 +71,10 @@ class MoleculeTopology:
     dihedral_idx: np.ndarray | None = field(default=None)   # (n_dihedrals, 4)
     ring_idx: np.ndarray | None = field(default=None)       # (ring_size,) or None
 
+    # The geometry the topology was built from, (n_atoms, 3) Å. A reference bundle
+    # keeps it to check a first frame's atom order. None for hand-built topologies.
+    reference_positions: np.ndarray | None = field(default=None)
+
     @property
     def has_ring(self) -> bool:
         """True when a ring was found or configured, so planarity is a feature."""
@@ -151,6 +155,7 @@ def build_topology(
     topo = MoleculeTopology(
         n_atoms=len(atoms),
         atom_types=list(atoms.get_chemical_symbols()),
+        reference_positions=np.array(atoms.get_positions(), dtype=np.float64),
     )
 
     # ── Bond graph ──────────────────────────────────────────────────────────

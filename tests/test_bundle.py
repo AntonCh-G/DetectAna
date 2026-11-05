@@ -87,7 +87,7 @@ def test_saved_bundle_has_a_readable_manifest_and_no_pickle(bundle, tmp_path):
     assert len(track["descriptor"]["code_sha256"]) == 64
     # Fitted arrays load without pickle.
     with np.load(path / "state.npz", allow_pickle=False) as state:
-        assert set(state.files) == set(track["state_keys"])
+        assert set(state.files) == set(track["state_keys"]) | {"molecule/reference_positions"}
 
 
 def test_top_level_names(bundle, tmp_path):
@@ -407,3 +407,92 @@ def test_score_features_refuses_wrong_width(bundle, trajectory, aspirin_topo):
     X = compute_descriptor_batch(trajectory, aspirin_topo)
     with pytest.raises(BundleError, match="134"):
         bundle.score_features(X[:, :-1])
+
+
+# ---------------------------------------------------------------------------
+# First-frame diagnostics: broken bonds and possible same-element swaps
+# ---------------------------------------------------------------------------
+
+def _h_bonded_to(topo, element):
+    """Hydrogens bonded to an atom of ``element``, grouped by that atom."""
+    groups: dict[int, list[int]] = {}
+    for i, j in topo.bonds:
+        for h, other in ((i, j), (j, i)):
+            if topo.atom_types[h] == "H" and topo.atom_types[other] == element:
+                groups.setdefault(other, []).append(h)
+    return groups
+
+
+def _swap(frame, i, j):
+    out = frame.copy()
+    out[[i, j]] = out[[j, i]]
+    return out
+
+
+def test_bundle_stores_the_topology_geometry(bundle, aspirin_topo):
+    ref = bundle.reference_positions
+    assert ref.shape == (21, 3)
+    np.testing.assert_array_equal(ref, aspirin_topo.reference_positions)
+    assert bundle.manifest["molecule"]["reference_geometry"]["source"] == "topology"
+
+
+def test_reference_geometry_falls_back_to_first_training_frame(reference, aspirin_topo):
+    import dataclasses
+    train, valid = reference
+    topo = dataclasses.replace(aspirin_topo, reference_positions=None)
+    b = fit(train, valid, topo)
+    np.testing.assert_array_equal(b.reference_positions, train[0])
+    assert b.manifest["molecule"]["reference_geometry"]["source"] == "first training frame"
+
+
+def test_reference_frame_passes(bundle):
+    check = bundle.validate_frame(bundle.elements, bundle.reference_positions)
+    assert check.ok
+    assert check.broken_bonds == ()
+    assert check.possible_swaps == ()
+    assert check.rmsd_to_reference == pytest.approx(0.0, abs=1e-9)
+
+
+def test_moved_and_rotated_reference_passes(bundle):
+    from scipy.spatial.transform import Rotation
+    rot = Rotation.from_euler("xyz", [40, -25, 110], degrees=True).as_matrix()
+    frame = bundle.reference_positions @ rot.T + np.array([3.0, -7.0, 1.5])
+    check = bundle.validate_frame(bundle.elements, frame)
+    assert check.ok
+    assert check.rmsd_to_reference == pytest.approx(0.0, abs=1e-6)
+
+
+def test_noisy_training_frame_passes(bundle, reference):
+    check = bundle.validate_frame(bundle.elements, reference[0][5])
+    assert check.ok, check.summary
+
+
+def test_swap_of_differently_bonded_hydrogens_is_caught(bundle, aspirin_topo):
+    """Hydroxyl H swapped with a ring H: bonds break, and matching names the pair."""
+    h_on_o = next(iter(_h_bonded_to(aspirin_topo, "O").values()))[0]
+    h_on_c = next(hs[0] for hs in _h_bonded_to(aspirin_topo, "C").values() if len(hs) == 1)
+    frame = _swap(bundle.reference_positions, h_on_o, h_on_c)
+    check = bundle.validate_frame(bundle.elements, frame)
+    assert not check.ok
+    assert check.broken_bonds
+    assert tuple(sorted((h_on_o, h_on_c))) in check.possible_swaps
+
+
+def test_swap_of_equivalent_methyl_hydrogens_is_caught_near_reference(bundle, aspirin_topo):
+    """Two H on the methyl carbon: the bond graph is unchanged, only matching sees it."""
+    methyl = next(hs for hs in _h_bonded_to(aspirin_topo, "C").values() if len(hs) == 3)
+    frame = _swap(bundle.reference_positions, methyl[0], methyl[1])
+    check = bundle.validate_frame(bundle.elements, frame)
+    assert check.broken_bonds == ()
+    assert tuple(sorted(methyl[:2])) in check.possible_swaps
+    assert not check.ok
+    assert check.rmsd_after_matching < check.rmsd_to_reference
+
+
+def test_load_refuses_bundle_without_reference_geometry(bundle, tmp_path):
+    path = _saved(bundle, tmp_path)
+    with np.load(path / "state.npz") as npz:
+        state = {k: npz[k] for k in npz.files if k != "molecule/reference_positions"}
+    np.savez(path / "state.npz", **state)
+    with pytest.raises(BundleError, match="reference"):
+        load(path)

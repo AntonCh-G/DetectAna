@@ -12,6 +12,6 @@ Library entry points (ADR 0005)::
 
 __version__ = "0.3.0"
 
-from detectana.bundle import BundleError, ReferenceBundle, fit, load  # noqa: E402
+from detectana.bundle import BundleError, FrameCheck, ReferenceBundle, fit, load  # noqa: E402
 
-__all__ = ["BundleError", "ReferenceBundle", "__version__", "fit", "load"]
+__all__ = ["BundleError", "FrameCheck", "ReferenceBundle", "__version__", "fit", "load"]

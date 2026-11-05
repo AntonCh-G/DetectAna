@@ -28,10 +28,13 @@ import hashlib
 import inspect
 import json
 from collections.abc import Mapping, Sequence
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
 import numpy as np
+from scipy.optimize import linear_sum_assignment
+from scipy.spatial.distance import cdist
 
 from detectana import __version__
 from detectana.descriptors import (
@@ -58,6 +61,10 @@ UNITS = {"length": "angstrom", "angle": "radian"}
 MANIFEST_FILE = "manifest.json"
 STATE_FILE = "state.npz"
 
+REFERENCE_KEY = "molecule/reference_positions"
+#: A first-frame bond longer than this multiple of its reference length counts as broken.
+BOND_STRETCH_LIMIT = 1.5
+
 _STATE_ARRAYS = ("scaler_mean", "scaler_scale", "pca_mean", "pca_components", "t2_mean", "t2_inv_cov")
 
 # The functions that compute the internal-coordinate descriptor. Their source text
@@ -73,6 +80,50 @@ _DESCRIPTOR_FUNCTIONS = (
 
 class BundleError(ValueError):
     """A bundle, or frames given to it, do not match; the message says why."""
+
+
+@dataclass(frozen=True)
+class FrameCheck:
+    """Diagnostics for a first frame that passed ``validate_frame``'s hard checks.
+
+    Neither check proves atom identity; they catch common mistakes.
+
+    broken_bonds : (i, j, length, reference_length) for each bundle bond longer
+        than ``BOND_STRETCH_LIMIT`` × its length in the reference geometry. Catches
+        swaps between atoms bonded to different partners.
+    possible_swaps : (i, j) pairs of same-element atoms whose positions match the
+        reference better exchanged than as numbered (rigid alignment, then
+        per-element Hungarian matching). Catches swaps the bond graph cannot see,
+        such as two hydrogens on one carbon, but only while the frame is close to
+        the reference: a methyl group rotated by 120° looks the same as a swap.
+    rmsd_to_reference : Å, after rigid alignment, atoms as numbered.
+    rmsd_after_matching : Å, after alignment with the best same-element matching.
+    """
+
+    broken_bonds: tuple[tuple[int, int, float, float], ...]
+    possible_swaps: tuple[tuple[int, int], ...]
+    rmsd_to_reference: float
+    rmsd_after_matching: float
+
+    @property
+    def ok(self) -> bool:
+        return not self.broken_bonds and not self.possible_swaps
+
+    @property
+    def summary(self) -> str:
+        if self.ok:
+            return f"ok (RMSD to reference {self.rmsd_to_reference:.3f} Å)"
+        parts = []
+        if self.broken_bonds:
+            bonds = ", ".join(f"{i}-{j} {d:.2f} Å (ref {r:.2f})" for i, j, d, r in self.broken_bonds[:5])
+            parts.append(f"{len(self.broken_bonds)} stretched bond(s): {bonds}")
+        if self.possible_swaps:
+            pairs = ", ".join(f"{i}<->{j}" for i, j in self.possible_swaps)
+            parts.append(
+                f"possible atom swap(s) {pairs}: RMSD {self.rmsd_to_reference:.3f} Å as numbered, "
+                f"{self.rmsd_after_matching:.3f} Å matched"
+            )
+        return "; ".join(parts)
 
 
 def descriptor_code_hash() -> str:
@@ -127,6 +178,12 @@ def fit(
     rule = WindowRule(int(window_frames), int(step_frames), float(fraction_threshold))
     train = _as_frames(train, topology.n_atoms, "train")
     valid = _as_frames(valid, topology.n_atoms, "valid")
+    if topology.reference_positions is not None:
+        reference = _as_frames(topology.reference_positions[None], topology.n_atoms, "reference")[0]
+        reference_source = "topology"
+    else:
+        reference = train[0]
+        reference_source = "first training frame"
 
     X_train = compute_descriptor_batch(train, topology)
     pipe = DescriptorPipeline(pca_variance=pca_variance, random_seed=random_seed).fit(X_train)
@@ -160,6 +217,7 @@ def fit(
             "n_atoms": int(topology.n_atoms),
             "elements": list(topology.atom_types),
             "index_base": 0,
+            "reference_geometry": {"source": reference_source, "state_key": REFERENCE_KEY},
             "topology": {
                 "bonds": [list(map(int, b)) for b in topology.bonds],
                 "angles": [list(map(int, a)) for a in topology.angles],
@@ -182,7 +240,9 @@ def fit(
         "onset_rule": rule.to_dict(),
         "fit_data": {"n_train": int(len(train)), "n_valid": int(len(valid))},
     }
-    return ReferenceBundle(manifest, {f"{GEOMETRIC_TRACK}/{k}": v for k, v in state.items()})
+    arrays = {f"{GEOMETRIC_TRACK}/{k}": v for k, v in state.items()}
+    arrays[REFERENCE_KEY] = np.array(reference, dtype=np.float64)
+    return ReferenceBundle(manifest, arrays)
 
 
 # ---------------------------------------------------------------------------
@@ -233,6 +293,11 @@ class ReferenceBundle:
         return copy.deepcopy(self._manifest["molecule"]["topology"])
 
     @property
+    def reference_positions(self) -> np.ndarray:
+        """The reference geometry, (n_atoms, 3) Å, used by ``validate_frame``."""
+        return self._state[REFERENCE_KEY].copy()
+
+    @property
     def tracks(self) -> tuple[str, ...]:
         return tuple(self._manifest["tracks"])
 
@@ -260,12 +325,17 @@ class ReferenceBundle:
         positions: np.ndarray,
         *,
         length_unit: str = "angstrom",
-    ) -> None:
-        """Check a first frame against the bundle; raise ``BundleError`` if it differs.
+    ) -> FrameCheck:
+        """Check a first frame against the bundle.
 
-        Checks the unit, the atom count, the element of every atom in order, and
-        that positions are a finite ``(n_atoms, 3)`` array. Matching elements do
-        not prove atom identity: two atoms of one element can still be swapped.
+        Raises ``BundleError`` when the unit, the atom count, the element of any
+        atom (in order), or the positions' shape and finiteness do not match.
+
+        Otherwise returns a ``FrameCheck`` with two diagnostics against the
+        reference geometry: stretched bonds and possible same-element swaps. They
+        are not proof either way: matching elements and a clean check do not
+        prove atom identity. Only starting the run from the bundle's reference
+        frame, in its atom order, does.
         """
         self._check_unit(length_unit)
         elements = [str(e) for e in elements]
@@ -284,6 +354,7 @@ class ReferenceBundle:
             raise BundleError(f"positions have shape {pos.shape}; expected ({self.n_atoms}, 3)")
         if not np.all(np.isfinite(pos)):
             raise BundleError("positions contain NaN or infinity")
+        return _frame_check(pos, self.reference_positions, self.elements, self._topology.bonds)
 
     def score(self, positions: np.ndarray, *, length_unit: str = "angstrom") -> dict[str, np.ndarray]:
         """T² per frame for each track.
@@ -411,6 +482,68 @@ def _check_length_unit(length_unit: str) -> None:
         )
 
 
+def _kabsch(P: np.ndarray, Q: np.ndarray) -> tuple[np.ndarray, float]:
+    """Rigidly align P onto Q (rotation + translation, no reflection); return (P aligned, RMSD)."""
+    p0, q0 = P.mean(axis=0), Q.mean(axis=0)
+    H = (P - p0).T @ (Q - q0)
+    U, _, Vt = np.linalg.svd(H)
+    d = np.sign(np.linalg.det(Vt.T @ U.T)) or 1.0
+    R = Vt.T @ np.diag([1.0, 1.0, d]) @ U.T
+    aligned = (P - p0) @ R.T + q0
+    return aligned, float(np.sqrt(np.mean(np.sum((aligned - Q) ** 2, axis=1))))
+
+
+def _match_to_reference(
+    frame: np.ndarray, ref: np.ndarray, elements: Sequence[str], max_rounds: int = 10,
+) -> tuple[np.ndarray, float]:
+    """Best same-element matching of ``frame`` atoms to ``ref`` atoms.
+
+    Alternates rigid alignment and per-element Hungarian assignment until the
+    matching stops changing. Returns ``perm`` (frame atom ``perm[k]`` matches
+    reference atom ``k``) and the RMSD after aligning with it. Not guaranteed to
+    find the global optimum; good enough near the reference.
+    """
+    elems = np.asarray(elements)
+    perm = np.arange(len(ref))
+    rmsd = _kabsch(frame, ref)[1]
+    for _ in range(max_rounds):
+        aligned, rmsd = _kabsch(frame[perm], ref)
+        by_frame_atom = np.empty_like(aligned)
+        by_frame_atom[perm] = aligned
+        new = perm.copy()
+        for e in np.unique(elems):
+            idx = np.flatnonzero(elems == e)
+            rows, cols = linear_sum_assignment(cdist(ref[idx], by_frame_atom[idx], "sqeuclidean"))
+            new[idx[rows]] = idx[cols]
+        if np.array_equal(new, perm):
+            break
+        perm = new
+    return perm, _kabsch(frame[perm], ref)[1]
+
+
+def _frame_check(
+    frame: np.ndarray, ref: np.ndarray, elements: Sequence[str], bonds: Sequence[tuple[int, int]],
+) -> FrameCheck:
+    broken = []
+    for i, j in bonds:
+        d = float(np.linalg.norm(frame[i] - frame[j]))
+        r = float(np.linalg.norm(ref[i] - ref[j]))
+        if d > BOND_STRETCH_LIMIT * r:
+            broken.append((int(i), int(j), d, r))
+
+    rmsd_identity = _kabsch(frame, ref)[1]
+    perm, rmsd_matched = _match_to_reference(frame, ref, elements)
+    swaps: tuple[tuple[int, int], ...] = ()
+    # Report a different matching only when it fits strictly better.
+    if rmsd_matched < rmsd_identity - 1e-9:
+        swaps = tuple(sorted({
+            (int(min(k, perm[k])), int(max(k, perm[k]))) for k in range(len(perm)) if perm[k] != k
+        }))
+    else:
+        rmsd_matched = rmsd_identity
+    return FrameCheck(tuple(broken), swaps, rmsd_identity, rmsd_matched)
+
+
 def _check_bundle(manifest: Any, state: Mapping[str, np.ndarray]) -> None:
     """Refuse a manifest + state this installation cannot score faithfully."""
     if not isinstance(manifest, dict) or manifest.get("format") != BUNDLE_FORMAT:
@@ -491,6 +624,12 @@ def _check_bundle(manifest: Any, state: Mapping[str, np.ndarray]) -> None:
             raise BundleError(f"fitted state: {key} has shape {arr.shape}, manifest implies {shape}")
         if arr.dtype.kind != "f" or not np.all(np.isfinite(arr)):
             raise BundleError(f"fitted state: {key} is not a finite float array")
+    ref_key = mol.get("reference_geometry", {}).get("state_key")
+    if ref_key != REFERENCE_KEY or REFERENCE_KEY not in state:
+        raise BundleError("fitted state: missing the reference geometry")
+    ref = state[REFERENCE_KEY]
+    if ref.shape != (n_atoms, 3) or ref.dtype.kind != "f" or not np.all(np.isfinite(ref)):
+        raise BundleError(f"fitted state: reference geometry has shape {ref.shape}, expected ({n_atoms}, 3)")
     for name, t in track.get("thresholds", {}).items():
         if not np.isfinite(float(t.get("value", np.nan))):
             raise BundleError(f"track {GEOMETRIC_TRACK!r}: threshold {name!r} is not a finite number")
