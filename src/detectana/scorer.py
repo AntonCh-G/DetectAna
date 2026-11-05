@@ -87,13 +87,31 @@ class MahalanobisScorer:
 
         Returns
         -------
-        distances : (n_frames,)
+        distances : (n_frames,) — √T², see ``score_t2`` for the statistic itself.
+        """
+        return np.sqrt(self.score_t2(X_pca))
+
+    # ------------------------------------------------------------------
+    def score_t2(self, X_pca: np.ndarray) -> np.ndarray:
+        """Hotelling's T²: the squared Mahalanobis distance of each row of X_pca.
+
+        This is the statistic the reference bundle stores and thresholds;
+        "distance" (``score``) is only its square root, kept for the batch
+        pipeline.
+
+        Parameters
+        ----------
+        X_pca : (n_frames, n_components)
+
+        Returns
+        -------
+        t2 : (n_frames,), non-negative
         """
         mean, inv_cov = self._fitted()
         diff = X_pca - mean  # (n_frames, n_components)
         # Vectorised: d² = diff @ inv_cov @ diff.T  →  diag only
         d2 = np.einsum("ij,jk,ik->i", diff, inv_cov, diff)
-        return np.sqrt(np.maximum(d2, 0.0))
+        return np.maximum(d2, 0.0)
 
     # ------------------------------------------------------------------
     def calibrate(

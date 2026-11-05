@@ -133,3 +133,12 @@ def test_one_feature_input_fits_and_scores():
     np.testing.assert_allclose(scores, expected, rtol=1e-6)
     threshold = scorer.calibrate(X, percentile=99.0)
     assert np.isfinite(threshold)
+
+
+def test_score_t2_is_the_squared_distance(fitted_scorer):
+    """T² is the stored statistic (issue 03); ``score`` stays the distance √T²."""
+    scorer, X = fitted_scorer
+    t2 = scorer.score_t2(X)
+    assert t2.shape == (len(X),)
+    assert np.all(t2 >= 0.0)
+    np.testing.assert_allclose(np.sqrt(t2), scorer.score(X), rtol=1e-12)
