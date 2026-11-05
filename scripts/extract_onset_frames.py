@@ -40,6 +40,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
 
 from detectana.aggregator import aggregate_bead_scores
 from detectana.onset import detect_onset
+from detectana.pipeline import time_per_step_fs
 from detectana.xyz_reader import load_or_build_index
 
 # NIST 2018 CODATA: 1 Hartree/Bohr = 51.4221 eV/Å
@@ -263,7 +264,7 @@ def main() -> None:
         centroid_scores = np.load(centroid_scores_path)
         agg_df_src = pd.read_csv(agg_csv_path)
         steps = agg_df_src["step"].to_numpy()
-        frame_time_fs = run_cfg["timestep_fs"] * run_cfg["stride"]
+        frame_time_fs = time_per_step_fs(run_cfg)
 
         agg_df_new = aggregate_bead_scores(
             bead_scores=bead_scores,

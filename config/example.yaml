@@ -38,7 +38,8 @@ runs:
     # Comment out the two lines above and uncomment this.
     # hdf5: "path/to/nvt_trajectory.hdf5"
 
-    # frame_time_fs = timestep_fs * stride
+    # time_ps = MD step × timestep_fs for i-PI XYZ (the step already counts
+    # the stride); frame index × timestep_fs × stride for HDF5.
     timestep_fs: 0.2
     stride: 50
 

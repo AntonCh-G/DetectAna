@@ -152,14 +152,29 @@ def test_frame_aggregate_schema_and_length(demo_outputs):
     assert agg["centroid_score"].gt(0.0).all()
 
 
-def test_frame_aggregate_time_axis_uses_timestep_times_stride(demo_outputs, demo_run):
+def test_xyz_time_axis_is_the_md_step_times_the_timestep(demo_outputs, demo_run):
+    """i-PI writes the MD step number, so time = step × timestep. The output
+    stride is already in the step numbers (multiplying by it again made times
+    stride-times too large before 0.4)."""
     _, cfg = demo_run
-    run_cfg = cfg["runs"][0]
-    frame_time_fs = run_cfg["timestep_fs"] * run_cfg["stride"]
     agg = demo_outputs["agg"]
     np.testing.assert_allclose(
         agg["time_ps"].to_numpy(),
-        agg["step"].to_numpy() * frame_time_fs / 1000.0,
+        agg["step"].to_numpy() * cfg["runs"][0]["timestep_fs"] / 1000.0,
+    )
+    # Demo: step 100000 at 0.2 fs is 20 ps.
+    assert agg["time_ps"].iloc[0] == pytest.approx(20.0)
+
+
+def test_hdf5_time_axis_is_the_frame_index_times_timestep_times_stride(hdf5_run):
+    """HDF5 runs store frame indices as steps, one per output stride."""
+    out, cfg = hdf5_run
+    agg = pd.read_csv(out / "hdf5run" / "frame_aggregate.csv")
+    run_cfg = cfg["runs"][0]
+    np.testing.assert_array_equal(agg["step"].to_numpy(), np.arange(len(agg)))
+    np.testing.assert_allclose(
+        agg["time_ps"].to_numpy(),
+        np.arange(len(agg)) * run_cfg["timestep_fs"] * run_cfg["stride"] / 1000.0,
     )
 
 

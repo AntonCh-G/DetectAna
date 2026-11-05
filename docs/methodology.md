@@ -95,8 +95,10 @@ leak information:
   carry no element symbols — the fast binary XYZ reader and HDF5 — can only be
   checked on atom count, and files with mixed atom counts across frames are
   rejected.
-- **Striding.** Trajectories are read at their stored output stride; the
-  configured `timestep_fs × stride` converts frame index to picoseconds. Output
+- **Striding.** Trajectories are read at their stored output stride. Time in
+  picoseconds is `step × timestep_fs` for i-PI XYZ files, whose step column is
+  the MD step number, and `frame × timestep_fs × stride` for HDF5 files, whose
+  step column is the frame index (`pipeline.time_per_step_fs`). Output
   tables carry both the raw step index and the time, because mixing the two
   produces a plot that looks entirely plausible.
 - **No alignment, no centering, no rotation.** Internal coordinates are

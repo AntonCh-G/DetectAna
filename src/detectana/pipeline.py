@@ -171,6 +171,18 @@ def _cache_file(cache_dir: Path, name: str, bundle: ReferenceBundle, topo: Molec
     return cache_dir / f"{name}_descriptors_{hashlib.sha256(key.encode()).hexdigest()[:10]}.npz"
 
 
+def time_per_step_fs(run_cfg: dict) -> float:
+    """Femtoseconds per unit of the ``step`` column of a run.
+
+    XYZ runs carry i-PI's MD step number (the output stride is already in it), so
+    one step is one timestep. HDF5 runs carry the frame index, one per output
+    stride, so one step is timestep × stride.
+    """
+    if "hdf5" in run_cfg:
+        return float(run_cfg["timestep_fs"]) * float(run_cfg["stride"])
+    return float(run_cfg["timestep_fs"])
+
+
 # ---------------------------------------------------------------------------
 # Public entry point
 # ---------------------------------------------------------------------------
@@ -397,8 +409,7 @@ def _process_run(
     chem_cfg = cfg["chemistry"]
     chunk_size = io_cfg["chunk_size"]
     stride = run_cfg["stride"]
-    timestep_fs = run_cfg["timestep_fs"]
-    frame_time_fs = timestep_fs * stride
+    step_time_fs = time_per_step_fs(run_cfg)
     force_recompute = io_cfg["force_recompute"]
     n_jobs = cfg.get("pipeline", {}).get("n_jobs", -1)
 
@@ -530,7 +541,7 @@ def _process_run(
         centroid_scores=centroid_scores,
         steps=np.array(step_arrays),
         threshold=SIGNAL_THRESHOLD,
-        frame_time_fs=frame_time_fs,
+        frame_time_fs=step_time_fs,
     )
     agg_df["centroid_top_test"] = [keys[i] for i in centroid_top]
     for k in keys:

@@ -107,6 +107,12 @@ produces results that still look plausible. See
   docstring claimed a share of the score. Use SPE and `attribute` (issue 01).
 
 ### Fixed
+- **Units: the time axis of XYZ runs was too large by the output stride.** i-PI's
+  step number already counts MD steps, and the pipeline multiplied it by
+  `timestep_fs × stride`. `time_ps` in `frame_aggregate.csv` and the plot axes of
+  XYZ runs are now `step × timestep_fs`; on the demo, 20 ps instead of 1000 ps.
+  Earlier picosecond values from XYZ runs should be divided by `stride`. Step
+  numbers, frame indices and HDF5 runs were right and are unchanged.
 - Fitting a one-feature input crashed `MahalanobisScorer.fit` (`np.cov` returns
   a scalar for one column).
 - A molecule with no angles or dihedrals (a diatomic) crashed the vectorised
