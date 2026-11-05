@@ -235,6 +235,14 @@ def build_topology(
         else:
             log.info("Ring-planarity feature disabled by configuration.")
 
+    return complete_topology(topo)
+
+
+def complete_topology(topo: MoleculeTopology) -> MoleculeTopology:
+    """Fill in feature names and numpy index arrays from bonds, angles, dihedrals
+    and ring atoms. ``build_topology`` calls it; so does a reference bundle that
+    rebuilds a topology from its manifest. Returns ``topo``, changed in place.
+    """
     # ── Feature names ────────────────────────────────────────────────────────
     sym = topo.atom_types
     topo.bond_names = [f"bond_{sym[i]}{i}-{sym[j]}{j}_Å" for i, j in topo.bonds]
