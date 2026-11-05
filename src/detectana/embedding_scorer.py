@@ -1,7 +1,8 @@
 """Per-atom Mahalanobis OOD scorer for MLFF invariant per-atom embeddings.
 
 One MahalanobisScorer is fit per atom index, preserving the stable atom
-ordering validated against initial.xyz. Per-frame scores are reduced to a
+ordering validated against initial.xyz. Each atom is scored by T², the squared
+Mahalanobis distance. Per-frame scores are reduced to a
 scalar via max over atoms — consistent with the project rule of never
 averaging away signals. A single threshold is calibrated on the
 max-over-atoms scores from the validation set.
@@ -59,7 +60,7 @@ class EmbeddingPipeline:
 
     # ------------------------------------------------------------------
     def score_per_atom(self, embeddings: np.ndarray) -> np.ndarray:
-        """Return per-frame per-atom Mahalanobis distances.
+        """Return per-frame per-atom T² (squared Mahalanobis distance).
 
         Parameters
         ----------
@@ -75,12 +76,12 @@ class EmbeddingPipeline:
             raise ValueError(f"Expected {self.n_atoms} atoms, got {n_atoms}")
         out = np.empty((n_frames, n_atoms), dtype=np.float64)
         for i, scorer in enumerate(atom_scorers):
-            out[:, i] = scorer.score(embeddings[:, i, :])
+            out[:, i] = scorer.score_t2(embeddings[:, i, :])
         return out
 
     # ------------------------------------------------------------------
     def score(self, embeddings: np.ndarray) -> np.ndarray:
-        """Return per-frame OOD score: max over atoms.
+        """Return per-frame OOD score: max over atoms of T².
 
         Parameters
         ----------
@@ -98,7 +99,7 @@ class EmbeddingPipeline:
         val_embeddings: np.ndarray,
         percentile: float = 99.0,
     ) -> float:
-        """Set threshold as percentile of max-over-atoms scores on validation set.
+        """Set threshold as percentile of max-over-atoms T² on the validation set.
 
         Parameters
         ----------
@@ -131,6 +132,9 @@ class EmbeddingPipeline:
                     "threshold": self.threshold,
                     "n_atoms": self.n_atoms,
                     "n_features": self.n_features,
+                    # Scores and threshold are T². Pickles without this key hold a
+                    # distance threshold and are refused by load().
+                    "statistic": "T2",
                 },
                 fh,
             )
@@ -139,6 +143,11 @@ class EmbeddingPipeline:
     def load(cls, path: str | Path) -> EmbeddingPipeline:
         with open(path, "rb") as fh:
             state = pickle.load(fh)
+        if state.get("statistic") != "T2":
+            raise ValueError(
+                f"{path}: embedding pipeline saved before scores became T²; its threshold "
+                "is a distance and would not match T² scores. Refit it."
+            )
         obj = cls()
         obj._atom_scorers = state["atom_scorers"]
         obj.threshold = state["threshold"]
