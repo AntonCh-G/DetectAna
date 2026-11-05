@@ -143,6 +143,7 @@ def test_frame_aggregate_schema_and_length(demo_outputs):
         "step", "time_ps", "bead_max", "bead_p95", "bead_frac_ood",
         "centroid_score", "centroid_ood", "centroid_top_test",
         *[f"centroid_{t.replace('/', '_')}" for t in tests],
+        "centroid_top_groups", "centroid_top_atoms",
     ]
     assert set(agg["centroid_top_test"]) <= set(tests)
     # data/smoke ships 24 trajectory frames.
@@ -689,3 +690,36 @@ def test_pipeline_refuses_tracks_that_are_not_a_mapping(demo_config):
     demo_config["tracks"] = ["bonds"]
     with pytest.raises(ValueError, match="tracks"):
         run_pipeline(demo_config)
+
+
+# ---------------------------------------------------------------------------
+# Attribution of marked frames and onsets (ADR 0007)
+# ---------------------------------------------------------------------------
+
+def test_marked_centroid_frames_name_their_top_groups(demo_run, demo_outputs):
+    import detectana
+
+    out, _ = demo_run
+    agg = demo_outputs["agg"]
+    marked = agg["centroid_ood"].to_numpy()
+    assert marked.any()
+    assert agg.loc[~marked, "centroid_top_groups"].isna().all()
+    bundle = detectana.load(out / "models" / "geometric.bundle")
+    cache = np.load(demo_outputs["run_dir"] / "descriptor_cache" / "centroid_descriptors.npz")
+    for i in np.flatnonzero(marked)[:3]:
+        track, score = agg["centroid_top_test"].iloc[i].split("/")
+        top = bundle.attribute_features(cache["descriptors"][[i]], track, score).top(k=3)
+        assert agg["centroid_top_groups"].iloc[i] == "; ".join(f"{g.group_id}={g.strength:.4g}" for g in top)
+        assert agg["centroid_top_atoms"].iloc[i] == "-".join(map(str, top[0].atoms))
+
+
+def test_onset_attribution_explains_each_onset_frame(demo_outputs):
+    att = pd.read_csv(demo_outputs["run_dir"] / "onset_attribution.csv")
+    onset = demo_outputs["onset"].iloc[0]
+    assert list(att.columns) == ["onset", "frame", "step", "test", "rank", "group", "atoms", "size", "strength"]
+    for kind in att["onset"].unique():
+        rows = att[att["onset"] == kind]
+        assert rows["frame"].nunique() == 1
+        assert int(rows["frame"].iloc[0]) == int(onset[f"{kind}_frame"])
+        assert list(rows["rank"]) == list(range(1, len(rows) + 1))
+        assert rows["strength"].is_monotonic_decreasing

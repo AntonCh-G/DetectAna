@@ -27,6 +27,7 @@ from joblib import Parallel, delayed
 
 from detectana import __version__
 from detectana.aggregator import add_embedding_scores, aggregate_bead_scores
+from detectana.attribution import GroupStrength
 from detectana.bundle import SCORES, ReferenceBundle
 from detectana.bundle import fit as fit_bundle
 from detectana.descriptors import compute_descriptor_batch
@@ -126,6 +127,27 @@ def _exceedance(
 def _save_arrays(path: Path, arrays: dict[str, np.ndarray]) -> None:
     """Named arrays to a compressed .npz (keys such as ``bonds/T2``)."""
     np.savez_compressed(path, **arrays)  # type: ignore[arg-type]
+
+
+def _top_groups(
+    bundle: ReferenceBundle,
+    features: np.ndarray,
+    keys: list[str],
+    top_test: np.ndarray,
+    frames: np.ndarray,
+    k: int,
+) -> dict[int, list[GroupStrength]]:
+    """The ``k`` strongest descriptor groups (RBC) of each frame, for its top test."""
+    out: dict[int, list[GroupStrength]] = {}
+    for i, key in enumerate(keys):
+        rows = frames[top_test[frames] == i]
+        if len(rows) == 0:
+            continue
+        track, score = key.split("/")
+        att = bundle.attribute_features(features[rows], track, score)
+        for j, frame in enumerate(rows):
+            out[int(frame)] = att.top(frame=j, k=k)
+    return out
 
 
 def _builtin_layout(bundle: ReferenceBundle, topo: MoleculeTopology) -> bool:
@@ -421,7 +443,7 @@ def _process_run(
         bead_raw = {k: np.stack([raw[k] for _, raw, _ in results]) for k in keys}
         step_arrays = results[0][2]
 
-        centroid_raw, centroid_steps = _score_centroid_array(
+        centroid_raw, centroid_steps, centroid_descs = _score_centroid_array(
             centroid_positions=traj.centroid_positions,
             topo=topo,
             bundle=bundle,
@@ -469,7 +491,7 @@ def _process_run(
         bead_raw = {k: np.stack([raw[k] for _, raw, _ in results]) for k in keys}
         step_arrays = results[0][2]
 
-        centroid_raw, centroid_steps = _score_centroid(
+        centroid_raw, centroid_steps, centroid_descs = _score_centroid(
             centroid_xyz=run_cfg["centroid_xyz"],
             topo=topo,
             spec=spec,
@@ -490,6 +512,7 @@ def _process_run(
         step_arrays = step_arrays[:n]
         bead_raw = {k: v[:, :n] for k, v in bead_raw.items()}
         centroid_raw = {k: v[:n] for k, v in centroid_raw.items()}
+        centroid_descs = centroid_descs[:n]
 
     # ── Exceedance: one signal per role, threshold 1 ──────────────────────────
     # Beads use the bead role, the centroid the centroid role. A frame is marked
@@ -512,6 +535,16 @@ def _process_run(
     agg_df["centroid_top_test"] = [keys[i] for i in centroid_top]
     for k in keys:
         agg_df[f"centroid_{k.replace('/', '_')}"] = centroid_raw[k]
+    # Attribution (RBC) of marked centroid frames, for the test that marked them.
+    top_groups: list[str | None] = [None] * len(agg_df)
+    top_atoms: list[str | None] = [None] * len(agg_df)
+    for frame, groups in _top_groups(
+        bundle, centroid_descs, keys, centroid_top, np.flatnonzero(centroid_scores > SIGNAL_THRESHOLD), k=3,
+    ).items():
+        top_groups[frame] = "; ".join(f"{g.group_id}={g.strength:.4g}" for g in groups)
+        top_atoms[frame] = "-".join(map(str, groups[0].atoms))
+    agg_df["centroid_top_groups"] = top_groups
+    agg_df["centroid_top_atoms"] = top_atoms
 
     # ── Embedding track (optional) ────────────────────────────────────────────
     if emb_pipe is not None and emb_threshold is not None:
@@ -593,6 +626,25 @@ def _process_run(
             np.iinfo(np.int64).max,
         )
         onset.first_anomaly_bead_idx = int(np.argmin(first_ood_frame))
+
+    # What drove the centroid at each onset frame (RBC of its top test).
+    onset_frames = {
+        kind: getattr(onset, f"{kind}_frame")
+        for kind in ("first_bead_anomaly", "persistent_bead_anomaly", "centroid_anomaly", "collective_anomaly")
+        if getattr(onset, f"{kind}_frame") is not None
+    }
+    explained = _top_groups(
+        bundle, centroid_descs, keys, centroid_top, np.array(sorted(set(onset_frames.values())), dtype=int), k=5,
+    )
+    att_rows = [
+        {"onset": kind, "frame": frame, "step": int(step_arrays[frame]), "test": keys[centroid_top[frame]],
+         "rank": rank, "group": g.group_id, "atoms": "-".join(map(str, g.atoms)), "size": g.size,
+         "strength": g.strength}
+        for kind, frame in onset_frames.items()
+        for rank, g in enumerate(explained[frame], start=1)
+    ]
+    pd.DataFrame(att_rows, columns=["onset", "frame", "step", "test", "rank", "group", "atoms", "size",
+                                    "strength"]).to_csv(run_out / "onset_attribution.csv", index=False)
 
     # ── Step 10: Plots ────────────────────────────────────────────────────────
     try:
@@ -770,8 +822,10 @@ def _score_centroid_array(
     bundle: ReferenceBundle,
     force_recompute: bool,
     cache_dir: Path,
-) -> tuple[dict[str, np.ndarray], np.ndarray]:
-    """Score centroid from an in-memory position array (HDF5 path)."""
+) -> tuple[dict[str, np.ndarray], np.ndarray, np.ndarray]:
+    """Score centroid from an in-memory position array (HDF5 path).
+
+    Returns (raw score per test, steps, descriptors)."""
     cache_path = _cache_file(cache_dir, "centroid", bundle, topo)
 
     cached = _read_cache(cache_path, bundle, force_recompute)
@@ -784,7 +838,7 @@ def _score_centroid_array(
         np.savez_compressed(cache_path, steps=steps, descriptors=descs)
         log.info("Cached %d frames → %s", len(steps), cache_path.name)
 
-    return _test_scores(bundle, descs), steps
+    return _test_scores(bundle, descs), steps, descs
 
 
 def _score_centroid(
@@ -796,7 +850,8 @@ def _score_centroid(
     stride: int,
     force_recompute: bool,
     cache_dir: Path,
-) -> tuple[dict[str, np.ndarray], np.ndarray]:
+) -> tuple[dict[str, np.ndarray], np.ndarray, np.ndarray]:
+    """Returns (raw score per test, steps, descriptors)."""
     cache_path = _cache_file(cache_dir, "centroid", bundle, topo)
     steps, descs = _load_or_compute_descriptors(
         bead_path=centroid_xyz,
@@ -809,7 +864,7 @@ def _score_centroid(
         force_recompute=force_recompute,
         bead_name="centroid",
     )
-    return _test_scores(bundle, descs), steps
+    return _test_scores(bundle, descs), steps, descs
 
 
 # ---------------------------------------------------------------------------
