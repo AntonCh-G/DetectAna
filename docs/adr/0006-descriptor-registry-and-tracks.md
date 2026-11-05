@@ -68,8 +68,10 @@ Decided while building; the decisions above are unchanged.
 - **Groups** are defined by the descriptor author with no size rule; RBC is not
   normalised by group size, and each group's size is reported with it.
 - **Empty tracks** (ring on a ring-less molecule) are dropped and recorded.
-- **The batch pipeline** keeps one joined track scored by T² until the default is
-  decided; a pipeline config with `tracks:` or `scores:` is refused.
+- **The batch pipeline** scores the config's tracks (absent → the default) and
+  stores the exceedance — largest score ÷ threshold over the tests — as each
+  frame's score, so the aggregation and window rule are unchanged. The joined
+  track with T² alone reproduces the earlier pipeline exactly.
 
 ## Consequences
 

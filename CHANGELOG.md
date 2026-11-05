@@ -61,9 +61,22 @@ produces results that still look plausible. See
 - **Scientific definition: thresholds of multi-test bundles.** With K active tests,
   each threshold is the 100·(1 − α/K) percentile of validation values, not the
   configured percentile. A one-test bundle (the batch pipeline's) is unchanged.
-- The batch pipeline fits the joined track scored by T² only: its outputs are
-  unchanged. A config with `tracks:` or `scores:` is refused until the pipeline
-  supports them.
+- **Scientific definition: batch pipeline scores are exceedances.** The pipeline
+  fits the config's `tracks:` and `scores:` (absent → the four-track default) and
+  stores, per bead and centroid frame, the largest score ÷ threshold over the
+  tests (bead role for beads, centroid role for the centroid); above 1 = marked.
+  `bead_scores.npy`, `centroid_scores.npy` and the score columns of
+  `frame_aggregate.csv` change meaning accordingly; raw T²/SPE per test are in
+  `bead_test_scores.npz` / `centroid_test_scores.npz`. Existing configs without
+  `tracks:` change results on their next run; `tracks: {geometric: [bonds, angles,
+  dihedrals, ring]}` with `scores: [T2]` reproduces the previous flags and onsets.
+  The run manifest records `"statistic": "exceedance"`, the tests, thresholds per
+  test and role, and the budget (the scalar `ood_threshold` keys are gone).
+- `frame_aggregate.csv` adds the top test, per-test centroid scores, and for
+  marked centroid frames the three strongest descriptor groups (RBC); a new
+  `onset_attribution.csv` explains each onset frame.
+- `extract_onset_frames.py --threshold` is in the run's score units: exceedance
+  for current runs, T² for runs written before tracks.
 - `MahalanobisScorer`: `track=` is renamed `role=` (threshold role), and
   `DEFAULT_TRACK` is `DEFAULT_ROLE`. Pickles are unaffected.
 - Core dependencies are `numpy`, `scipy`, `scikit-learn`, `ase`. `pandas`,

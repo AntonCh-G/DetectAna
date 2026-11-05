@@ -67,8 +67,11 @@ outputs/demo/
   demo/
     manifest.json              # config, version, threshold, topology, onset design
     onset_table.csv            # the four onset criteria
-    bead_scores.npy            # (n_beads, n_frames)
-    centroid_scores.npy        # (n_frames,)
+    onset_attribution.csv      # strongest descriptor groups at each onset
+    bead_scores.npy            # (n_beads, n_frames), exceedance
+    centroid_scores.npy        # (n_frames,), exceedance
+    bead_test_scores.npz       # raw T²/SPE per test
+    centroid_test_scores.npz
     frame_aggregate.csv        # per-timestep max / p95 / fraction OOD / centroid
     chemistry_flags_bead00.csv # hard-chemistry flags, separate from the score
     descriptor_cache/          # per-bead descriptor NPZ

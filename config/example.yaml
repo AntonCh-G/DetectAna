@@ -53,9 +53,29 @@ descriptor:
   # Fixed so runs are reproducible.
   random_seed: 42
 
+# ── Tracks and scores (ADR 0006, 0007) ───────────────────────────────────────
+# Each track is fitted, scored and thresholded on its own: T² (unusual within the
+# motions training showed) and SPE (a new kind of motion). Left out, the library
+# default applies — four tracks, provisional. To reproduce runs made before
+# tracks, use the joined track with T² only:
+#
+# tracks:
+#   geometric: [bonds, angles, dihedrals, ring]
+# scores: [T2]
+#
+# A track can name your own descriptor as "module.path:function".
+#
+# tracks:
+#   bonds: [bonds]
+#   angles: [angles]
+#   dihedrals: [dihedrals]
+#   ring: [ring]
+# scores: [T2, SPE]
+
 # ── Threshold calibration ─────────────────────────────────────────────────────
 threshold:
-  # Which percentile of the validation-set scores becomes the OOD threshold.
+  # Total false-alarm budget: 100 − percentile is split equally over the active
+  # tests (track × score), each thresholded at its share of validation scores.
   percentile: 99.0
 
 # ── Hard-chemistry checks ─────────────────────────────────────────────────────

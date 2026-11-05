@@ -163,16 +163,31 @@ outputs/
   models/
     geometric.bundle/              # reference bundle: manifest.json + state.npz
   <run_name>/
-    manifest.json                  # config, version, statistic, threshold, onset design
+    manifest.json                  # config, version, tests, thresholds, budget, onset design
     onset_table.csv                # run-level onset summary
-    bead_scores.npy                # (n_beads, n_frames), T²
-    centroid_scores.npy            # (n_frames,), T²
-    frame_aggregate.csv            # aggregated scores per timestep
+    onset_attribution.csv          # strongest descriptor groups at each onset frame
+    bead_scores.npy                # (n_beads, n_frames), exceedance (bead role)
+    centroid_scores.npy            # (n_frames,), exceedance (centroid role)
+    bead_test_scores.npz           # raw T²/SPE per test, (n_beads, n_frames) each
+    centroid_test_scores.npz       # raw T²/SPE per test, (n_frames,) each
+    frame_aggregate.csv            # per timestep: aggregates, top test, per-test
+                                   #   centroid scores, top groups of marked frames
     chemistry_flags_bead00.csv     # hard-chemistry flags, bead 00
     descriptor_cache/              # raw descriptor NPZ caches, per bead
     plots/
       score_vs_time.png            # bead max/p95, fraction OOD, centroid
 ```
+
+**Scores are exceedances.** A run has several *tests* — each track's T² and
+SPE — each with its own threshold. The pipeline's per-frame score is the
+**exceedance**: the largest score ÷ threshold over the tests, for the bead role on
+beads and the centroid role on the centroid. Above 1 means the frame is marked;
+the fraction of beads, the window rule and the onsets work on that. Its size is
+not comparable across tests. `centroid_top_test` names the test that set it, and
+the raw scores of every test are in the `*_test_scores.npz` files and the
+`centroid_<track>_<score>` columns. A config with `tracks: {geometric: [bonds,
+angles, dihedrals, ring]}` and `scores: [T2]` reproduces the flags and onsets of
+runs made before tracks.
 
 ## Library use: the reference bundle
 

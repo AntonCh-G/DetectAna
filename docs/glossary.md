@@ -76,8 +76,8 @@ rule) and `state.npz` (fitted arrays, no pickle). Callers use its metadata API,
 `score`, `exceedance` and `attribute`, never the fitted state. It refuses a
 bundle of another format version, changed or unimported descriptor code or other
 units, and frames of another atom count, element order or unit. The batch
-pipeline fits one with a single joined track `geometric`, scored by T² only, and
-saves it to `outputs/models/geometric.bundle`.
+pipeline fits one with the config's tracks and saves it to
+`outputs/models/geometric.bundle`.
 
 **Frame check** — what `validate_frame` returns for a first frame that passed
 the hard checks: stretched bonds and possible same-element swaps against the
@@ -97,7 +97,8 @@ reported with every attribution, since larger groups tend to show larger RBC.
 
 **Track** — a set of descriptor numbers fitted, scored and thresholded together,
 as the embedding track is. Default (provisional): bonds, angles, dihedrals, ring.
-The *joined track* puts all four into one; the batch pipeline uses it.
+The *joined track* puts all four into one; with T² alone it is the detector used
+before tracks.
 
 **Test** — one score of one track (T² or SPE) against its own thresholds, e.g.
 "bonds, SPE". A test is *active* when its score can fire; an inactive SPE is not
@@ -133,7 +134,8 @@ explanation itself is the group.
 **Exceedance** — for one threshold role, the largest score ÷ threshold over a
 frame's active tests, with the test that produced it. Above 1 = the frame is
 marked. Its size is not comparable across tests; only "above 1" has a
-statistical meaning. The one per-frame signal the window rule reads.
+statistical meaning. The one per-frame signal the window rule reads; the batch
+pipeline stores it as each bead's and the centroid's score.
 _Avoid_: threshold ratio, severity.
 
 **Mark, alarm** — a mark is one frame above a threshold; an alarm is the window
