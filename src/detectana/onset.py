@@ -34,10 +34,13 @@ from __future__ import annotations
 import logging
 from collections import deque
 from dataclasses import dataclass
+from typing import TYPE_CHECKING
 
 import numpy as np
-import pandas as pd
 from scipy.stats import binom
+
+if TYPE_CHECKING:  # pandas is a [pipeline] extra; detect_onset only reads columns
+    import pandas as pd
 
 log = logging.getLogger(__name__)
 
