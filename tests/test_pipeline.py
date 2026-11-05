@@ -9,8 +9,8 @@ Covered
 1.  ``run_pipeline`` on ``config/demo.yaml`` — every output file, and the
     internal consistency of onset_table / frame_aggregate / bead_scores.
 2.  manifest.json, including the ``molecule`` and ``onset_design`` blocks.
-3.  The saved models: loadable, and re-scoring the cached descriptors with them
-    reproduces bead_scores.npy exactly.
+3.  The saved reference bundle: loadable, and re-scoring the cached descriptors
+    with it reproduces bead_scores.npy exactly. Scores are T².
 4.  The HDF5 branch of ``_process_run``, driven by a synthesised
     ``nvt_trajectory.hdf5`` (see the ``smoke_hdf5`` fixture).
 5.  Descriptor-cache reuse and ``force_recompute``.
@@ -96,8 +96,8 @@ def hdf5_run(demo_config_template, smoke_hdf5, tmp_path_factory):
 def test_demo_run_writes_every_documented_output(demo_run):
     out, _ = demo_run
     expected = [
-        "models/descriptor_pipeline.pkl",
-        "models/scorer.pkl",
+        "models/geometric.bundle/manifest.json",
+        "models/geometric.bundle/state.npz",
         "onset_summary.csv",
         "demo/onset_table.csv",
         "demo/frame_aggregate.csv",
@@ -111,6 +111,12 @@ def test_demo_run_writes_every_documented_output(demo_run):
     ]
     missing = [rel for rel in expected if not (out / rel).exists()]
     assert not missing, f"pipeline did not write: {missing}"
+
+
+def test_demo_run_no_longer_writes_the_geometric_pickles(demo_run):
+    out, _ = demo_run
+    assert not (out / "models" / "descriptor_pipeline.pkl").exists()
+    assert not (out / "models" / "scorer.pkl").exists()
 
 
 def test_frame_aggregate_schema_and_length(demo_outputs):
@@ -247,6 +253,13 @@ def test_manifest_threshold_block_is_consistent(demo_outputs):
     assert manifest["n_features"] > 0
 
 
+def test_manifest_says_scores_are_t2_and_names_the_bundle(demo_run, demo_outputs):
+    out, _ = demo_run
+    manifest = demo_outputs["manifest"]
+    assert manifest["statistic"] == "T2"
+    assert Path(manifest["reference_bundle"]) == out / "models" / "geometric.bundle"
+
+
 def test_manifest_onset_design_records_the_window_rule_arithmetic(demo_outputs):
     design = demo_outputs["manifest"]["onset_design"]
     n_frames = len(demo_outputs["agg"])
@@ -272,52 +285,68 @@ def test_manifest_onset_design_records_the_window_rule_arithmetic(demo_outputs):
 # 3. Saved models
 # ---------------------------------------------------------------------------
 
-def test_saved_models_reproduce_the_saved_scores(demo_run, demo_outputs):
-    """Loading the pickles and re-scoring the cached descriptors is exact.
+def test_saved_bundle_reproduces_the_saved_scores(demo_run, demo_outputs):
+    """Loading the bundle and re-scoring the cached descriptors is exact.
 
     This is the check that matters for anyone reusing the fitted model: the
-    artefacts on disk have to be the ones that produced the numbers on disk.
+    artefact on disk has to be the one that produced the numbers on disk.
     """
-    from detectana.descriptors import DescriptorPipeline
-    from detectana.scorer import MahalanobisScorer
+    import detectana
 
     out, _ = demo_run
-    pipe = DescriptorPipeline.load(out / "models" / "descriptor_pipeline.pkl")
-    scorer = MahalanobisScorer.load(out / "models" / "scorer.pkl")
+    bundle = detectana.load(out / "models" / "geometric.bundle")
 
     cache = np.load(demo_outputs["run_dir"] / "descriptor_cache" / "bead_00_descriptors.npz")
-    rescored = scorer.score(pipe.transform(cache["descriptors"]))
+    rescored = bundle.score_features(cache["descriptors"])["geometric"]
     np.testing.assert_array_equal(rescored, demo_outputs["bead_scores"][0])
 
     centroid_cache = np.load(
         demo_outputs["run_dir"] / "descriptor_cache" / "centroid_descriptors.npz"
     )
     np.testing.assert_array_equal(
-        scorer.score(pipe.transform(centroid_cache["descriptors"])),
+        bundle.score_features(centroid_cache["descriptors"])["geometric"],
         demo_outputs["centroid_scores"],
     )
 
 
-def test_saved_scorer_carries_both_track_thresholds(demo_run, demo_outputs):
+def test_saved_scores_are_t2_of_the_old_scorer(demo_run, demo_outputs):
+    """Same fit as before, squared: T² = distance² up to rounding."""
+    from detectana.descriptors import DescriptorPipeline, compute_descriptor_batch
+    from detectana.io import load_reference_frames
     from detectana.scorer import MahalanobisScorer
+    from detectana.topology import build_topology
+
+    _, cfg = demo_run
+    topo = build_topology(cfg["runs"][0]["initial_xyz"], nl_mult=cfg["chemistry"]["nl_mult"])
+    train, _, _ = load_reference_frames(cfg["reference"]["train"])
+    X_train = compute_descriptor_batch(train, topo)
+    pipe = DescriptorPipeline(
+        pca_variance=cfg["descriptor"]["pca_variance"], random_seed=cfg["descriptor"]["random_seed"],
+    ).fit(X_train)
+    scorer = MahalanobisScorer().fit(pipe.transform(X_train))
+    cache = np.load(demo_outputs["run_dir"] / "descriptor_cache" / "bead_00_descriptors.npz")
+    distance = scorer.score(pipe.transform(cache["descriptors"]))
+    np.testing.assert_allclose(demo_outputs["bead_scores"][0], distance**2, rtol=1e-6)
+
+
+def test_saved_bundle_carries_both_thresholds(demo_run, demo_outputs):
+    import detectana
 
     out, _ = demo_run
-    scorer = MahalanobisScorer.load(out / "models" / "scorer.pkl")
+    thresholds = detectana.load(out / "models" / "geometric.bundle").thresholds("geometric")
     manifest = demo_outputs["manifest"]
-
-    assert scorer.get_threshold("bead") == pytest.approx(manifest["bead_ood_threshold"])
-    assert scorer.get_threshold("centroid") == pytest.approx(manifest["centroid_ood_threshold"])
-    # The plain attribute still answers, and answers with the bead threshold.
-    assert scorer.threshold == pytest.approx(manifest["ood_threshold"])
+    assert thresholds["bead"] == pytest.approx(manifest["bead_ood_threshold"])
+    assert thresholds["centroid"] == pytest.approx(manifest["centroid_ood_threshold"])
+    assert manifest["ood_threshold"] == pytest.approx(thresholds["bead"])
 
 
-def test_loaded_scorer_flags_the_same_frames_as_the_aggregate_table(demo_run, demo_outputs):
-    """is_ood() on a reloaded scorer must agree with centroid_ood in the CSV."""
-    from detectana.scorer import MahalanobisScorer
+def test_loaded_bundle_flags_the_same_frames_as_the_aggregate_table(demo_run, demo_outputs):
+    """The reloaded centroid threshold must agree with centroid_ood in the CSV."""
+    import detectana
 
     out, _ = demo_run
-    scorer = MahalanobisScorer.load(out / "models" / "scorer.pkl")
-    flags = scorer.is_ood(demo_outputs["centroid_scores"], track="centroid")
+    thr = detectana.load(out / "models" / "geometric.bundle").thresholds("geometric")["centroid"]
+    flags = demo_outputs["centroid_scores"] > thr
     np.testing.assert_array_equal(flags, demo_outputs["agg"]["centroid_ood"].to_numpy())
 
 

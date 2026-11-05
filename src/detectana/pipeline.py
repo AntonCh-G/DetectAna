@@ -4,8 +4,8 @@ Step 1.  Load trajectories and metadata.
 Step 2.  Validate units, atom order, indexing.
 Step 3.  Compute hard-chemistry checks.
 Step 4.  Compute internal-coordinate fingerprints.
-Step 5.  Fit OOD statistics on training frames.
-Step 6.  Calibrate threshold on validation frames.
+Step 5.  Fit OOD statistics on training frames (a reference bundle, scored by T²).
+Step 6.  Calibrate thresholds on validation frames (percentiles of T²).
 Step 7.  Score bead and centroid frames.
 Step 8.  Aggregate bead scores per timestep.
 Step 9.  Detect persistent anomaly onset.
@@ -26,7 +26,9 @@ from joblib import Parallel, delayed
 
 from detectana import __version__
 from detectana.aggregator import add_embedding_scores, aggregate_bead_scores
-from detectana.descriptors import DescriptorPipeline, compute_descriptor_batch
+from detectana.bundle import ReferenceBundle
+from detectana.bundle import fit as fit_bundle
+from detectana.descriptors import compute_descriptor_batch
 from detectana.embedding_scorer import EmbeddingPipeline
 from detectana.io import (
     MoleculeSpec,
@@ -37,7 +39,6 @@ from detectana.io import (
     load_single_frame,
 )
 from detectana.onset import OnsetResult, detect_onset, resolve_onset_rule
-from detectana.scorer import MahalanobisScorer
 from detectana.topology import MoleculeTopology, build_topology, check_chemistry_batch  # noqa: F401
 
 log = logging.getLogger(__name__)
@@ -134,48 +135,52 @@ def run_pipeline(cfg: dict) -> None:
     train_pos, _, _ = load_reference_frames(ref_cfg["train"], spec=spec)
     valid_pos, _, _ = load_reference_frames(ref_cfg["valid"], spec=spec)
 
-    # ── Step 4–5: Descriptors + PCA fit on training data ─────────────────────
-    log.info("Computing training descriptors …")
-    X_train = compute_descriptor_batch(train_pos, topo)   # (n_train, n_feat)
-
+    # ── Step 4–6: Fit the reference bundle on training data, calibrate on valid ─
+    # One fitting path for batch and live use (ADR 0005): descriptors,
+    # standardisation, PCA and T² on the training frames; thresholds are
+    # percentiles of validation T². Scores everywhere below are T².
+    log.info("Fitting the reference bundle (descriptors, PCA, T²) on training frames …")
+    bead_percentile, centroid_percentile = resolve_threshold_percentiles(cfg["threshold"])
     desc_cfg = cfg["descriptor"]
-    pipe = DescriptorPipeline(
+    onset_cfg_global = cfg["onset"]
+    if "fraction_threshold" not in onset_cfg_global:
+        # Budget mode derives the fraction per run from its length, so the bundle
+        # has no fit-time value; it records the library default instead and the
+        # batch pipeline below always resolves its own per run.
+        log.info(
+            "onset.fraction_threshold not set (false_alarm_budget mode): the bundle "
+            "records the default 0.20; each run derives its own fraction."
+        )
+    bundle = fit_bundle(
+        train_pos, valid_pos, topo,
         pca_variance=desc_cfg["pca_variance"],
         random_seed=desc_cfg["random_seed"],
+        percentiles={"bead": bead_percentile, "centroid": centroid_percentile},
+        window_frames=onset_cfg_global["window_frames"],
+        step_frames=onset_cfg_global["step_frames"],
+        fraction_threshold=onset_cfg_global.get("fraction_threshold", 0.20),
     )
-    pipe.fit(X_train)
-    log.info("PCA: %d components explain %.1f%% variance",
-             pipe.n_components, pipe.explained_variance_ratio.sum() * 100)
-
-    # ── Step 6: Calibrate threshold on validation data ────────────────────────
-    log.info("Calibrating OOD threshold on validation set …")
-    X_val = compute_descriptor_batch(valid_pos, topo)
-    X_val_pca = pipe.transform(X_val)
-    X_train_pca = pipe.transform(X_train)
-
-    bead_percentile, centroid_percentile = resolve_threshold_percentiles(cfg["threshold"])
-    scorer = MahalanobisScorer()
-    scorer.fit(X_train_pca)
-    # Named tracks, so calibrating the centroid does not overwrite the bead
-    # threshold in the pickle that gets saved below.
-    threshold = scorer.calibrate(X_val_pca, percentile=bead_percentile, track="bead")
-    centroid_threshold = scorer.calibrate(
-        X_val_pca, percentile=centroid_percentile, track="centroid"
+    track_manifest = bundle.manifest["tracks"]["geometric"]
+    log.info(
+        "PCA: %d components explain %.1f%% variance",
+        track_manifest["n_components"], track_manifest["pca_variance_explained"] * 100,
     )
-    scorer.threshold = threshold  # keeps scorer.is_ood() bead-based by default
+    thresholds = bundle.thresholds("geometric")
+    threshold, centroid_threshold = thresholds["bead"], thresholds["centroid"]
     if centroid_percentile == bead_percentile:
-        log.info("OOD threshold (%.1f-th pct of validation): %.4f", bead_percentile, threshold)
+        log.info("OOD threshold (%.1f-th pct of validation T²): %.4f", bead_percentile, threshold)
     else:
         log.info(
-            "OOD thresholds — bead (%.1f-th pct): %.4f, centroid (%.1f-th pct): %.4f",
+            "OOD thresholds (T²) — bead (%.1f-th pct): %.4f, centroid (%.1f-th pct): %.4f",
             bead_percentile, threshold, centroid_percentile, centroid_threshold,
         )
 
-    # Save fitted objects
+    # Save the fit
     models_dir = out_root / "models"
     models_dir.mkdir(exist_ok=True)
-    pipe.save(models_dir / "descriptor_pipeline.pkl")
-    scorer.save(models_dir / "scorer.pkl")
+    bundle_path = models_dir / "geometric.bundle"
+    bundle.save(bundle_path)
+    log.info("Saved reference bundle → %s", bundle_path)
 
     # ── Embedding scorer (optional) ────────────────────────────────────────────
     emb_cfg = cfg.get("embedding", {})
@@ -204,6 +209,10 @@ def run_pipeline(cfg: dict) -> None:
     manifest_base = {
         "detectana_version": __version__,
         "config": cfg,
+        # Every score and threshold in this run is T², the squared Mahalanobis
+        # distance (geometric and embedding tracks alike).
+        "statistic": "T2",
+        "reference_bundle": str(bundle_path),
         # ood_threshold is the bead threshold; the two are equal unless the config
         # sets bead_percentile / centroid_percentile apart.
         "ood_threshold": threshold,
@@ -211,8 +220,8 @@ def run_pipeline(cfg: dict) -> None:
         "centroid_ood_threshold": centroid_threshold,
         "bead_percentile": bead_percentile,
         "centroid_percentile": centroid_percentile,
-        "pca_n_components": pipe.n_components,
-        "pca_variance_explained": float(pipe.explained_variance_ratio.sum()),
+        "pca_n_components": track_manifest["n_components"],
+        "pca_variance_explained": track_manifest["pca_variance_explained"],
         "n_features": topo.n_features,
         "molecule": {
             "n_atoms": topo.n_atoms,
@@ -232,8 +241,7 @@ def run_pipeline(cfg: dict) -> None:
             run_cfg=run_cfg,
             topo=topo,
             spec=spec,
-            pipe=pipe,
-            scorer=scorer,
+            bundle=bundle,
             threshold=threshold,
             centroid_threshold=centroid_threshold,
             bead_percentile=bead_percentile,
@@ -276,8 +284,7 @@ def _process_run(
     run_cfg: dict,
     topo: MoleculeTopology,
     spec: MoleculeSpec,
-    pipe: DescriptorPipeline,
-    scorer: MahalanobisScorer,
+    bundle: ReferenceBundle,
     threshold: float,
     centroid_threshold: float,
     bead_percentile: float,
@@ -323,8 +330,7 @@ def _process_run(
                 bead_positions=traj.bead_positions[:, bead_idx, :, :],
                 desc_cache_dir=desc_cache_dir,
                 topo=topo,
-                pipe=pipe,
-                scorer=scorer,
+                bundle=bundle,
                 chem_cfg=chem_cfg,
                 force_recompute=force_recompute,
                 run_out=run_out,
@@ -351,8 +357,7 @@ def _process_run(
         centroid_scores, centroid_steps = _score_centroid_array(
             centroid_positions=traj.centroid_positions,
             topo=topo,
-            pipe=pipe,
-            scorer=scorer,
+            bundle=bundle,
             force_recompute=force_recompute,
             cache_dir=desc_cache_dir,
         )
@@ -375,8 +380,7 @@ def _process_run(
                 desc_cache_dir=desc_cache_dir,
                 topo=topo,
                 spec=spec,
-                pipe=pipe,
-                scorer=scorer,
+                bundle=bundle,
                 chem_cfg=chem_cfg,
                 chunk_size=chunk_size,
                 stride=stride,
@@ -407,8 +411,7 @@ def _process_run(
             centroid_xyz=run_cfg["centroid_xyz"],
             topo=topo,
             spec=spec,
-            pipe=pipe,
-            scorer=scorer,
+            bundle=bundle,
             chunk_size=chunk_size,
             stride=stride,
             force_recompute=force_recompute,
@@ -540,8 +543,7 @@ def _process_bead(
     desc_cache_dir: Path,
     topo: MoleculeTopology,
     spec: MoleculeSpec,
-    pipe: DescriptorPipeline,
-    scorer: MahalanobisScorer,
+    bundle: ReferenceBundle,
     chem_cfg: dict,
     chunk_size: int,
     stride: int,
@@ -586,8 +588,7 @@ def _process_bead(
             chem_df["broken_bond"].sum(), chem_df["close_contact"].sum(),
         )
 
-    X_pca = pipe.transform(descs_all)
-    scores = scorer.score(X_pca)
+    scores = bundle.score_features(descs_all)["geometric"]
     log.info("Bead %02d scored: max=%.3f, frac_ood=%.4f",
              bead_idx, scores.max(), (scores > threshold).mean())
     return bead_idx, scores, steps_all
@@ -637,8 +638,7 @@ def _process_bead_array(
     bead_positions: np.ndarray,
     desc_cache_dir: Path,
     topo: MoleculeTopology,
-    pipe: DescriptorPipeline,
-    scorer: MahalanobisScorer,
+    bundle: ReferenceBundle,
     chem_cfg: dict,
     force_recompute: bool,
     run_out: Path,
@@ -674,8 +674,7 @@ def _process_bead_array(
             chem_df["broken_bond"].sum(), chem_df["close_contact"].sum(),
         )
 
-    X_pca = pipe.transform(descs)
-    scores = scorer.score(X_pca)
+    scores = bundle.score_features(descs)["geometric"]
     log.info("Bead %02d scored: max=%.3f, frac_ood=%.4f",
              bead_idx, scores.max(), (scores > threshold).mean())
     return bead_idx, scores, steps
@@ -684,8 +683,7 @@ def _process_bead_array(
 def _score_centroid_array(
     centroid_positions: np.ndarray,
     topo: MoleculeTopology,
-    pipe: DescriptorPipeline,
-    scorer: MahalanobisScorer,
+    bundle: ReferenceBundle,
     force_recompute: bool,
     cache_dir: Path,
 ) -> tuple[np.ndarray, np.ndarray]:
@@ -703,8 +701,7 @@ def _score_centroid_array(
         np.savez_compressed(cache_path, steps=steps, descriptors=descs)
         log.info("Cached %d frames → centroid_descriptors.npz", len(steps))
 
-    X_pca = pipe.transform(descs)
-    scores = scorer.score(X_pca)
+    scores = bundle.score_features(descs)["geometric"]
     return scores, steps
 
 
@@ -712,8 +709,7 @@ def _score_centroid(
     centroid_xyz: str,
     topo: MoleculeTopology,
     spec: MoleculeSpec,
-    pipe: DescriptorPipeline,
-    scorer: MahalanobisScorer,
+    bundle: ReferenceBundle,
     chunk_size: int,
     stride: int,
     force_recompute: bool,
@@ -730,8 +726,7 @@ def _score_centroid(
         force_recompute=force_recompute,
         bead_name="centroid",
     )
-    X_pca = pipe.transform(descs)
-    scores = scorer.score(X_pca)
+    scores = bundle.score_features(descs)["geometric"]
     return scores, steps
 
 
@@ -874,7 +869,7 @@ def _make_plots(
     ax.plot(time_ps, agg_df["bead_p95"], lw=0.5, label="bead p95", color="cornflowerblue")
     ax.axhline(threshold, color="red", ls="--", lw=1, label=f"threshold={threshold:.2f}")
     _mark_onset(ax, time_ps, onset.persistent_bead_anomaly_frame, "geo bead onset", "orange")
-    ax.set_ylabel("Mahalanobis distance")
+    ax.set_ylabel("T² (squared Mahalanobis)")
     ax.legend(fontsize=7)
     ax.set_title(f"{run_name} — geometric track")
 
@@ -893,7 +888,7 @@ def _make_plots(
             label=f"centroid threshold={centroid_threshold:.2f}",
         )
     _mark_onset(ax, time_ps, onset.centroid_anomaly_frame, "geo centroid onset", "purple")
-    ax.set_ylabel("Mahalanobis distance")
+    ax.set_ylabel("T² (squared Mahalanobis)")
     ax.legend(fontsize=7)
     if not has_emb:
         ax.set_xlabel("Time (ps)")
@@ -904,7 +899,7 @@ def _make_plots(
         ax.plot(time_ps, agg_df["emb_bead_max"], lw=0.5, label="emb bead max", color="royalblue")
         ax.plot(time_ps, agg_df["emb_bead_p95"], lw=0.5, label="emb bead p95", color="skyblue")
         _mark_onset(ax, time_ps, onset.embedding_persistent_bead_onset_frame, "emb bead onset", "orange")
-        ax.set_ylabel("Emb. Mahalanobis")
+        ax.set_ylabel("Emb. T² (max over atoms)")
         ax.legend(fontsize=7)
         ax.set_title(f"{run_name} — embedding track")
 
@@ -916,7 +911,7 @@ def _make_plots(
         ax = axes[5]
         ax.plot(time_ps, agg_df["emb_centroid_score"], lw=0.5, color="teal", label="emb centroid score")
         _mark_onset(ax, time_ps, onset.embedding_centroid_onset_frame, "emb centroid onset", "purple")
-        ax.set_ylabel("Emb. Mahalanobis")
+        ax.set_ylabel("Emb. T² (max over atoms)")
         ax.set_xlabel("Time (ps)")
         ax.legend(fontsize=7)
 

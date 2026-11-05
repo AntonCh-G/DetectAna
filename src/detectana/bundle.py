@@ -232,6 +232,7 @@ def fit(
                 "feature_names": list(topology.feature_names),
                 "n_features": int(topology.n_features),
                 "n_components": int(state["pca_components"].shape[0]),
+                "pca_variance_explained": float(np.sum(pca.explained_variance_ratio_)),
                 "parameters": {"pca_variance": float(pca_variance), "random_seed": int(random_seed)},
                 "thresholds": thresholds,
                 "state_keys": [f"{GEOMETRIC_TRACK}/{k}" for k in _STATE_ARRAYS],
