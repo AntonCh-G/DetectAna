@@ -305,7 +305,22 @@ class ReferenceBundle:
             pos = _as_frames(pos, self.n_atoms, "positions", allow_empty=True)
         except ValueError as exc:
             raise BundleError(str(exc)) from exc
-        X = compute_descriptor_batch(pos, self._topology)
+        return self.score_features(compute_descriptor_batch(pos, self._topology))
+
+    def score_features(self, features: np.ndarray) -> dict[str, np.ndarray]:
+        """T² per frame from descriptors already computed with this bundle's topology.
+
+        For callers that cache descriptors (the batch pipeline does). The columns
+        must be in ``feature_names(track)`` order; only the width is checked.
+
+        Parameters
+        ----------
+        features : (n_frames, n_features)
+        """
+        X = np.asarray(features, dtype=np.float64)
+        n_features = len(self.feature_names(GEOMETRIC_TRACK))
+        if X.ndim != 2 or X.shape[1] != n_features:
+            raise BundleError(f"features have shape {X.shape}; expected (n_frames, {n_features})")
         return {GEOMETRIC_TRACK: _t2(X, self._track_state(GEOMETRIC_TRACK))}
 
     # ── persistence ──────────────────────────────────────────────────────────

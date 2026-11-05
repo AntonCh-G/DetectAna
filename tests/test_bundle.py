@@ -392,3 +392,18 @@ def test_score_refuses_wrong_shape(bundle, reference):
 
 def test_bundle_error_is_a_value_error():
     assert issubclass(BundleError, ValueError)
+
+
+# ---------------------------------------------------------------------------
+# Precomputed descriptors (the batch pipeline caches them)
+# ---------------------------------------------------------------------------
+
+def test_score_features_equals_score(bundle, trajectory, aspirin_topo):
+    X = compute_descriptor_batch(trajectory, aspirin_topo)
+    assert np.array_equal(bundle.score_features(X)["geometric"], bundle.score(trajectory)["geometric"])
+
+
+def test_score_features_refuses_wrong_width(bundle, trajectory, aspirin_topo):
+    X = compute_descriptor_batch(trajectory, aspirin_topo)
+    with pytest.raises(BundleError, match="134"):
+        bundle.score_features(X[:, :-1])
