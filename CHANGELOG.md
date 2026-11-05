@@ -28,6 +28,9 @@ produces results that still look plausible. See
   and the test behind it; above 1 = marked.
 - `ReferenceBundle.attribute(frames, track, score)`: reconstruction-based
   contribution (RBC) per descriptor group, mapped to atoms (`detectana.attribution`).
+- `ReferenceBundle.check_chemistry(frames)`: broken bonds, close contacts and ring
+  planarity per frame against the bundle's own topology (`ChemistryFlags`, now
+  exported). `ReferenceBundle.false_flag_rate(role)`: the role's total α.
   Attribution strengths overlap and do not sum to the score.
 - `scripts/benchmark_tracks.py`: joined vs four tracks, with and without SPE, at
   one total false-alarm rate; per-group RBC as an alarm reported separately.

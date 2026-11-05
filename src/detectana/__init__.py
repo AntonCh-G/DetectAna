@@ -28,12 +28,14 @@ from detectana.bundle import (  # noqa: E402
     load,
 )
 from detectana.registry import DescriptorValues, descriptor  # noqa: E402
+from detectana.topology import ChemistryFlags  # noqa: E402
 
 __all__ = [
     "DEFAULT_TRACKS",
     "JOINED_TRACKS",
     "Attribution",
     "BundleError",
+    "ChemistryFlags",
     "DescriptorValues",
     "Exceedance",
     "FrameCheck",

@@ -61,7 +61,7 @@ from detectana.registry import (
     resolve_descriptor,
 )
 from detectana.scorer import MahalanobisScorer
-from detectana.topology import MoleculeTopology, complete_topology
+from detectana.topology import ChemistryFlags, MoleculeTopology, check_chemistry_batch, complete_topology
 
 BUNDLE_FORMAT = "detectana-reference-bundle"
 #: Bumped whenever the manifest layout or the meaning of a stored value changes.
@@ -472,6 +472,13 @@ class ReferenceBundle:
             for score, info in self._track(track)["scores"].items() if info["active"]
         }
 
+    def false_flag_rate(self, role: str) -> float:
+        """α of ``role``: the fraction of in-distribution frames it marks, over all active tests."""
+        roles = self._manifest["budget"]["roles"]
+        if role not in roles:
+            raise KeyError(f"unknown threshold role {role!r}; bundle has {', '.join(roles)}")
+        return float(roles[role]["alpha"])
+
     @property
     def onset_rule(self) -> WindowRule:
         return WindowRule(**self._manifest["onset_rule"])
@@ -518,6 +525,29 @@ class ReferenceBundle:
         if not np.all(np.isfinite(pos)):
             raise BundleError("positions contain NaN or infinity")
         return _frame_check(pos, self.reference_positions, self.elements, self._topology.bonds)
+
+    def check_chemistry(
+        self,
+        positions: np.ndarray,
+        *,
+        bond_break_cutoff: float = 2.0,
+        close_contact_cutoff: float = 1.2,
+        length_unit: str = "angstrom",
+    ) -> list[ChemistryFlags]:
+        """Hard-chemistry checks per frame against the bundle's topology.
+
+        Broken bonds (longer than ``bond_break_cutoff`` Å), close non-bonded
+        contacts (shorter than ``close_contact_cutoff`` Å) and the ring's
+        planarity RMSD. A separate signal from the OOD scores: a chemistry flag
+        is a claim about the geometry, not about the training data.
+
+        Parameters
+        ----------
+        positions : (n_frames, n_atoms, 3), or (n_atoms, 3) for one frame, in the
+            bundle's atom order.
+        """
+        pos = self._frames(positions, length_unit)
+        return check_chemistry_batch(pos, self._topology, bond_break_cutoff, close_contact_cutoff)
 
     def compute_features(self, positions: np.ndarray, *, length_unit: str = "angstrom") -> np.ndarray:
         """Every descriptor's numbers, (n_frames, len(all_feature_names)).
