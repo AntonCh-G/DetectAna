@@ -1,4 +1,4 @@
-"""Tests for named threshold tracks on ``MahalanobisScorer``.
+"""Tests for named threshold roles on ``MahalanobisScorer``.
 
 Calibrating used to overwrite one mutable ``self.threshold``, so a run that
 calibrated a bead threshold and then a centroid threshold saved a pickle holding
@@ -24,39 +24,39 @@ def fitted_scorer():
     return MahalanobisScorer().fit(X), X
 
 
-def test_calibrating_a_second_track_leaves_the_first_alone(fitted_scorer):
+def test_calibrating_a_second_role_leaves_the_first_alone(fitted_scorer):
     scorer, X = fitted_scorer
-    bead = scorer.calibrate(X, percentile=99.0, track="bead")
-    centroid = scorer.calibrate(X, percentile=85.0, track="centroid")
+    bead = scorer.calibrate(X, percentile=99.0, role="bead")
+    centroid = scorer.calibrate(X, percentile=85.0, role="centroid")
 
     assert bead > centroid
     assert scorer.get_threshold("bead") == bead
     assert scorer.get_threshold("centroid") == centroid
 
 
-def test_is_ood_uses_the_track_it_is_asked_for(fitted_scorer):
+def test_is_ood_uses_the_role_it_is_asked_for(fitted_scorer):
     scorer, X = fitted_scorer
-    scorer.calibrate(X, percentile=99.0, track="bead")
-    scorer.calibrate(X, percentile=50.0, track="centroid")
+    scorer.calibrate(X, percentile=99.0, role="bead")
+    scorer.calibrate(X, percentile=50.0, role="centroid")
     scores = scorer.score(X)
 
-    strict = scorer.is_ood(scores, track="bead")
-    loose = scorer.is_ood(scores, track="centroid")
+    strict = scorer.is_ood(scores, role="bead")
+    loose = scorer.is_ood(scores, role="centroid")
     assert strict.sum() < loose.sum()
     np.testing.assert_array_equal(strict, scores > scorer.get_threshold("bead"))
 
 
-def test_an_uncalibrated_track_is_an_error_not_a_default(fitted_scorer):
+def test_an_uncalibrated_role_is_an_error_not_a_default(fitted_scorer):
     scorer, X = fitted_scorer
-    scorer.calibrate(X, percentile=99.0, track="bead")
+    scorer.calibrate(X, percentile=99.0, role="bead")
     with pytest.raises(RuntimeError, match="centroid"):
-        scorer.is_ood(scorer.score(X), track="centroid")
+        scorer.is_ood(scorer.score(X), role="centroid")
 
 
-def test_saving_keeps_every_track(fitted_scorer, tmp_path):
+def test_saving_keeps_every_role(fitted_scorer, tmp_path):
     scorer, X = fitted_scorer
-    bead = scorer.calibrate(X, percentile=99.0, track="bead")
-    centroid = scorer.calibrate(X, percentile=85.0, track="centroid")
+    bead = scorer.calibrate(X, percentile=99.0, role="bead")
+    centroid = scorer.calibrate(X, percentile=85.0, role="centroid")
 
     path = tmp_path / "scorer.pkl"
     scorer.save(path)
@@ -67,7 +67,7 @@ def test_saving_keeps_every_track(fitted_scorer, tmp_path):
     np.testing.assert_array_equal(loaded.score(X), scorer.score(X))
 
 
-def test_the_default_track_still_reads_as_a_plain_attribute(fitted_scorer, tmp_path):
+def test_the_default_role_still_reads_as_a_plain_attribute(fitted_scorer, tmp_path):
     scorer, X = fitted_scorer
     threshold = scorer.calibrate(X, percentile=99.0)
     assert scorer.threshold == threshold
@@ -142,3 +142,12 @@ def test_score_t2_is_the_squared_distance(fitted_scorer):
     assert t2.shape == (len(X),)
     assert np.all(t2 >= 0.0)
     np.testing.assert_allclose(np.sqrt(t2), scorer.score(X), rtol=1e-12)
+
+
+def test_track_keyword_is_gone(fitted_scorer):
+    """ADR 0006: bead/centroid are threshold roles, not tracks; no alias is kept."""
+    scorer, X = fitted_scorer
+    with pytest.raises(TypeError):
+        scorer.calibrate(X, percentile=99.0, track="bead")  # type: ignore[call-arg]
+    with pytest.raises(TypeError):
+        scorer.is_ood(scorer.score(X), track="bead")  # type: ignore[call-arg]
