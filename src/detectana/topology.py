@@ -248,9 +248,10 @@ def build_topology(
     )
 
     # ── Precomputed numpy index arrays for vectorised descriptors ─────────────
-    topo.bond_idx = np.array(topo.bonds, dtype=np.int32)            # (n_bonds, 2)
-    topo.angle_idx = np.array(topo.angles, dtype=np.int32)          # (n_angles, 3)
-    topo.dihedral_idx = np.array(topo.dihedrals, dtype=np.int32)    # (n_dihedrals, 4)
+    # reshape keeps an empty list 2-d (a diatomic has no angles or dihedrals).
+    topo.bond_idx = np.array(topo.bonds, dtype=np.int32).reshape(-1, 2)          # (n_bonds, 2)
+    topo.angle_idx = np.array(topo.angles, dtype=np.int32).reshape(-1, 3)        # (n_angles, 3)
+    topo.dihedral_idx = np.array(topo.dihedrals, dtype=np.int32).reshape(-1, 4)  # (n_dihedrals, 4)
     topo.ring_idx = (
         np.array(topo.ring_atoms, dtype=np.int32) if topo.ring_atoms else None
     )

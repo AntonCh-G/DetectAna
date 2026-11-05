@@ -205,3 +205,24 @@ def test_build_topology_from_atoms_equals_from_path(initial_xyz):
     assert from_atoms.ring_atoms == from_path.ring_atoms
     assert from_atoms.atom_types == from_path.atom_types
     assert from_atoms.feature_names == from_path.feature_names
+
+
+def test_diatomic_has_a_one_feature_descriptor():
+    """A molecule with no angles or dihedrals (one bond) gives one descriptor column.
+
+    The empty angle and dihedral index arrays used to be 1-d, which broke the
+    vectorised descriptor.
+    """
+    import numpy as np
+    from ase import Atoms
+
+    from detectana.descriptors import compute_descriptor_batch
+    from detectana.topology import build_topology
+
+    h2 = Atoms("H2", positions=[[0.0, 0.0, 0.0], [0.74, 0.0, 0.0]])
+    topo = build_topology(h2)
+    assert topo.n_features == 1
+    frames = np.stack([h2.positions, h2.positions * 1.1])
+    X = compute_descriptor_batch(frames, topo)
+    assert X.shape == (2, 1)
+    np.testing.assert_allclose(X[:, 0], [0.74, 0.814])
