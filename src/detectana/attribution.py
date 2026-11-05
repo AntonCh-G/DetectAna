@@ -22,6 +22,7 @@ numpy only.
 from __future__ import annotations
 
 from collections.abc import Sequence
+from dataclasses import dataclass
 
 import numpy as np
 
@@ -74,3 +75,47 @@ def atom_strength(
         idx = list(atoms)
         out[:, idx] = np.maximum(out[:, idx], S[:, [g]])
     return out[0] if single else out
+
+
+@dataclass(frozen=True)
+class GroupStrength:
+    """One descriptor group's attribution strength for one frame."""
+
+    group_id: str
+    atoms: tuple[int, ...]
+    size: int
+    strength: float
+
+
+@dataclass(frozen=True)
+class Attribution:
+    """RBC of every descriptor group of one track's score, for a batch of frames.
+
+    Attribution strengths overlap and do not sum to the score; never present
+    them as shares. A larger group (``group_sizes``) tends to show a larger
+    strength, so compare groups of similar size.
+
+    values : (n,) the score itself (T² or SPE)
+    thresholds : the score's thresholds by role
+    strength : (n, G) RBC per group
+    atom_strength : (n, n_atoms) per atom, the largest strength of a group involving it
+    """
+
+    track: str
+    score: str
+    values: np.ndarray
+    thresholds: dict[str, float]
+    group_ids: tuple[str, ...]
+    group_atoms: tuple[tuple[int, ...], ...]
+    group_sizes: tuple[int, ...]
+    strength: np.ndarray
+    atom_strength: np.ndarray
+
+    def top(self, frame: int = 0, k: int = 5) -> list[GroupStrength]:
+        """The ``k`` strongest groups of one frame, strongest first."""
+        row = self.strength[frame]
+        order = np.argsort(row, kind="stable")[::-1][:k]
+        return [
+            GroupStrength(self.group_ids[g], self.group_atoms[g], self.group_sizes[g], float(row[g]))
+            for g in order
+        ]

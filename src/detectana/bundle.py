@@ -50,6 +50,7 @@ from scipy.optimize import linear_sum_assignment
 from scipy.spatial.distance import cdist
 
 from detectana import __version__
+from detectana.attribution import Attribution, atom_strength, quadratic_score, reconstruction_contributions
 from detectana.descriptors import DescriptorPipeline
 from detectana.onset import WindowRule
 from detectana.registry import (
@@ -584,6 +585,51 @@ class ReferenceBundle:
         ])
         best = np.argmax(ratios, axis=0)
         return Exceedance(role, ratios[best, np.arange(ratios.shape[1])], tuple(tests[i] for i in best))
+
+    def attribute(
+        self, positions: np.ndarray, track: str, score: str = "T2", *, length_unit: str = "angstrom",
+    ) -> Attribution:
+        """Attribution strength (RBC) of each descriptor group of ``track``'s ``score``.
+
+        For each group, how much the score would drop if that group's numbers
+        were reconstructed to the values the model expects given the rest; a
+        dihedral's sin and cos are reconstructed together. Values overlap and do
+        not sum to the score (ADR 0007). Mapped to atoms by ``atom_strength``.
+
+        Raises ``BundleError`` if ``score`` is inactive for ``track``.
+        """
+        info = self._track(track)
+        if not info["scores"].get(score, {}).get("active"):
+            raise BundleError(f"track {track!r}: {score} is inactive or was not fitted")
+        X = self.compute_features(positions, length_unit=length_unit)[:, self._columns(track)]
+        state = self._track_state(track)
+        P = state["pca_components"]
+        # Shift so zᵀ M_T2 z is exactly the stored T² (the fitted mean of the PCA
+        # scores is ~0, not 0); SPE is unchanged by the shift.
+        z = _standardised(X, state) - state["t2_mean"] @ P
+        if score == "T2":
+            M = P.T @ state["t2_inv_cov"] @ P
+        else:
+            M = np.eye(P.shape[1]) - P.T @ P
+        groups: dict[str, list[int]] = {}
+        for col, g in enumerate(info["feature_groups"]):
+            groups.setdefault(g, []).append(col)
+        cols = list(groups.values())
+        atoms = tuple(
+            tuple(dict.fromkeys(a for c in cs for a in info["feature_atoms"][c])) for cs in cols
+        )
+        strength = reconstruction_contributions(z, M, cols)
+        return Attribution(
+            track=track,
+            score=score,
+            values=np.maximum(np.asarray(quadratic_score(z, M)), 0.0),
+            thresholds=self.thresholds(track)[score],
+            group_ids=tuple(groups),
+            group_atoms=atoms,
+            group_sizes=tuple(len(cs) for cs in cols),
+            strength=strength,
+            atom_strength=atom_strength(strength, atoms, self.n_atoms),
+        )
 
     # ── persistence ──────────────────────────────────────────────────────────
     def save(self, path: str | Path) -> None:
