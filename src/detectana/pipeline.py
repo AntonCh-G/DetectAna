@@ -638,24 +638,31 @@ def _process_run(
         )
         onset.first_anomaly_bead_idx = int(np.argmin(first_ood_frame))
 
-    # What drove the centroid at each onset frame (RBC of its top test).
+    # What drove each alarm (RBC of the centroid's top test). An onset frame is
+    # the start of the first window that fired and may itself be unmarked, and
+    # the first marked frame may be a stray one, so the explanation is of the
+    # most exceeded centroid frame within that window.
+    window = int(onset_cfg["window_frames"])
     onset_frames = {
         kind: getattr(onset, f"{kind}_frame")
         for kind in ("first_bead_anomaly", "persistent_bead_anomaly", "centroid_anomaly", "collective_anomaly")
         if getattr(onset, f"{kind}_frame") is not None
     }
+    explained_frame = {}
+    for kind, start in onset_frames.items():
+        explained_frame[kind] = start + int(np.argmax(centroid_scores[start:start + window]))
     explained = _top_groups(
-        bundle, centroid_descs, keys, centroid_top, np.array(sorted(set(onset_frames.values())), dtype=int), k=5,
+        bundle, centroid_descs, keys, centroid_top, np.array(sorted(set(explained_frame.values())), dtype=int), k=5,
     )
+    att_columns = ["onset", "onset_frame", "frame", "step", "test", "rank", "group", "atoms", "size", "strength"]
     att_rows = [
-        {"onset": kind, "frame": frame, "step": int(step_arrays[frame]), "test": keys[centroid_top[frame]],
-         "rank": rank, "group": g.group_id, "atoms": "-".join(map(str, g.atoms)), "size": g.size,
-         "strength": g.strength}
-        for kind, frame in onset_frames.items()
+        {"onset": kind, "onset_frame": onset_frames[kind], "frame": frame, "step": int(step_arrays[frame]),
+         "test": keys[centroid_top[frame]], "rank": rank, "group": g.group_id,
+         "atoms": "-".join(map(str, g.atoms)), "size": g.size, "strength": g.strength}
+        for kind, frame in explained_frame.items()
         for rank, g in enumerate(explained[frame], start=1)
     ]
-    pd.DataFrame(att_rows, columns=["onset", "frame", "step", "test", "rank", "group", "atoms", "size",
-                                    "strength"]).to_csv(run_out / "onset_attribution.csv", index=False)
+    pd.DataFrame(att_rows, columns=att_columns).to_csv(run_out / "onset_attribution.csv", index=False)
 
     # ── Step 10: Plots ────────────────────────────────────────────────────────
     try:

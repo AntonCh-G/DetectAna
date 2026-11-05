@@ -728,13 +728,25 @@ def test_marked_centroid_frames_name_their_top_groups(demo_run, demo_outputs):
         assert agg["centroid_top_atoms"].iloc[i] == "-".join(map(str, top[0].atoms))
 
 
-def test_onset_attribution_explains_each_onset_frame(demo_outputs):
+def test_onset_attribution_explains_the_most_exceeded_frame_of_each_alarm_window(demo_run, demo_outputs):
+    """An onset frame is a window start and may itself be unmarked, and the
+    first marked frame may be stray; the explanation is of the centroid frame
+    with the largest exceedance in the window."""
+    _, cfg = demo_run
+    window = cfg["onset"]["window_frames"]
     att = pd.read_csv(demo_outputs["run_dir"] / "onset_attribution.csv")
     onset = demo_outputs["onset"].iloc[0]
-    assert list(att.columns) == ["onset", "frame", "step", "test", "rank", "group", "atoms", "size", "strength"]
+    signal = demo_outputs["centroid_scores"]
+    steps = demo_outputs["agg"]["step"].to_numpy()
+    assert list(att.columns) == ["onset", "onset_frame", "frame", "step", "test", "rank", "group", "atoms",
+                                 "size", "strength"]
+    assert len(att)
     for kind in att["onset"].unique():
         rows = att[att["onset"] == kind]
-        assert rows["frame"].nunique() == 1
-        assert int(rows["frame"].iloc[0]) == int(onset[f"{kind}_frame"])
+        start = int(onset[f"{kind}_frame"])
+        assert (rows["onset_frame"] == start).all()
+        expected = start + int(np.argmax(signal[start:start + window]))
+        assert (rows["frame"] == expected).all()
+        assert (rows["step"] == steps[expected]).all()
         assert list(rows["rank"]) == list(range(1, len(rows) + 1))
         assert rows["strength"].is_monotonic_decreasing

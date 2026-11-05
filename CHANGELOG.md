@@ -74,7 +74,9 @@ produces results that still look plausible. See
   test and role, and the budget (the scalar `ood_threshold` keys are gone).
 - `frame_aggregate.csv` adds the top test, per-test centroid scores, and for
   marked centroid frames the three strongest descriptor groups (RBC); a new
-  `onset_attribution.csv` explains each onset frame.
+  `onset_attribution.csv` explains each alarm by the most exceeded centroid
+  frame in the window that fired (`onset_frame` is the window start, `frame` the
+  frame explained).
 - `extract_onset_frames.py --threshold` is in the run's score units: exceedance
   for current runs, T² for runs written before tracks.
 - `MahalanobisScorer`: `track=` is renamed `role=` (threshold role), and
