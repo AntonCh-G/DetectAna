@@ -102,6 +102,13 @@ def run_pipeline(cfg: dict) -> None:
     ----------
     cfg : dict loaded from YAML config (see config/example.yaml).
     """
+    unsupported = [key for key in ("tracks", "scores") if key in cfg]
+    if unsupported:
+        raise ValueError(
+            f"config sets {', '.join(unsupported)}: the batch pipeline scores one joined "
+            "track by T² only until multi-track scoring reaches it (step 3b). Remove the "
+            "key(s), or use detectana.fit / scripts/benchmark_tracks.py for tracks and SPE."
+        )
     out_root = Path(cfg["io"]["output_dir"])
     out_root.mkdir(parents=True, exist_ok=True)
 

@@ -623,3 +623,17 @@ def test_plot_failure_does_not_lose_the_results(demo_config_template, tmp_path, 
 
     assert (out / "demo" / "onset_table.csv").exists()
     assert not (out / "demo" / "plots" / "score_vs_time.png").exists()
+
+
+@pytest.mark.parametrize("key, value", [
+    ("tracks", {"bonds": ["bonds"]}),
+    ("scores", ["T2", "SPE"]),
+])
+def test_pipeline_refuses_track_settings_it_cannot_honour_yet(demo_config, key, value):
+    """The batch pipeline scores one joined track by T² until step 3b; a config
+    asking for tracks or SPE is refused, not silently ignored."""
+    from detectana.pipeline import run_pipeline
+
+    demo_config[key] = value
+    with pytest.raises(ValueError, match="step 3b"):
+        run_pipeline(demo_config)
