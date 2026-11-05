@@ -10,7 +10,7 @@ import pytest
 from ase import Atoms
 
 import detectana
-from detectana.bundle import BUNDLE_FORMAT_VERSION, ReferenceBundle, fit, load
+from detectana.bundle import BUNDLE_FORMAT_VERSION, BundleError, ReferenceBundle, fit, load
 from detectana.descriptors import DescriptorPipeline, compute_descriptor_batch
 from detectana.io import load_reference_frames
 from detectana.scorer import MahalanobisScorer
@@ -214,3 +214,181 @@ def test_fit_refuses_unknown_length_unit(reference, aspirin_topo):
     train, valid = reference
     with pytest.raises(ValueError, match="bohr"):
         fit(train, valid, aspirin_topo, length_unit="bohr")
+
+
+# ---------------------------------------------------------------------------
+# Refusals: the bundle does not score what it cannot vouch for
+# ---------------------------------------------------------------------------
+
+def _saved(bundle, tmp_path):
+    path = tmp_path / "aspirin.bundle"
+    bundle.save(path)
+    return path
+
+
+def _edit_manifest(path, edit):
+    manifest = json.loads((path / "manifest.json").read_text())
+    edit(manifest)
+    (path / "manifest.json").write_text(json.dumps(manifest))
+
+
+@pytest.mark.parametrize("version", [0, BUNDLE_FORMAT_VERSION + 1])
+def test_load_refuses_another_format_version(bundle, tmp_path, version):
+    path = _saved(bundle, tmp_path)
+    _edit_manifest(path, lambda m: m.update(format_version=version))
+    with pytest.raises(BundleError, match="format version"):
+        load(path)
+
+
+def test_load_refuses_a_file_that_is_not_a_bundle(bundle, tmp_path):
+    path = _saved(bundle, tmp_path)
+    _edit_manifest(path, lambda m: m.update(format="something-else"))
+    with pytest.raises(BundleError, match="not a DetectAna reference bundle"):
+        load(path)
+
+
+def test_load_refuses_distance_based_results(bundle, tmp_path):
+    """Old √T² values and new T² values are never mixed (issue 03)."""
+    path = _saved(bundle, tmp_path)
+    _edit_manifest(path, lambda m: m.update(statistic="distance"))
+    with pytest.raises(BundleError, match="statistic"):
+        load(path)
+
+
+def test_load_refuses_changed_descriptor_code(bundle, tmp_path):
+    path = _saved(bundle, tmp_path)
+
+    def edit(m):
+        m["tracks"]["geometric"]["descriptor"]["code_sha256"] = "0" * 64
+    _edit_manifest(path, edit)
+    with pytest.raises(BundleError, match="descriptor code"):
+        load(path)
+
+
+def test_load_refuses_when_installed_descriptor_code_changed(bundle, tmp_path, monkeypatch):
+    path = _saved(bundle, tmp_path)
+    monkeypatch.setattr("detectana.bundle.descriptor_code_hash", lambda: "f" * 64)
+    with pytest.raises(BundleError, match="descriptor code"):
+        load(path)
+
+
+def test_load_refuses_unknown_descriptor(bundle, tmp_path):
+    path = _saved(bundle, tmp_path)
+
+    def edit(m):
+        m["tracks"]["geometric"]["descriptor"]["name"] = "soap"
+    _edit_manifest(path, edit)
+    with pytest.raises(BundleError, match="soap"):
+        load(path)
+
+
+@pytest.mark.parametrize("units", [
+    {"length": "bohr", "angle": "radian"},
+    {"length": "angstrom", "angle": "degree"},
+    {"length": "angstrom"},
+])
+def test_load_refuses_other_units(bundle, tmp_path, units):
+    path = _saved(bundle, tmp_path)
+    _edit_manifest(path, lambda m: m.update(units=units))
+    with pytest.raises(BundleError, match="unit"):
+        load(path)
+
+
+def test_load_refuses_elements_that_do_not_match_atom_count(bundle, tmp_path):
+    path = _saved(bundle, tmp_path)
+    _edit_manifest(path, lambda m: m["molecule"]["elements"].pop())
+    with pytest.raises(BundleError, match="elements"):
+        load(path)
+
+
+def test_load_refuses_feature_names_that_do_not_match_topology(bundle, tmp_path):
+    path = _saved(bundle, tmp_path)
+    _edit_manifest(path, lambda m: m["tracks"]["geometric"]["feature_names"].pop())
+    with pytest.raises(BundleError, match="feature"):
+        load(path)
+
+
+def test_load_refuses_atom_index_out_of_range(bundle, tmp_path):
+    path = _saved(bundle, tmp_path)
+    _edit_manifest(path, lambda m: m["molecule"]["topology"]["bonds"].append([0, 21]))
+    with pytest.raises(BundleError, match="atom index"):
+        load(path)
+
+
+def test_load_refuses_missing_state_array(bundle, tmp_path):
+    path = _saved(bundle, tmp_path)
+    with np.load(path / "state.npz") as npz:
+        state = {k: npz[k] for k in npz.files if not k.endswith("t2_inv_cov")}
+    np.savez(path / "state.npz", **state)
+    with pytest.raises(BundleError, match="t2_inv_cov"):
+        load(path)
+
+
+def test_load_refuses_state_of_the_wrong_shape(bundle, tmp_path):
+    path = _saved(bundle, tmp_path)
+    with np.load(path / "state.npz") as npz:
+        state = {k: npz[k] for k in npz.files}
+    state["geometric/pca_components"] = state["geometric/pca_components"][:, :-1]
+    np.savez(path / "state.npz", **state)
+    with pytest.raises(BundleError, match="shape"):
+        load(path)
+
+
+def test_load_refuses_a_missing_file(bundle, tmp_path):
+    path = _saved(bundle, tmp_path)
+    (path / "state.npz").unlink()
+    with pytest.raises(BundleError, match="state.npz"):
+        load(path)
+
+
+def test_load_refuses_unreadable_manifest(bundle, tmp_path):
+    path = _saved(bundle, tmp_path)
+    (path / "manifest.json").write_text("{not json")
+    with pytest.raises(BundleError, match="manifest"):
+        load(path)
+
+
+# ── frames ──────────────────────────────────────────────────────────────────
+
+def test_validate_frame_accepts_the_reference_order(bundle, reference):
+    bundle.validate_frame(bundle.elements, reference[0][0])
+
+
+def test_validate_frame_refuses_swapped_atoms(bundle, reference):
+    elements = list(bundle.elements)
+    i = elements.index("C")
+    j = elements.index("H")
+    elements[i], elements[j] = elements[j], elements[i]
+    with pytest.raises(BundleError, match="atom order"):
+        bundle.validate_frame(elements, reference[0][0])
+
+
+def test_validate_frame_refuses_wrong_atom_count(bundle, reference):
+    with pytest.raises(BundleError, match="atoms"):
+        bundle.validate_frame(bundle.elements[:-1], reference[0][0][:-1])
+
+
+def test_validate_frame_refuses_wrong_unit(bundle, reference):
+    with pytest.raises(BundleError, match="bohr"):
+        bundle.validate_frame(bundle.elements, reference[0][0], length_unit="bohr")
+
+
+def test_validate_frame_refuses_non_finite_positions(bundle, reference):
+    pos = reference[0][0].copy()
+    pos[4, 1] = np.nan
+    with pytest.raises(BundleError, match="NaN"):
+        bundle.validate_frame(bundle.elements, pos)
+
+
+def test_score_refuses_wrong_unit(bundle, reference):
+    with pytest.raises(BundleError, match="bohr"):
+        bundle.score(reference[0], length_unit="bohr")
+
+
+def test_score_refuses_wrong_shape(bundle, reference):
+    with pytest.raises(BundleError, match="atoms"):
+        bundle.score(reference[0][:, :20])
+
+
+def test_bundle_error_is_a_value_error():
+    assert issubclass(BundleError, ValueError)

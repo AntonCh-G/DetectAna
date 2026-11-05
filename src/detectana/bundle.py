@@ -320,11 +320,27 @@ class ReferenceBundle:
 
     @classmethod
     def load(cls, path: str | Path) -> ReferenceBundle:
-        """Read a bundle directory written by ``save``."""
+        """Read a bundle directory written by ``save``.
+
+        Raises ``BundleError`` when the bundle cannot be trusted with this
+        installation: another format version or statistic, descriptor code that
+        changed since the fit, unsupported units, or a manifest and fitted
+        arrays that do not agree with each other.
+        """
         path = Path(path)
-        manifest = json.loads((path / MANIFEST_FILE).read_text())
-        with np.load(path / STATE_FILE, allow_pickle=False) as npz:
-            state = {k: npz[k] for k in npz.files}
+        for name in (MANIFEST_FILE, STATE_FILE):
+            if not (path / name).is_file():
+                raise BundleError(f"{path}: missing {name}; not a saved reference bundle")
+        try:
+            manifest = json.loads((path / MANIFEST_FILE).read_text())
+        except (json.JSONDecodeError, UnicodeDecodeError) as exc:
+            raise BundleError(f"{path / MANIFEST_FILE}: unreadable manifest ({exc})") from exc
+        try:
+            with np.load(path / STATE_FILE, allow_pickle=False) as npz:
+                state = {k: npz[k] for k in npz.files}
+        except (OSError, ValueError) as exc:
+            raise BundleError(f"{path / STATE_FILE}: unreadable fitted state ({exc})") from exc
+        _check_bundle(manifest, state)
         return cls(manifest, state)
 
     # ── internals ────────────────────────────────────────────────────────────
@@ -380,6 +396,91 @@ def _check_length_unit(length_unit: str) -> None:
         )
 
 
+def _check_bundle(manifest: Any, state: Mapping[str, np.ndarray]) -> None:
+    """Refuse a manifest + state this installation cannot score faithfully."""
+    if not isinstance(manifest, dict) or manifest.get("format") != BUNDLE_FORMAT:
+        raise BundleError("manifest: not a DetectAna reference bundle")
+    version = manifest.get("format_version")
+    if version != BUNDLE_FORMAT_VERSION:
+        raise BundleError(
+            f"bundle format version {version!r}; this DetectAna "
+            f"({__version__}) reads format version {BUNDLE_FORMAT_VERSION} only. Refit the bundle."
+        )
+    if manifest.get("statistic") != "T2":
+        raise BundleError(f"bundle statistic {manifest.get('statistic')!r}; expected 'T2'")
+
+    units = manifest.get("units")
+    if units != UNITS:
+        raise BundleError(f"bundle units {units!r}; supported unit set is {UNITS!r}")
+
+    try:
+        mol = manifest["molecule"]
+        n_atoms = int(mol["n_atoms"])
+        elements = list(mol["elements"])
+        topo_dict = mol["topology"]
+        tracks = manifest["tracks"]
+        WindowRule(**manifest["onset_rule"])
+    except (KeyError, TypeError, ValueError) as exc:
+        raise BundleError(f"manifest: missing or invalid field ({exc})") from exc
+
+    if len(elements) != n_atoms:
+        raise BundleError(f"manifest: {len(elements)} elements for {n_atoms} atoms")
+    for key in ("bonds", "angles", "dihedrals"):
+        for group in topo_dict.get(key, []):
+            if any(not 0 <= int(i) < n_atoms for i in group):
+                raise BundleError(f"manifest: {key} entry {group} has an atom index outside 0..{n_atoms - 1}")
+    if any(not 0 <= int(i) < n_atoms for i in topo_dict.get("ring_atoms", [])):
+        raise BundleError(f"manifest: ring_atoms has an atom index outside 0..{n_atoms - 1}")
+
+    if set(tracks) != {GEOMETRIC_TRACK}:
+        raise BundleError(f"manifest: tracks {sorted(tracks)}; this DetectAna knows only {GEOMETRIC_TRACK!r}")
+    track = tracks[GEOMETRIC_TRACK]
+    descriptor = track.get("descriptor", {})
+    if descriptor.get("name") != DESCRIPTOR_NAME:
+        raise BundleError(f"track {GEOMETRIC_TRACK!r}: unknown descriptor {descriptor.get('name')!r}")
+    if descriptor.get("code_sha256") != descriptor_code_hash():
+        raise BundleError(
+            f"track {GEOMETRIC_TRACK!r}: descriptor code differs from the code that fitted "
+            f"this bundle (fitted with DetectAna {manifest.get('detectana_version')}, "
+            f"installed {__version__}). Refit the bundle."
+        )
+
+    try:
+        topo = _topology_from_manifest(manifest)
+    except BundleError:
+        raise
+    except (KeyError, TypeError, ValueError, IndexError) as exc:
+        raise BundleError(f"manifest: invalid topology ({exc})") from exc
+    n_features = len(track.get("feature_names", []))
+    if n_features != topo.n_features or track.get("n_features") != topo.n_features:
+        raise BundleError(
+            f"track {GEOMETRIC_TRACK!r}: {n_features} feature names, the topology gives {topo.n_features}"
+        )
+
+    expected_keys = [f"{GEOMETRIC_TRACK}/{k}" for k in _STATE_ARRAYS]
+    missing = [k for k in expected_keys if k not in state]
+    if missing or track.get("state_keys") != expected_keys:
+        raise BundleError(f"fitted state: missing arrays {missing or track.get('state_keys')}")
+    n_comp = int(track.get("n_components", -1))
+    shapes = {
+        "scaler_mean": (n_features,),
+        "scaler_scale": (n_features,),
+        "pca_mean": (n_features,),
+        "pca_components": (n_comp, n_features),
+        "t2_mean": (n_comp,),
+        "t2_inv_cov": (n_comp, n_comp),
+    }
+    for key, shape in shapes.items():
+        arr = state[f"{GEOMETRIC_TRACK}/{key}"]
+        if arr.shape != shape:
+            raise BundleError(f"fitted state: {key} has shape {arr.shape}, manifest implies {shape}")
+        if arr.dtype.kind != "f" or not np.all(np.isfinite(arr)):
+            raise BundleError(f"fitted state: {key} is not a finite float array")
+    for name, t in track.get("thresholds", {}).items():
+        if not np.isfinite(float(t.get("value", np.nan))):
+            raise BundleError(f"track {GEOMETRIC_TRACK!r}: threshold {name!r} is not a finite number")
+
+
 def _topology_from_manifest(manifest: Mapping[str, Any]) -> MoleculeTopology:
     """Rebuild the topology the descriptor needs from the manifest alone."""
     mol = manifest["molecule"]
@@ -393,6 +494,10 @@ def _topology_from_manifest(manifest: Mapping[str, Any]) -> MoleculeTopology:
         atom_types=list(mol["elements"]),
     )
     names = list(manifest["tracks"][GEOMETRIC_TRACK]["feature_names"])
+    if len(names) != topo.n_features:
+        raise BundleError(
+            f"track {GEOMETRIC_TRACK!r}: {len(names)} feature names, the topology gives {topo.n_features}"
+        )
     nb, na, nd = topo.n_bond_features, topo.n_angle_features, topo.n_dihedral_features
     topo.bond_names = names[:nb]
     topo.angle_names = names[nb:nb + na]
