@@ -91,3 +91,77 @@ def test_user_hash_covers_the_whole_module_file(user_module):
     assert before == reg.code_hash()
     path.write_text(textwrap.dedent(USER_MODULE.format(name=name, scale=2.0)))
     assert reg.code_hash() != before
+
+
+# ---------------------------------------------------------------------------
+# A bundle that uses a user descriptor
+# ---------------------------------------------------------------------------
+
+@pytest.fixture
+def user_bundle(user_module, topo, train_positions, tmp_path):
+    from detectana.bundle import fit
+
+    module, name, path = user_module
+    b = fit(train_positions[:64], train_positions[64:], topo,
+            tracks={"bonds": ["bonds"], "pair": [f"{module}:pair_distance"]},
+            percentiles={"bead": 80.0})
+    saved = tmp_path / "user.bundle"
+    b.save(saved)
+    return b, saved, module, path
+
+
+def test_bundle_records_the_user_descriptor(user_bundle):
+    b, _, module, _ = user_bundle
+    d = b.manifest["descriptors"][b.descriptors("pair")[0]]
+    assert d["reference"] == f"{module}:pair_distance"
+    assert d["builtin"] is False
+    assert b.manifest["tracks"]["pair"]["feature_groups"] == [f"{b.descriptors('pair')[0]}:d01"]
+
+
+def test_user_bundle_loads_and_scores_in_a_fresh_process(user_bundle, train_positions, tmp_path):
+    """Nothing carried over from this process: the module is named explicitly."""
+    import subprocess
+
+    b, saved, module, path = user_bundle
+    np.save(tmp_path / "frames.npy", train_positions[:5])
+    expected = b.score(train_positions[:5])["pair"]["T2"]
+    script = textwrap.dedent(f"""
+        import sys, numpy as np, detectana
+        sys.path.insert(0, {str(path.parent)!r})
+        b = detectana.load({str(saved)!r}, descriptor_modules=[{module!r}])
+        np.save({str(tmp_path / "out.npy")!r}, b.score(np.load({str(tmp_path / "frames.npy")!r}))["pair"]["T2"])
+    """)
+    src = str(__import__("pathlib").Path(__file__).resolve().parents[1] / "src")
+    result = subprocess.run([sys.executable, "-c", script], env={"PYTHONPATH": src, "PATH": "/usr/bin:/bin"},
+                            capture_output=True, text=True, timeout=120)
+    assert result.returncode == 0, result.stderr
+    np.testing.assert_array_equal(np.load(tmp_path / "out.npy"), expected)
+
+
+def test_load_does_not_import_a_user_module_itself(user_bundle):
+    from detectana.bundle import BundleError, load
+
+    _, saved, module, _ = user_bundle
+    sys.modules.pop(module)
+    with pytest.raises(BundleError, match=module):
+        load(saved)
+    assert module not in sys.modules
+    assert load(saved, descriptor_modules=[module]).tracks == ("bonds", "pair")
+
+
+def test_load_refuses_when_the_user_module_changed(user_bundle):
+    """Editing the descriptor's module file after the fit refuses the bundle."""
+    from detectana.bundle import BundleError, load
+
+    _, saved, module, path = user_bundle
+    path.write_text(path.read_text().replace("SCALE = 1.0", "SCALE = 2.0"))
+    with pytest.raises(BundleError, match="descriptor code differs"):
+        load(saved)
+
+
+def test_load_refuses_an_unimportable_descriptor_module(user_bundle):
+    from detectana.bundle import BundleError, load
+
+    _, saved, _, _ = user_bundle
+    with pytest.raises(BundleError, match="no_such_module"):
+        load(saved, descriptor_modules=["no_such_module"])
