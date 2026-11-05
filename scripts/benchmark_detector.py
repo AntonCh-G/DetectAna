@@ -52,7 +52,7 @@ import numpy as np
 import pandas as pd
 import yaml
 
-from detectana.descriptors import DescriptorPipeline, compute_descriptor_batch
+import detectana
 from detectana.evaluation import (
     conformal_threshold,
     detection_metrics,
@@ -62,7 +62,6 @@ from detectana.evaluation import (
     set_dihedral,
 )
 from detectana.io import MoleculeSpec, load_reference_frames
-from detectana.scorer import MahalanobisScorer
 from detectana.topology import build_topology, check_chemistry_batch
 
 logging.basicConfig(level=logging.INFO, format="%(levelname)-7s %(message)s")
@@ -137,25 +136,29 @@ def main() -> None:
     train_pos, _, _ = load_reference_frames(ref_cfg["train"], spec=spec)
     held_out_pos, _, _ = load_reference_frames(ref_cfg["valid"], spec=spec)
 
-    pipe = DescriptorPipeline(
+    # The bundle's own thresholds are not used here: the benchmark calibrates a
+    # conformal threshold on its calibration split of the held-out frames.
+    bundle = detectana.fit(
+        train_pos, held_out_pos, topo,
         pca_variance=cfg["descriptor"]["pca_variance"],
         random_seed=cfg["descriptor"]["random_seed"],
-    ).fit(compute_descriptor_batch(train_pos, topo))
-    scorer = MahalanobisScorer().fit(pipe.transform(compute_descriptor_batch(train_pos, topo)))
+    )
+    n_components = int(bundle.manifest["tracks"]["geometric"]["n_components"])
 
     def score(positions: np.ndarray) -> np.ndarray:
-        return scorer.score(pipe.transform(compute_descriptor_batch(positions, topo)))
+        """T² per frame (the squared Mahalanobis distance)."""
+        return bundle.score(positions)["geometric"]
 
     # The Mahalanobis covariance is estimated in PCA space, so it needs many more
     # training frames than components. Below ~10 per component the inverse is
     # dominated by estimation noise and every number downstream is unreliable —
     # which is exactly the regime config/demo.yaml runs in.
-    if len(train_pos) < 10 * pipe.n_components:
+    if len(train_pos) < 10 * n_components:
         log.warning(
             "Only %d training frames for %d PCA components (<10 per component). "
             "The covariance is poorly conditioned, so treat these results as a "
             "smoke test of the machinery, not as a measurement of the detector.",
-            len(train_pos), pipe.n_components,
+            len(train_pos), n_components,
         )
 
     # ── Split the held-out set: calibrate on one half, evaluate on the other ──
@@ -296,7 +299,7 @@ def main() -> None:
         "n_calibration": int(len(calib_idx)),
         "n_evaluation_negatives": int(len(eval_idx)),
         "n_features": int(topo.n_features),
-        "pca_n_components": int(pipe.n_components),
+        "pca_n_components": int(n_components),
         "seed": args.seed,
         "torsion_scan": headline,
     }

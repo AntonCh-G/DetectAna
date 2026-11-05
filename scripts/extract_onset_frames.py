@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import argparse
 import glob
+import json
 import math
 import re
 import sys
@@ -164,7 +165,8 @@ def parse_args() -> argparse.Namespace:
                    ))
     p.add_argument("--threshold", type=float, default=None, metavar="SCORE",
                    help=(
-                       "Override the Mahalanobis distance threshold (e.g. 15.0). "
+                       "Override the OOD threshold, in T² units (squared Mahalanobis "
+                       "distance, e.g. 225.0). "
                        "Read the value directly from the score_vs_time.png plot. "
                        "Re-detects onset from saved bead_scores.npy. "
                        "If omitted, uses onset frame from onset_table.csv as-is."
@@ -223,8 +225,18 @@ def main() -> None:
     onset_frame = int(onset_frame)
     bead_idx = int(bead_idx)
 
-    # ── Optional: re-detect onset at a different Mahalanobis threshold ────────
+    # ── Optional: re-detect onset at a different T² threshold ────────────────
     if args.threshold is not None:
+        # Runs written before scores became T² saved distances; a T² threshold
+        # would be compared against them on the wrong scale.
+        run_manifest = run_out / "manifest.json"
+        if run_manifest.exists():
+            statistic = json.loads(run_manifest.read_text()).get("statistic")
+            if statistic != "T2":
+                sys.exit(
+                    f"{run_manifest} records no T² statistic: its saved scores are "
+                    "distances. Rerun run_pipeline.py before overriding the threshold."
+                )
         bead_scores_path = run_out / "bead_scores.npy"
         centroid_scores_path = run_out / "centroid_scores.npy"
         agg_csv_path = run_out / "frame_aggregate.csv"
