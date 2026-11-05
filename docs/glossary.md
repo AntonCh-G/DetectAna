@@ -53,6 +53,9 @@ rate: at α = 1 % a clean 200,000-frame run still gets ~2000 flagged frames.
 flagged fraction reaches `fraction_threshold`. Bounds on its false-alarm rate come
 from `onset.window_false_alarm_probability`; `onset.choose_fraction_threshold`
 inverts it, turning a `false_alarm_budget` into the loosest fraction that fits.
+`onset.WindowRule(...).stream()` applies the same rule one frame at a time and
+gives exactly the onset frame `detect_onset` gives on the same frames; the
+first onset latches.
 
 **Effective trials** — independent flag opportunities in a window, `window ·
 (1−ρ)/(1+ρ)` for lag-1 autocorrelation ρ, times `n_effective_beads` (default 1,
@@ -63,12 +66,19 @@ since beads are not independent). For illustration, a 500-frame window at
 window, the fraction actually used, ρ, effective trials, flags needed and the
 false-alarm bounds per window and per run.
 
-## Planned: library interface (ADR 0005–0007, not built)
+## Library interface (ADR 0005 built; ADR 0006–0007 planned)
 
-**Reference bundle** — the saved fit for one force field, with a versioned
-manifest: atom order and topology, units, feature order per track, fitted state,
-calibrated thresholds, DetectAna version and descriptor code hashes. Replaces the
-pickled `pipeline.pkl` / `scorer.pkl` pair as the thing a caller loads.
+**Reference bundle** — the saved fit for one force field (`detectana.fit`,
+`detectana.load`; `src/detectana/bundle.py`): a directory with `manifest.json`
+(format version, statistic `T2`, DetectAna version, elements and topology, units,
+feature names, PCA parameters, thresholds, onset rule, descriptor code hash) and
+`state.npz` (fitted arrays, no pickle). Callers use its metadata API and
+`score`, never the fitted state. It refuses a bundle of another format version,
+changed descriptor code or other units, and frames of another atom count,
+element order or unit. One track today, `geometric`. The batch pipeline still
+writes `pipeline.pkl` / `scorer.pkl`.
+
+*Planned (not built):*
 
 **Descriptor registry** — descriptors as functions marked `@descriptor("name")`,
 each returning named numbers with their atoms and a group ID (a dihedral's sin and
@@ -82,8 +92,9 @@ as the embedding track is. Default (provisional): bonds, angles, dihedrals, ring
 cut-offs on the same score inside one track. Not a track.
 
 **T²** — Hotelling's statistic, the squared Mahalanobis distance in the kept PCA
-space: unusual within the motions the training data showed. The current code
-returns its square root, the distance.
+space: unusual within the motions the training data showed. The reference bundle
+stores and thresholds T² (`MahalanobisScorer.score_t2`); the batch pipeline still
+reports its square root, the distance (`MahalanobisScorer.score`).
 
 **SPE (Q)** — squared prediction error of the PCA residual: a new kind of motion
 the training data never showed. Inactive when PCA keeps every direction.

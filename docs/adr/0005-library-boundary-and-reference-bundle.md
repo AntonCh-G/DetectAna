@@ -1,6 +1,6 @@
 # ADR 0005 — DetectAna is a science library; the fit is a versioned reference bundle
 
-**Status:** Accepted (not built)
+**Status:** Accepted. Decisions 2–4 built on 2026-11-05 (`src/detectana/bundle.py`); 5 open.
 **Date:** 2026-11-04
 
 ## Context

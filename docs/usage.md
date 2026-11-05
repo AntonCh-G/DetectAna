@@ -12,7 +12,9 @@ For environment setup, data requirements and determinism, see
 ```bash
 uv venv .venv --python 3.11      # or python -m venv .venv
 source .venv/bin/activate
-uv pip install -e ".[dev]"
+uv pip install -e ".[dev]"      # tests, lint, and the [pipeline] extra
+uv pip install -e ".[pipeline]" # batch pipeline, scripts and plots only
+uv pip install -e .             # core library only: the reference bundle
 ```
 
 Python 3.10–3.12. CPU only — no deep-learning framework is imported anywhere.
@@ -172,6 +174,45 @@ outputs/
     plots/
       score_vs_time.png            # bead max/p95, fraction OOD, centroid
 ```
+
+## Library use: the reference bundle
+
+For scoring frames as they arrive (ADR 0005), fit once, save, and score from
+Python. Only the core install is needed.
+
+```python
+import detectana
+from detectana.topology import build_topology
+
+topo = build_topology("initial.xyz")              # or an ase Atoms object
+bundle = detectana.fit(
+    train, valid, topo,                            # (n_frames, n_atoms, 3), Å
+    percentiles={"bead": 99.0, "centroid": 99.0},
+    window_frames=500, step_frames=50, fraction_threshold=0.2,
+)
+bundle.save("aspirin.bundle")
+
+bundle = detectana.load("aspirin.bundle")          # refuses a mismatched bundle
+bundle.validate_frame(elements, first_frame)       # atom order, count, unit
+t2 = bundle.score(frames)["geometric"]             # T² per frame
+flags = t2 > bundle.thresholds("geometric")["bead"]
+
+stream = bundle.onset_rule.stream()                # same result as detect_onset
+for flag in flags:
+    onset = stream.push(float(flag))               # window start frame, or None
+```
+
+The bundle directory holds `manifest.json` (format version, statistic, DetectAna
+version, elements and topology, units, feature names, PCA parameters, thresholds,
+onset rule, descriptor code hash) and `state.npz` (fitted arrays, no pickle).
+`load` refuses another format version, changed descriptor code, other units, or
+arrays that disagree with the manifest; `validate_frame` and `score` refuse
+frames with another atom count, element order or unit. Every refusal is a
+`detectana.BundleError`.
+
+The bundle stores **T²**, the squared Mahalanobis distance, and its thresholds
+are percentiles of validation T². The batch pipeline below still reports the
+distance √T²; the two are not interchangeable numbers.
 
 ## Scripts
 
@@ -383,9 +424,10 @@ src/detectana/
   topology.py         Bond graph, angles, dihedrals, ring, hard-chemistry checks
   descriptors.py      Internal-coordinate fingerprint + StandardScaler + PCA
   scorer.py           Mahalanobis scorer and threshold calibration
+  bundle.py           Reference bundle: fit, save, load, score (library interface)
   embedding_scorer.py Per-atom Mahalanobis scorer in MLFF embedding space
   aggregator.py       Bead-score aggregation per timestep
-  onset.py            Windowed fraction onset detector + false-alarm arithmetic
+  onset.py            Windowed onset rule (batch and streaming) + false-alarm arithmetic
   evaluation.py       Detection metrics, error correlation, controlled distortions
   pipeline.py         The orchestrator
 scripts/

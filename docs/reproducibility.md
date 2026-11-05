@@ -40,8 +40,9 @@ uv pip install -e ".[dev]"       # or: pip install -e ".[dev]"
 ```
 
 Runtime dependencies and their floors are declared in
-[`pyproject.toml`](../pyproject.toml): `ase`, `numpy`, `scipy`, `scikit-learn`,
-`pandas`, `matplotlib`, `pyyaml`, `joblib`, `h5py`. `uv.lock` pins the exact
+[`pyproject.toml`](../pyproject.toml): the core library needs `ase`, `numpy`,
+`scipy` and `scikit-learn`; the batch pipeline and scripts add the `[pipeline]`
+extra, `pandas`, `matplotlib`, `pyyaml`, `joblib` and `h5py` (`[dev]` includes it). `uv.lock` pins the exact
 versions the project was last developed against; installing from it rather than
 from the floors is the way to reproduce bit-for-bit.
 

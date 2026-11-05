@@ -29,6 +29,10 @@ source .venv/bin/activate
 uv pip install -e ".[dev]"
 ```
 
+`[dev]` includes `[pipeline]`, which the batch pipeline, scripts and plots need
+(pandas, matplotlib, h5py, pyyaml, joblib). The core library alone — fit, save,
+load and score a reference bundle — needs only `pip install -e .`.
+
 ## Use
 
 Run the whole pipeline on the demo data that ships with the repository:

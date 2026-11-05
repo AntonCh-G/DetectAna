@@ -10,6 +10,37 @@ are called out explicitly whenever they change, because a silent change there
 produces results that still look plausible. See
 [docs/scientific-rules.md](docs/scientific-rules.md).
 
+## Unreleased
+
+### Added
+- **Reference bundle** (ADR 0005): `detectana.fit(train, valid, topology)` →
+  `ReferenceBundle` with `save`, `detectana.load`, `score(frames)` →
+  `{"geometric": T²}`, `validate_frame`, and a metadata API (elements, atom
+  count, units, topology, tracks, feature names, thresholds, onset rule,
+  `history_frames`). Saved as `manifest.json` + `state.npz`, no pickle. `load`
+  refuses another format version or statistic, changed descriptor code (SHA-256
+  of its source), other units, or inconsistent arrays.
+- `MahalanobisScorer.score_t2()` — Hotelling's T², the squared distance.
+- `onset.WindowRule` and `WindowRule.stream()` — the window onset rule one frame
+  at a time, equal to `detect_onset` on the same frames.
+- `build_topology` accepts an ase `Atoms` as well as a path.
+
+### Changed
+- Core dependencies are `numpy`, `scipy`, `scikit-learn`, `ase`. `pandas`,
+  `matplotlib`, `h5py`, `pyyaml`, `joblib` moved to a `[pipeline]` extra, which
+  `[dev]` includes. Install with `pip install "detectana[pipeline]"` to run the
+  batch pipeline and scripts.
+- **Scientific definition:** the bundle's statistic is **T²**, not the distance
+  √T² the batch pipeline reports; its thresholds are percentiles of validation
+  T². Batch pipeline outputs are unchanged.
+
+### Fixed
+- Fitting a one-feature input crashed `MahalanobisScorer.fit` (`np.cov` returns
+  a scalar for one column).
+- A molecule with no angles or dihedrals (a diatomic) crashed the vectorised
+  descriptor (empty index arrays were 1-d).
+- `detectana.onset` no longer needs pandas to import.
+
 ## 0.3.0 — 2026-08-11
 
 No change to the detection code. This release makes the repository standalone —
