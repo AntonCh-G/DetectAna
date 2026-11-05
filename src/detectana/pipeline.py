@@ -26,7 +26,7 @@ from joblib import Parallel, delayed
 
 from detectana import __version__
 from detectana.aggregator import add_embedding_scores, aggregate_bead_scores
-from detectana.bundle import ReferenceBundle
+from detectana.bundle import JOINED_TRACKS, ReferenceBundle
 from detectana.bundle import fit as fit_bundle
 from detectana.descriptors import compute_descriptor_batch
 from detectana.embedding_scorer import EmbeddingPipeline
@@ -151,8 +151,12 @@ def run_pipeline(cfg: dict) -> None:
             "onset.fraction_threshold not set (false_alarm_budget mode): the bundle "
             "records the default 0.20; each run derives its own fraction."
         )
+    # One joined track scored by T² only until multi-track scoring reaches the
+    # batch pipeline (step 3b); its outputs are unchanged by the registry.
     bundle = fit_bundle(
         train_pos, valid_pos, topo,
+        tracks=JOINED_TRACKS,
+        scores=("T2",),
         pca_variance=desc_cfg["pca_variance"],
         random_seed=desc_cfg["random_seed"],
         percentiles={"bead": bead_percentile, "centroid": centroid_percentile},
@@ -165,7 +169,7 @@ def run_pipeline(cfg: dict) -> None:
         "PCA: %d components explain %.1f%% variance",
         track_manifest["n_components"], track_manifest["pca_variance_explained"] * 100,
     )
-    thresholds = bundle.thresholds("geometric")
+    thresholds = bundle.thresholds("geometric")["T2"]
     threshold, centroid_threshold = thresholds["bead"], thresholds["centroid"]
     if centroid_percentile == bead_percentile:
         log.info("OOD threshold (%.1f-th pct of validation T²): %.4f", bead_percentile, threshold)
@@ -588,7 +592,7 @@ def _process_bead(
             chem_df["broken_bond"].sum(), chem_df["close_contact"].sum(),
         )
 
-    scores = bundle.score_features(descs_all)["geometric"]
+    scores = bundle.score_features(descs_all)["geometric"]["T2"]
     log.info("Bead %02d scored: max=%.3f, frac_ood=%.4f",
              bead_idx, scores.max(), (scores > threshold).mean())
     return bead_idx, scores, steps_all
@@ -674,7 +678,7 @@ def _process_bead_array(
             chem_df["broken_bond"].sum(), chem_df["close_contact"].sum(),
         )
 
-    scores = bundle.score_features(descs)["geometric"]
+    scores = bundle.score_features(descs)["geometric"]["T2"]
     log.info("Bead %02d scored: max=%.3f, frac_ood=%.4f",
              bead_idx, scores.max(), (scores > threshold).mean())
     return bead_idx, scores, steps
@@ -701,7 +705,7 @@ def _score_centroid_array(
         np.savez_compressed(cache_path, steps=steps, descriptors=descs)
         log.info("Cached %d frames → centroid_descriptors.npz", len(steps))
 
-    scores = bundle.score_features(descs)["geometric"]
+    scores = bundle.score_features(descs)["geometric"]["T2"]
     return scores, steps
 
 
@@ -726,7 +730,7 @@ def _score_centroid(
         force_recompute=force_recompute,
         bead_name="centroid",
     )
-    scores = bundle.score_features(descs)["geometric"]
+    scores = bundle.score_features(descs)["geometric"]["T2"]
     return scores, steps
 
 

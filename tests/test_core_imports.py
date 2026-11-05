@@ -49,15 +49,16 @@ SCRIPT = textwrap.dedent(
     train = np.array([a.positions for a in read(smoke + "/reference_train.xyz", index=":")])
     valid = np.array([a.positions for a in read(smoke + "/reference_valid.xyz", index=":")])
     topo = build_topology(smoke + "/initial.xyz")
-    bundle = detectana.fit(train, valid, topo, window_frames=4, step_frames=1)
+    bundle = detectana.fit(train, valid, topo, window_frames=4, step_frames=1,
+                           percentiles={{"bead": 80.0, "centroid": 80.0}})
     with tempfile.TemporaryDirectory() as d:
         bundle.save(d + "/b")
         loaded = detectana.load(d + "/b")
-    t2 = loaded.score(valid)["geometric"]
-    assert t2.shape == (len(valid),)
+    scores = loaded.score(valid)
+    assert scores["bonds"]["T2"].shape == (len(valid),)
     stream = loaded.onset_rule.stream()
-    for value in t2 > loaded.thresholds("geometric")["bead"]:
-        stream.push(float(value))
+    for marked in loaded.exceedance(scores, role="bead").marked:
+        stream.push(float(marked))
 
     leaked = sorted(m for m in sys.modules if m.split(".")[0] in BLOCKED)
     assert not leaked, leaked

@@ -53,6 +53,7 @@ import pandas as pd
 import yaml
 
 import detectana
+from detectana.bundle import JOINED_TRACKS
 from detectana.evaluation import (
     conformal_threshold,
     detection_metrics,
@@ -140,6 +141,8 @@ def main() -> None:
     # conformal threshold on its calibration split of the held-out frames.
     bundle = detectana.fit(
         train_pos, held_out_pos, topo,
+        tracks=JOINED_TRACKS,
+        scores=("T2",),
         pca_variance=cfg["descriptor"]["pca_variance"],
         random_seed=cfg["descriptor"]["random_seed"],
     )
@@ -147,7 +150,7 @@ def main() -> None:
 
     def score(positions: np.ndarray) -> np.ndarray:
         """T² per frame (the squared Mahalanobis distance)."""
-        return bundle.score(positions)["geometric"]
+        return bundle.score(positions)["geometric"]["T2"]
 
     # The Mahalanobis covariance is estimated in PCA space, so it needs many more
     # training frames than components. Below ~10 per component the inverse is

@@ -78,6 +78,7 @@ from ase.io import iread
 sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
 
 import detectana
+from detectana.bundle import JOINED_TRACKS
 from detectana.descriptors import compute_descriptor_batch
 from detectana.evaluation import (
     error_by_score_decile,
@@ -157,6 +158,8 @@ def _fit_reference(cfg: dict, initial_xyz: str | None = None):
     valid_pos, _, _ = load_reference_frames(cfg["reference"]["valid"], spec=spec)
     bundle = detectana.fit(
         train_pos, valid_pos, topo,
+        tracks=JOINED_TRACKS,
+        scores=("T2",),
         pca_variance=cfg["descriptor"]["pca_variance"],
         random_seed=cfg["descriptor"]["random_seed"],
     )
@@ -288,7 +291,7 @@ def run_sample(args: argparse.Namespace, cfg: dict, out_dir: Path) -> None:
             blk_steps, blk_pos = _read_frames(traj, block, _cache_for(traj))
             scores[start:start + len(block)] = bundle.score_features(
                 compute_descriptor_batch(blk_pos, topo)
-            )["geometric"]
+            )["geometric"]["T2"]
             steps[start:start + len(block)] = blk_steps
             log.info("  scored %d / %d", start + len(block), len(scan_ids))
 
@@ -514,7 +517,7 @@ def main() -> None:
     log.info("Analysing %d frames", len(positions))
 
     # ── Score, error, correlate ──────────────────────────────────────────────
-    scores = bundle.score(positions)["geometric"]
+    scores = bundle.score(positions)["geometric"]["T2"]
     errors = per_frame_force_error(ref_forces, pred_forces, metric=args.metric)
     flags = check_chemistry_batch(
         positions, topo, chem_cfg["bond_break_cutoff"], chem_cfg["close_contact_cutoff"]

@@ -1,32 +1,45 @@
-"""Reference bundle: the saved fit for one force field (ADR 0005).
+"""Reference bundle: the saved fit for one force field (ADR 0005, 0006, 0007).
 
 A bundle is fitted once from training and validation frames and then scores any
 number of frames, in batch or one at a time. It is a directory::
 
     <name>.bundle/
-        manifest.json   what the fit is: molecule, units, features, thresholds,
-                        onset rule, versions, descriptor code hash
+        manifest.json   what the fit is: molecule, units, descriptors and their
+                        code hashes, tracks, thresholds, budget, onset rule, versions
         state.npz       fitted arrays only, read with allow_pickle=False
 
 Callers use the public properties and methods; they never open the fitted state.
 
-The statistic is Hotelling's T², the squared Mahalanobis distance in the kept PCA
-space. "Distance" (√T²) is only a display label. Thresholds are percentiles of the
-validation T² values, so they can differ marginally from the square of the
-distance percentile the batch pipeline reports (both interpolate linearly between
-order statistics); flags agree exactly only at the order statistics themselves.
+**Tracks.** A track is a set of descriptor numbers fitted, scored and
+thresholded together: standardised, reduced by PCA, then scored twice —
 
-Today there is one track, ``"geometric"``: the internal-coordinate descriptor,
-standardised, reduced by PCA and scored by T². ADR 0006 adds more.
+- T², Hotelling's statistic, the squared Mahalanobis distance in the kept PCA
+  space: unusual *within* the motions the training data showed;
+- SPE, the squared PCA residual: a new kind of motion. Inactive when PCA keeps
+  every direction or the validation residual is numerically zero.
+
+The default is four tracks — bonds, angles, dihedrals, ring — and is
+provisional until benchmarked (ADR 0006). ``JOINED_TRACKS`` is the single
+joined track that reproduces the step-1 descriptor.
+
+**Tests and budget.** Each active (track, score) pair is a *test*. For each
+threshold role (``bead``, ``centroid``) the total false-alarm rate
+α = 1 − percentile/100 is split equally over the K active tests (Bonferroni):
+each test's threshold is the 100·(1 − α/K) percentile of its validation values,
+and a frame is marked when any test exceeds its threshold. ``exceedance`` turns
+that into one number per frame.
+
+Thresholds are percentiles (linear interpolation) of validation values.
 """
 
 from __future__ import annotations
 
 import copy
 import datetime as _dt
-import hashlib
-import inspect
+import importlib
 import json
+import re
+import warnings
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
@@ -37,26 +50,34 @@ from scipy.optimize import linear_sum_assignment
 from scipy.spatial.distance import cdist
 
 from detectana import __version__
-from detectana.descriptors import (
-    DescriptorPipeline,
-    _compute_descriptor_batch_vectorised,
-    _dihedral_rad,
-    compute_descriptor,
-    compute_descriptor_batch,
-)
+from detectana.descriptors import DescriptorPipeline
 from detectana.onset import WindowRule
+from detectana.registry import (
+    BUILTIN_DESCRIPTORS,
+    DescriptorValues,
+    RegisteredDescriptor,
+    compute,
+    resolve_descriptor,
+)
 from detectana.scorer import MahalanobisScorer
-from detectana.topology import MoleculeTopology, _ring_planarity_rmsd
+from detectana.topology import MoleculeTopology, complete_topology
 
 BUNDLE_FORMAT = "detectana-reference-bundle"
 #: Bumped whenever the manifest layout or the meaning of a stored value changes.
-#: Version 1 stores T² (not the distance √T²).
-BUNDLE_FORMAT_VERSION = 1
+#: 1: one track, T². 2: descriptor registry, tracks, T² and SPE, budget split.
+BUNDLE_FORMAT_VERSION = 2
 
-GEOMETRIC_TRACK = "geometric"
-DESCRIPTOR_NAME = "internal_coordinates"
+SCORES = ("T2", "SPE")
+#: ADR 0006 default, provisional until the benchmark decides.
+DEFAULT_TRACKS: dict[str, tuple[str, ...]] = {name: (name,) for name in BUILTIN_DESCRIPTORS}
+#: One joined track: the step-1 internal-coordinate descriptor.
+JOINED_TRACKS: dict[str, tuple[str, ...]] = {"geometric": BUILTIN_DESCRIPTORS}
+
 SUPPORTED_LENGTH_UNITS = ("angstrom",)
 UNITS = {"length": "angstrom", "angle": "radian"}
+BUDGET_RULE = "bonferroni"
+#: Largest validation SPE below this (standardised units²) means no residual.
+SPE_FLOOR = 1e-10
 
 MANIFEST_FILE = "manifest.json"
 STATE_FILE = "state.npz"
@@ -66,16 +87,7 @@ REFERENCE_KEY = "molecule/reference_positions"
 BOND_STRETCH_LIMIT = 1.5
 
 _STATE_ARRAYS = ("scaler_mean", "scaler_scale", "pca_mean", "pca_components", "t2_mean", "t2_inv_cov")
-
-# The functions that compute the internal-coordinate descriptor. Their source text
-# is hashed into the manifest so a bundle refuses to score with changed code.
-_DESCRIPTOR_FUNCTIONS = (
-    compute_descriptor_batch,
-    _compute_descriptor_batch_vectorised,
-    compute_descriptor,
-    _dihedral_rad,
-    _ring_planarity_rmsd,
-)
+_TRACK_NAME = re.compile(r"^[A-Za-z0-9_.-]+$")
 
 
 class BundleError(ValueError):
@@ -126,18 +138,25 @@ class FrameCheck:
         return "; ".join(parts)
 
 
-def descriptor_code_hash() -> str:
-    """SHA-256 of the source of the functions that compute the descriptor.
+@dataclass(frozen=True)
+class Exceedance:
+    """For one threshold role: per frame, the largest score ÷ threshold over the
+    active tests, and the test that produced it.
 
-    A formatting edit changes it too (ADR 0006): such a bundle is refused and must
-    be refitted. The DetectAna version in the manifest narrows down which release
-    wrote it.
+    Above 1 = the frame is marked. Its size is not comparable across tests; only
+    "above 1" has a statistical meaning.
+
+    values : (n_frames,)
+    tests : per frame, the (track, score) of the largest ratio
     """
-    h = hashlib.sha256()
-    for fn in _DESCRIPTOR_FUNCTIONS:
-        h.update(f"{fn.__module__}.{fn.__qualname__}\n".encode())
-        h.update(inspect.getsource(fn).encode())
-    return h.hexdigest()
+
+    role: str
+    values: np.ndarray
+    tests: tuple[tuple[str, str], ...]
+
+    @property
+    def marked(self) -> np.ndarray:
+        return self.values > 1.0
 
 
 # ---------------------------------------------------------------------------
@@ -149,6 +168,8 @@ def fit(
     valid: np.ndarray,
     topology: MoleculeTopology,
     *,
+    tracks: Mapping[str, Sequence[str]] | None = None,
+    scores: Sequence[str] = SCORES,
     pca_variance: float = 0.95,
     random_seed: int = 42,
     percentiles: Mapping[str, float] | None = None,
@@ -164,18 +185,32 @@ def fit(
     train, valid : (n_frames, n_atoms, 3) positions in ``length_unit``, atoms in
         the topology's order. Disjoint sets: the thresholds are only honest when
         no validation frame was used to fit. Overlap is not checked.
-    topology : from ``build_topology``; fixes atom order, elements and features.
-    pca_variance : fraction of standardised-descriptor variance PCA keeps.
-    random_seed : PCA seed.
-    percentiles : threshold name → percentile of validation T², default
-        ``{"bead": 99.0, "centroid": 99.0}``.
+    topology : from ``build_topology``; fixes atom order, elements and the
+        built-in descriptors' numbers.
+    tracks : track name → descriptor references (a registered name such as
+        ``"bonds"`` or ``"module.path:function"``; the module is imported).
+        Default ``DEFAULT_TRACKS`` (provisional). A track whose descriptors give
+        no numbers (ring on a ring-less molecule) is dropped and recorded.
+    scores : which of ``"T2"``, ``"SPE"`` to compute for every track.
+    pca_variance, random_seed : PCA settings, shared by all tracks.
+    percentiles : threshold role → percentile, the *total* budget of that role
+        over all active tests; default ``{"bead": 99.0, "centroid": 99.0}``.
     window_frames, step_frames, fraction_threshold : the window onset rule.
     length_unit : only ``"angstrom"`` is supported.
     """
     _check_length_unit(length_unit)
     if percentiles is None:
         percentiles = {"bead": 99.0, "centroid": 99.0}
+    for role, p in percentiles.items():
+        if not 0.0 < float(p) < 100.0:
+            raise ValueError(f"percentile of role {role!r} must be in (0, 100), got {p}")
+    scores = tuple(scores)
+    if not scores or any(s not in SCORES for s in scores) or len(set(scores)) != len(scores):
+        raise ValueError(f"scores must be a non-empty subset of {SCORES}, got {scores}")
+    track_spec = _track_spec(DEFAULT_TRACKS if tracks is None else tracks)
     rule = WindowRule(int(window_frames), int(step_frames), float(fraction_threshold))
+    if len(topology.bond_names) != len(topology.bonds):
+        topology = complete_topology(copy.deepcopy(topology))
     train = _as_frames(train, topology.n_atoms, "train")
     valid = _as_frames(valid, topology.n_atoms, "valid")
     if topology.reference_positions is not None:
@@ -185,32 +220,103 @@ def fit(
         reference = train[0]
         reference_source = "first training frame"
 
-    X_train = compute_descriptor_batch(train, topology)
-    pipe = DescriptorPipeline(pca_variance=pca_variance, random_seed=random_seed).fit(X_train)
-    scorer = MahalanobisScorer().fit(pipe.transform(X_train))
-    scaler, pca = pipe._scaler, pipe._pca
-    assert scaler is not None and pca is not None
-    mean, inv_cov = scorer._fitted()
+    # ── Descriptors: each computed once, however many tracks use it ──────────
+    regs: dict[str, RegisteredDescriptor] = {}
+    for refs in track_spec.values():
+        for ref in refs:
+            reg = resolve_descriptor(ref, allow_import=True)
+            if reg.name in regs and regs[reg.name].reference != reg.reference:
+                raise ValueError(f"two descriptors are called {reg.name!r}")
+            regs[reg.name] = reg
+    d_train = {n: compute(r, train, topology) for n, r in regs.items()}
+    d_valid = {n: compute(r, valid, topology) for n, r in regs.items()}
 
-    state = {
-        "scaler_mean": np.asarray(scaler.mean_, dtype=np.float64),
-        "scaler_scale": np.asarray(scaler.scale_, dtype=np.float64),
-        "pca_mean": np.asarray(pca.mean_, dtype=np.float64),
-        "pca_components": np.asarray(pca.components_, dtype=np.float64),
-        "t2_mean": np.asarray(mean, dtype=np.float64),
-        "t2_inv_cov": np.asarray(inv_cov, dtype=np.float64),
-    }
+    # ── Tracks: fit, score validation ────────────────────────────────────────
+    track_manifests: dict[str, dict[str, Any]] = {}
+    arrays: dict[str, np.ndarray] = {}
+    valid_scores: dict[tuple[str, str], np.ndarray] = {}
+    dropped: dict[str, str] = {}
+    for track, refs in track_spec.items():
+        names = [resolve_descriptor(r, allow_import=True).name for r in refs]
+        layout = _track_layout(track, names, d_train)
+        if not layout["feature_names"]:
+            dropped[track] = "its descriptors give no numbers for this molecule"
+            continue
+        X_train = np.concatenate([d_train[n].values for n in names], axis=1)
+        X_valid = np.concatenate([d_valid[n].values for n in names], axis=1)
+        pipe = DescriptorPipeline(pca_variance=pca_variance, random_seed=random_seed).fit(X_train)
+        scorer = MahalanobisScorer().fit(pipe.transform(X_train))
+        scaler, pca = pipe._scaler, pipe._pca
+        assert scaler is not None and pca is not None
+        mean, inv_cov = scorer._fitted()
+        state = {
+            "scaler_mean": np.asarray(scaler.mean_, dtype=np.float64),
+            "scaler_scale": np.asarray(scaler.scale_, dtype=np.float64),
+            "pca_mean": np.asarray(pca.mean_, dtype=np.float64),
+            "pca_components": np.asarray(pca.components_, dtype=np.float64),
+            "t2_mean": np.asarray(mean, dtype=np.float64),
+            "t2_inv_cov": np.asarray(inv_cov, dtype=np.float64),
+        }
+        n_features, n_components = X_train.shape[1], state["pca_components"].shape[0]
+        score_info: dict[str, dict[str, Any]] = {}
+        if "T2" in scores:
+            valid_scores[(track, "T2")] = _t2(X_valid, state)
+            score_info["T2"] = {"active": True}
+        if "SPE" in scores:
+            spe = _spe(X_valid, state)
+            if n_components >= n_features:
+                score_info["SPE"] = {"active": False, "reason": "PCA keeps every direction"}
+            elif float(spe.max()) < SPE_FLOOR:
+                score_info["SPE"] = {"active": False, "reason": "no residual variance in validation"}
+            else:
+                valid_scores[(track, "SPE")] = spe
+                score_info["SPE"] = {"active": True}
+        track_manifests[track] = {
+            **layout,
+            "n_features": int(n_features),
+            "n_components": int(n_components),
+            "pca_variance_explained": float(np.sum(pca.explained_variance_ratio_)),
+            "parameters": {"pca_variance": float(pca_variance), "random_seed": int(random_seed)},
+            "scores": score_info,
+            "state_keys": [f"{track}/{k}" for k in _STATE_ARRAYS],
+        }
+        arrays.update({f"{track}/{k}": v for k, v in state.items()})
+    if not track_manifests:
+        raise ValueError(f"every track is empty for this molecule: {dropped}")
 
-    valid_t2 = _t2(compute_descriptor_batch(valid, topology), state)
-    thresholds = {
-        str(name): {"percentile": float(p), "value": float(np.percentile(valid_t2, p))}
-        for name, p in percentiles.items()
-    }
+    # ── Budget: Bonferroni over the active tests, per role ───────────────────
+    tests = list(valid_scores)
+    if not tests:
+        raise ValueError("no active test: every requested score is inactive")
+    k = len(tests)
+    n_valid = len(valid)
+    budget: dict[str, Any] = {"rule": BUDGET_RULE, "tests": [list(t) for t in tests], "n_tests": k, "roles": {}}
+    for role, p in percentiles.items():
+        alpha = 1.0 - float(p) / 100.0
+        p_test = 100.0 * (1.0 - alpha / k)
+        expected = n_valid * alpha / k
+        budget["roles"][str(role)] = {
+            "percentile": float(p), "alpha": alpha, "alpha_per_test": alpha / k,
+            "percentile_per_test": p_test, "expected_valid_exceedances_per_test": expected,
+        }
+        if expected < 1.0:
+            warnings.warn(
+                f"role {role!r}: {n_valid} validation frames × α/K = {alpha:.3g}/{k} gives "
+                f"{expected:.2f} expected exceedances per test (< 1); each threshold is "
+                "close to the largest validation value",
+                UserWarning, stacklevel=2,
+            )
+        for track, score in tests:
+            thresholds = track_manifests[track]["scores"][score].setdefault("thresholds", {})
+            thresholds[str(role)] = {
+                "percentile_total": float(p), "percentile_test": p_test,
+                "value": float(np.percentile(valid_scores[(track, score)], p_test)),
+            }
 
+    used = {n for t in track_manifests.values() for n in t["descriptors"]}
     manifest: dict[str, Any] = {
         "format": BUNDLE_FORMAT,
         "format_version": BUNDLE_FORMAT_VERSION,
-        "statistic": "T2",
         "detectana_version": __version__,
         "created_utc": _dt.datetime.now(_dt.timezone.utc).isoformat(timespec="seconds"),
         "molecule": {
@@ -226,24 +332,53 @@ def fit(
             },
         },
         "units": dict(UNITS),
-        "tracks": {
-            GEOMETRIC_TRACK: {
-                "descriptor": {"name": DESCRIPTOR_NAME, "code_sha256": descriptor_code_hash()},
-                "feature_names": list(topology.feature_names),
-                "n_features": int(topology.n_features),
-                "n_components": int(state["pca_components"].shape[0]),
-                "pca_variance_explained": float(np.sum(pca.explained_variance_ratio_)),
-                "parameters": {"pca_variance": float(pca_variance), "random_seed": int(random_seed)},
-                "thresholds": thresholds,
-                "state_keys": [f"{GEOMETRIC_TRACK}/{k}" for k in _STATE_ARRAYS],
+        "descriptors": {
+            n: {
+                "reference": r.reference,
+                "builtin": r.builtin,
+                "code_sha256": r.code_hash(),
+                "feature_names": list(d_train[n].names),
             }
+            for n, r in regs.items() if n in used
         },
+        "scores": list(scores),
+        "tracks": track_manifests,
+        "dropped_tracks": dropped,
+        "budget": budget,
         "onset_rule": rule.to_dict(),
-        "fit_data": {"n_train": int(len(train)), "n_valid": int(len(valid))},
+        "fit_data": {"n_train": int(len(train)), "n_valid": int(n_valid)},
     }
-    arrays = {f"{GEOMETRIC_TRACK}/{k}": v for k, v in state.items()}
     arrays[REFERENCE_KEY] = np.array(reference, dtype=np.float64)
     return ReferenceBundle(manifest, arrays)
+
+
+def _track_spec(tracks: Mapping[str, Sequence[str]]) -> dict[str, tuple[str, ...]]:
+    if not tracks:
+        raise ValueError("no tracks given")
+    spec: dict[str, tuple[str, ...]] = {}
+    for name, refs in tracks.items():
+        if not _TRACK_NAME.match(str(name)):
+            raise ValueError(f"track name {name!r}: use letters, digits, '_', '.', '-'")
+        if isinstance(refs, str) or not refs:
+            raise ValueError(f"track {name!r}: give a non-empty list of descriptor references")
+        spec[str(name)] = tuple(str(r) for r in refs)
+    return spec
+
+
+def _track_layout(track: str, names: Sequence[str], values: Mapping[str, DescriptorValues]) -> dict[str, Any]:
+    """Column names, atoms and group IDs (scoped ``descriptor:group``) of a track."""
+    feature_names: list[str] = []
+    atoms: list[list[int]] = []
+    groups: list[str] = []
+    for n in names:
+        v = values[n]
+        feature_names += v.names
+        atoms += [list(a) for a in v.atoms]
+        groups += [f"{n}:{g}" for g in v.groups]
+    if len(set(feature_names)) != len(feature_names):
+        raise ValueError(f"track {track!r}: two of its descriptors use the same number name")
+    return {"descriptors": list(names), "feature_names": feature_names,
+            "feature_atoms": atoms, "feature_groups": groups}
 
 
 # ---------------------------------------------------------------------------
@@ -260,6 +395,10 @@ class ReferenceBundle:
         self._manifest = manifest
         self._state = {k: np.asarray(v) for k, v in state.items()}
         self._topology = _topology_from_manifest(manifest)
+        self._descriptors = {
+            n: resolve_descriptor(d["reference"], allow_import=False)
+            for n, d in manifest["descriptors"].items()
+        }
 
     # ── metadata ─────────────────────────────────────────────────────────────
     @property
@@ -302,13 +441,35 @@ class ReferenceBundle:
     def tracks(self) -> tuple[str, ...]:
         return tuple(self._manifest["tracks"])
 
+    @property
+    def tests(self) -> tuple[tuple[str, str], ...]:
+        """The active (track, score) pairs; the false-alarm budget is split over these."""
+        return tuple((t, s) for t, s in self._manifest["budget"]["tests"])
+
+    @property
+    def roles(self) -> tuple[str, ...]:
+        """Threshold roles, e.g. ``("bead", "centroid")``."""
+        return tuple(self._manifest["budget"]["roles"])
+
+    def descriptors(self, track: str) -> tuple[str, ...]:
+        """Names of the descriptors ``track`` is built from."""
+        return tuple(self._track(track)["descriptors"])
+
     def feature_names(self, track: str) -> tuple[str, ...]:
-        """Descriptor column names of ``track``, in column order."""
+        """Descriptor number names of ``track``, in column order."""
         return tuple(self._track(track)["feature_names"])
 
-    def thresholds(self, track: str) -> dict[str, float]:
-        """Calibrated T² thresholds of ``track``, by name (``bead``, ``centroid``)."""
-        return {name: float(t["value"]) for name, t in self._track(track)["thresholds"].items()}
+    @property
+    def all_feature_names(self) -> tuple[str, ...]:
+        """Column order of ``compute_features``: every descriptor's numbers, in turn."""
+        return tuple(n for d in self._manifest["descriptors"].values() for n in d["feature_names"])
+
+    def thresholds(self, track: str) -> dict[str, dict[str, float]]:
+        """Calibrated thresholds of ``track``'s active scores: {score: {role: value}}."""
+        return {
+            score: {role: float(t["value"]) for role, t in info["thresholds"].items()}
+            for score, info in self._track(track)["scores"].items() if info["active"]
+        }
 
     @property
     def onset_rule(self) -> WindowRule:
@@ -357,43 +518,72 @@ class ReferenceBundle:
             raise BundleError("positions contain NaN or infinity")
         return _frame_check(pos, self.reference_positions, self.elements, self._topology.bonds)
 
-    def score(self, positions: np.ndarray, *, length_unit: str = "angstrom") -> dict[str, np.ndarray]:
-        """T² per frame for each track.
+    def compute_features(self, positions: np.ndarray, *, length_unit: str = "angstrom") -> np.ndarray:
+        """Every descriptor's numbers, (n_frames, len(all_feature_names)).
+
+        Raises ``BundleError`` if a descriptor now returns other numbers than at
+        fit time.
+        """
+        pos = self._frames(positions, length_unit)
+        blocks = []
+        for name, reg in self._descriptors.items():
+            out = compute(reg, pos, self._topology)
+            expected = tuple(self._manifest["descriptors"][name]["feature_names"])
+            if out.names != expected:
+                raise BundleError(
+                    f"descriptor {name!r} returns numbers {list(out.names)[:3]}…; "
+                    f"the bundle was fitted on {list(expected)[:3]}…. Refit the bundle."
+                )
+            blocks.append(out.values)
+        return np.concatenate(blocks, axis=1) if blocks else np.zeros((len(pos), 0))
+
+    def score(self, positions: np.ndarray, *, length_unit: str = "angstrom") -> dict[str, dict[str, np.ndarray]]:
+        """Scores per frame: ``{track: {"T2": (n,), "SPE": (n,)}}``.
+
+        An inactive score's key is absent.
 
         Parameters
         ----------
         positions : (n_frames, n_atoms, 3), or (n_atoms, 3) for one frame, in the
             bundle's atom order.
-
-        Returns
-        -------
-        {track: (n_frames,) T²}
         """
-        self._check_unit(length_unit)
-        pos = np.asarray(positions, dtype=np.float64)
-        if pos.ndim == 2:
-            pos = pos[None]
-        try:
-            pos = _as_frames(pos, self.n_atoms, "positions", allow_empty=True)
-        except ValueError as exc:
-            raise BundleError(str(exc)) from exc
-        return self.score_features(compute_descriptor_batch(pos, self._topology))
+        return self.score_features(self.compute_features(positions, length_unit=length_unit))
 
-    def score_features(self, features: np.ndarray) -> dict[str, np.ndarray]:
-        """T² per frame from descriptors already computed with this bundle's topology.
+    def score_features(self, features: np.ndarray) -> dict[str, dict[str, np.ndarray]]:
+        """As ``score``, from ``compute_features`` output (for callers that cache it).
 
-        For callers that cache descriptors (the batch pipeline does). The columns
-        must be in ``feature_names(track)`` order; only the width is checked.
-
-        Parameters
-        ----------
-        features : (n_frames, n_features)
+        The columns must be in ``all_feature_names`` order; only the width is checked.
         """
         X = np.asarray(features, dtype=np.float64)
-        n_features = len(self.feature_names(GEOMETRIC_TRACK))
-        if X.ndim != 2 or X.shape[1] != n_features:
-            raise BundleError(f"features have shape {X.shape}; expected (n_frames, {n_features})")
-        return {GEOMETRIC_TRACK: _t2(X, self._track_state(GEOMETRIC_TRACK))}
+        width = len(self.all_feature_names)
+        if X.ndim != 2 or X.shape[1] != width:
+            raise BundleError(f"features have shape {X.shape}; expected (n_frames, {width})")
+        out: dict[str, dict[str, np.ndarray]] = {}
+        for track in self.tracks:
+            Xt = X[:, self._columns(track)]
+            state = self._track_state(track)
+            info = self._track(track)["scores"]
+            out[track] = {}
+            if info.get("T2", {}).get("active"):
+                out[track]["T2"] = _t2(Xt, state)
+            if info.get("SPE", {}).get("active"):
+                out[track]["SPE"] = _spe(Xt, state)
+        return out
+
+    def exceedance(self, scores: Mapping[str, Mapping[str, np.ndarray]], role: str = "bead") -> Exceedance:
+        """Largest score ÷ threshold over the active tests, per frame, for ``role``.
+
+        ``scores`` is what ``score`` or ``score_features`` returned. Above 1 =
+        the frame is marked for ``role``; the window rule reads this.
+        """
+        if role not in self.roles:
+            raise KeyError(f"unknown threshold role {role!r}; bundle has {', '.join(self.roles)}")
+        tests = self.tests
+        ratios = np.stack([
+            np.asarray(scores[t][s], dtype=np.float64) / self.thresholds(t)[s][role] for t, s in tests
+        ])
+        best = np.argmax(ratios, axis=0)
+        return Exceedance(role, ratios[best, np.arange(ratios.shape[1])], tuple(tests[i] for i in best))
 
     # ── persistence ──────────────────────────────────────────────────────────
     def save(self, path: str | Path) -> None:
@@ -406,15 +596,24 @@ class ReferenceBundle:
         (path / MANIFEST_FILE).write_text(json.dumps(self._manifest, indent=2) + "\n")
 
     @classmethod
-    def load(cls, path: str | Path) -> ReferenceBundle:
+    def load(cls, path: str | Path, *, descriptor_modules: Sequence[str] = ()) -> ReferenceBundle:
         """Read a bundle directory written by ``save``.
 
+        A user descriptor's module is never imported because a bundle names it:
+        import it first, or list it in ``descriptor_modules`` to have it imported
+        here.
+
         Raises ``BundleError`` when the bundle cannot be trusted with this
-        installation: another format version or statistic, descriptor code that
-        changed since the fit, unsupported units, or a manifest and fitted
-        arrays that do not agree with each other.
+        installation: another format version, a descriptor that is not imported
+        or whose code changed since the fit, unsupported units, or a manifest and
+        fitted arrays that do not agree with each other.
         """
         path = Path(path)
+        for module in descriptor_modules:
+            try:
+                importlib.import_module(module)
+            except ImportError as exc:
+                raise BundleError(f"cannot import descriptor module {module!r}: {exc}") from exc
         for name in (MANIFEST_FILE, STATE_FILE):
             if not (path / name).is_file():
                 raise BundleError(f"{path}: missing {name}; not a saved reference bundle")
@@ -441,6 +640,27 @@ class ReferenceBundle:
         prefix = f"{track}/"
         return {k[len(prefix):]: v for k, v in self._state.items() if k.startswith(prefix)}
 
+    def _columns(self, track: str) -> np.ndarray:
+        """Indices of ``track``'s numbers within ``all_feature_names``."""
+        start, offsets = 0, {}
+        for name, d in self._manifest["descriptors"].items():
+            offsets[name] = start
+            start += len(d["feature_names"])
+        return np.concatenate([
+            np.arange(offsets[n], offsets[n] + len(self._manifest["descriptors"][n]["feature_names"]))
+            for n in self.descriptors(track)
+        ]).astype(np.intp)
+
+    def _frames(self, positions: np.ndarray, length_unit: str) -> np.ndarray:
+        self._check_unit(length_unit)
+        pos = np.asarray(positions, dtype=np.float64)
+        if pos.ndim == 2:
+            pos = pos[None]
+        try:
+            return _as_frames(pos, self.n_atoms, "positions", allow_empty=True)
+        except ValueError as exc:
+            raise BundleError(str(exc)) from exc
+
     def _check_unit(self, length_unit: str) -> None:
         if length_unit != self.length_unit:
             raise BundleError(
@@ -448,21 +668,33 @@ class ReferenceBundle:
             )
 
 
-def load(path: str | Path) -> ReferenceBundle:
-    """Load a reference bundle directory."""
-    return ReferenceBundle.load(path)
+def load(path: str | Path, *, descriptor_modules: Sequence[str] = ()) -> ReferenceBundle:
+    """Load a reference bundle directory; see ``ReferenceBundle.load``."""
+    return ReferenceBundle.load(path, descriptor_modules=descriptor_modules)
 
 
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
 
+def _standardised(X: np.ndarray, state: Mapping[str, np.ndarray]) -> np.ndarray:
+    """Standardised descriptor, centred on the PCA mean (z in attribution.py)."""
+    return (X - state["scaler_mean"]) / state["scaler_scale"] - state["pca_mean"]
+
+
 def _t2(X: np.ndarray, state: Mapping[str, np.ndarray]) -> np.ndarray:
     """Standardise, project onto the kept PCA directions, return T² per row."""
-    Xs = (X - state["scaler_mean"]) / state["scaler_scale"]
-    Z = (Xs - state["pca_mean"]) @ state["pca_components"].T
+    Z = _standardised(X, state) @ state["pca_components"].T
     diff = Z - state["t2_mean"]
     return np.maximum(np.einsum("ij,jk,ik->i", diff, state["t2_inv_cov"], diff), 0.0)
+
+
+def _spe(X: np.ndarray, state: Mapping[str, np.ndarray]) -> np.ndarray:
+    """Squared PCA residual per row, in standardised units."""
+    z = _standardised(X, state)
+    P = state["pca_components"]
+    r = z - (z @ P.T) @ P
+    return np.einsum("ij,ij->i", r, r)
 
 
 def _as_frames(pos: np.ndarray, n_atoms: int, name: str, allow_empty: bool = False) -> np.ndarray:
@@ -555,9 +787,6 @@ def _check_bundle(manifest: Any, state: Mapping[str, np.ndarray]) -> None:
             f"bundle format version {version!r}; this DetectAna "
             f"({__version__}) reads format version {BUNDLE_FORMAT_VERSION} only. Refit the bundle."
         )
-    if manifest.get("statistic") != "T2":
-        raise BundleError(f"bundle statistic {manifest.get('statistic')!r}; expected 'T2'")
-
     units = manifest.get("units")
     if units != UNITS:
         raise BundleError(f"bundle units {units!r}; supported unit set is {UNITS!r}")
@@ -568,6 +797,8 @@ def _check_bundle(manifest: Any, state: Mapping[str, np.ndarray]) -> None:
         elements = list(mol["elements"])
         topo_dict = mol["topology"]
         tracks = manifest["tracks"]
+        descriptors = manifest["descriptors"]
+        budget = manifest["budget"]
         WindowRule(**manifest["onset_rule"])
     except (KeyError, TypeError, ValueError) as exc:
         raise BundleError(f"manifest: missing or invalid field ({exc})") from exc
@@ -580,64 +811,93 @@ def _check_bundle(manifest: Any, state: Mapping[str, np.ndarray]) -> None:
                 raise BundleError(f"manifest: {key} entry {group} has an atom index outside 0..{n_atoms - 1}")
     if any(not 0 <= int(i) < n_atoms for i in topo_dict.get("ring_atoms", [])):
         raise BundleError(f"manifest: ring_atoms has an atom index outside 0..{n_atoms - 1}")
-
-    if set(tracks) != {GEOMETRIC_TRACK}:
-        raise BundleError(f"manifest: tracks {sorted(tracks)}; this DetectAna knows only {GEOMETRIC_TRACK!r}")
-    track = tracks[GEOMETRIC_TRACK]
-    descriptor = track.get("descriptor", {})
-    if descriptor.get("name") != DESCRIPTOR_NAME:
-        raise BundleError(f"track {GEOMETRIC_TRACK!r}: unknown descriptor {descriptor.get('name')!r}")
-    if descriptor.get("code_sha256") != descriptor_code_hash():
-        raise BundleError(
-            f"track {GEOMETRIC_TRACK!r}: descriptor code differs from the code that fitted "
-            f"this bundle (fitted with DetectAna {manifest.get('detectana_version')}, "
-            f"installed {__version__}). Refit the bundle."
-        )
-
     try:
         topo = _topology_from_manifest(manifest)
-    except BundleError:
-        raise
     except (KeyError, TypeError, ValueError, IndexError) as exc:
         raise BundleError(f"manifest: invalid topology ({exc})") from exc
-    n_features = len(track.get("feature_names", []))
-    if n_features != topo.n_features or track.get("n_features") != topo.n_features:
-        raise BundleError(
-            f"track {GEOMETRIC_TRACK!r}: {n_features} feature names, the topology gives {topo.n_features}"
-        )
 
-    expected_keys = [f"{GEOMETRIC_TRACK}/{k}" for k in _STATE_ARRAYS]
-    missing = [k for k in expected_keys if k not in state]
-    if missing or track.get("state_keys") != expected_keys:
-        raise BundleError(f"fitted state: missing arrays {missing or track.get('state_keys')}")
-    n_comp = int(track.get("n_components", -1))
-    shapes = {
-        "scaler_mean": (n_features,),
-        "scaler_scale": (n_features,),
-        "pca_mean": (n_features,),
-        "pca_components": (n_comp, n_features),
-        "t2_mean": (n_comp,),
-        "t2_inv_cov": (n_comp, n_comp),
-    }
-    for key, shape in shapes.items():
-        arr = state[f"{GEOMETRIC_TRACK}/{key}"]
-        if arr.shape != shape:
-            raise BundleError(f"fitted state: {key} has shape {arr.shape}, manifest implies {shape}")
-        if arr.dtype.kind != "f" or not np.all(np.isfinite(arr)):
-            raise BundleError(f"fitted state: {key} is not a finite float array")
     ref_key = mol.get("reference_geometry", {}).get("state_key")
     if ref_key != REFERENCE_KEY or REFERENCE_KEY not in state:
         raise BundleError("fitted state: missing the reference geometry")
     ref = state[REFERENCE_KEY]
     if ref.shape != (n_atoms, 3) or ref.dtype.kind != "f" or not np.all(np.isfinite(ref)):
         raise BundleError(f"fitted state: reference geometry has shape {ref.shape}, expected ({n_atoms}, 3)")
-    for name, t in track.get("thresholds", {}).items():
-        if not np.isfinite(float(t.get("value", np.nan))):
-            raise BundleError(f"track {GEOMETRIC_TRACK!r}: threshold {name!r} is not a finite number")
+
+    # ── Descriptors: importable, same code, same numbers ─────────────────────
+    for name, d in descriptors.items():
+        try:
+            reg = resolve_descriptor(str(d["reference"]), allow_import=False)
+        except (LookupError, ValueError) as exc:
+            raise BundleError(f"descriptor {name!r}: {exc}") from exc
+        if reg.name != name:
+            raise BundleError(f"descriptor {name!r}: {d['reference']} is registered as {reg.name!r}")
+        if d.get("code_sha256") != reg.code_hash():
+            raise BundleError(
+                f"descriptor {name!r}: descriptor code differs from the code that fitted "
+                f"this bundle (fitted with DetectAna {manifest.get('detectana_version')}, "
+                f"installed {__version__}). Refit the bundle."
+            )
+        if reg.builtin:
+            # Built-ins can be checked now: the topology fixes their numbers.
+            probe = compute(reg, ref[None], topo)
+            if list(probe.names) != list(d.get("feature_names", [])):
+                raise BundleError(f"descriptor {name!r}: feature names do not match the topology")
+
+    # ── Tracks: layout, scores, state arrays ─────────────────────────────────
+    if not tracks:
+        raise BundleError("manifest: no tracks")
+    active: list[tuple[str, str]] = []
+    for track, t in tracks.items():
+        if not _TRACK_NAME.match(str(track)):
+            raise BundleError(f"manifest: invalid track name {track!r}")
+        names = t.get("descriptors", [])
+        if not names or any(n not in descriptors for n in names):
+            raise BundleError(f"track {track!r}: unknown descriptors {names}")
+        expected_names = [f for n in names for f in descriptors[n]["feature_names"]]
+        n_features = len(expected_names)
+        if (t.get("feature_names") != expected_names or t.get("n_features") != n_features
+                or len(t.get("feature_atoms", [])) != n_features or len(t.get("feature_groups", [])) != n_features):
+            raise BundleError(f"track {track!r}: {len(t.get('feature_names', []))} feature names, "
+                              f"its descriptors give {n_features}")
+        for atoms in t["feature_atoms"]:
+            if not atoms or any(not 0 <= int(i) < n_atoms for i in atoms):
+                raise BundleError(f"track {track!r}: feature atoms {atoms} outside 0..{n_atoms - 1}")
+        expected_keys = [f"{track}/{k}" for k in _STATE_ARRAYS]
+        missing = [k for k in expected_keys if k not in state]
+        if missing or t.get("state_keys") != expected_keys:
+            raise BundleError(f"fitted state: missing arrays {missing or t.get('state_keys')}")
+        n_comp = int(t.get("n_components", -1))
+        shapes = {
+            "scaler_mean": (n_features,), "scaler_scale": (n_features,), "pca_mean": (n_features,),
+            "pca_components": (n_comp, n_features), "t2_mean": (n_comp,), "t2_inv_cov": (n_comp, n_comp),
+        }
+        for key, shape in shapes.items():
+            arr = state[f"{track}/{key}"]
+            if arr.shape != shape:
+                raise BundleError(f"fitted state: {track}/{key} has shape {arr.shape}, manifest implies {shape}")
+            if arr.dtype.kind != "f" or not np.all(np.isfinite(arr)):
+                raise BundleError(f"fitted state: {track}/{key} is not a finite float array")
+        for score, info in t.get("scores", {}).items():
+            if score not in SCORES:
+                raise BundleError(f"track {track!r}: unknown score {score!r}")
+            if not info.get("active"):
+                continue
+            active.append((track, score))
+            for role, thr in info.get("thresholds", {}).items():
+                if not np.isfinite(float(thr.get("value", np.nan))):
+                    raise BundleError(f"track {track!r}: {score} threshold {role!r} is not a finite number")
+            if set(info.get("thresholds", {})) != set(budget.get("roles", {})):
+                raise BundleError(f"track {track!r}: {score} thresholds do not cover every role")
+
+    if [tuple(x) for x in budget.get("tests", [])] != active or budget.get("n_tests") != len(active):
+        raise BundleError("manifest: the budget's tests are not the active scores")
+    if budget.get("rule") != BUDGET_RULE:
+        raise BundleError(f"manifest: unknown budget rule {budget.get('rule')!r}")
+
 
 
 def _topology_from_manifest(manifest: Mapping[str, Any]) -> MoleculeTopology:
-    """Rebuild the topology the descriptor needs from the manifest alone."""
+    """Rebuild the topology the built-in descriptors need from the manifest alone."""
     mol = manifest["molecule"]
     t = mol["topology"]
     topo = MoleculeTopology(
@@ -648,19 +908,4 @@ def _topology_from_manifest(manifest: Mapping[str, Any]) -> MoleculeTopology:
         n_atoms=int(mol["n_atoms"]),
         atom_types=list(mol["elements"]),
     )
-    names = list(manifest["tracks"][GEOMETRIC_TRACK]["feature_names"])
-    if len(names) != topo.n_features:
-        raise BundleError(
-            f"track {GEOMETRIC_TRACK!r}: {len(names)} feature names, the topology gives {topo.n_features}"
-        )
-    nb, na, nd = topo.n_bond_features, topo.n_angle_features, topo.n_dihedral_features
-    topo.bond_names = names[:nb]
-    topo.angle_names = names[nb:nb + na]
-    topo.dihedral_names = names[nb + na:nb + na + nd]
-    if topo.has_ring:
-        topo.planarity_name = names[nb + na + nd]
-    topo.bond_idx = np.array(topo.bonds, dtype=np.int32).reshape(-1, 2)
-    topo.angle_idx = np.array(topo.angles, dtype=np.int32).reshape(-1, 3)
-    topo.dihedral_idx = np.array(topo.dihedrals, dtype=np.int32).reshape(-1, 4)
-    topo.ring_idx = np.array(topo.ring_atoms, dtype=np.int32) if topo.ring_atoms else None
-    return topo
+    return complete_topology(topo)

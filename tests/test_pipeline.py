@@ -297,14 +297,14 @@ def test_saved_bundle_reproduces_the_saved_scores(demo_run, demo_outputs):
     bundle = detectana.load(out / "models" / "geometric.bundle")
 
     cache = np.load(demo_outputs["run_dir"] / "descriptor_cache" / "bead_00_descriptors.npz")
-    rescored = bundle.score_features(cache["descriptors"])["geometric"]
+    rescored = bundle.score_features(cache["descriptors"])["geometric"]["T2"]
     np.testing.assert_array_equal(rescored, demo_outputs["bead_scores"][0])
 
     centroid_cache = np.load(
         demo_outputs["run_dir"] / "descriptor_cache" / "centroid_descriptors.npz"
     )
     np.testing.assert_array_equal(
-        bundle.score_features(centroid_cache["descriptors"])["geometric"],
+        bundle.score_features(centroid_cache["descriptors"])["geometric"]["T2"],
         demo_outputs["centroid_scores"],
     )
 
@@ -333,7 +333,7 @@ def test_saved_bundle_carries_both_thresholds(demo_run, demo_outputs):
     import detectana
 
     out, _ = demo_run
-    thresholds = detectana.load(out / "models" / "geometric.bundle").thresholds("geometric")
+    thresholds = detectana.load(out / "models" / "geometric.bundle").thresholds("geometric")["T2"]
     manifest = demo_outputs["manifest"]
     assert thresholds["bead"] == pytest.approx(manifest["bead_ood_threshold"])
     assert thresholds["centroid"] == pytest.approx(manifest["centroid_ood_threshold"])
@@ -345,7 +345,7 @@ def test_loaded_bundle_flags_the_same_frames_as_the_aggregate_table(demo_run, de
     import detectana
 
     out, _ = demo_run
-    thr = detectana.load(out / "models" / "geometric.bundle").thresholds("geometric")["centroid"]
+    thr = detectana.load(out / "models" / "geometric.bundle").thresholds("geometric")["T2"]["centroid"]
     flags = demo_outputs["centroid_scores"] > thr
     np.testing.assert_array_equal(flags, demo_outputs["agg"]["centroid_ood"].to_numpy())
 
