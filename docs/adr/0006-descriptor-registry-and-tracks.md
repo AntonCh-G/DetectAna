@@ -1,7 +1,8 @@
 # ADR 0006 — Descriptors come from a registry and are scored in tracks
 
-**Status:** Accepted (not built). The default track split is provisional until
-benchmarked.
+**Status:** Accepted; built 2026-11-05 (`registry.py`, `bundle.py` format 2). The
+default track split is provisional until benchmarked on real reference data
+(`scripts/benchmark_tracks.py`).
 **Date:** 2026-11-04
 
 ## Context
@@ -46,6 +47,29 @@ direction leaves no residual, so SPE (ADR 0007) is identically zero.
    (`track=` becomes `role=` in `MahalanobisScorer.calibrate`) when this is built.
    Confirmed 2026-11-04: "track" always means something with its own fitted model
    and its own score.
+
+## Amendment (2026-11-05, when built)
+
+Decided while building; the decisions above are unchanged.
+
+- **Budget split rule**: Bonferroni. Each of the K active tests gets α/K of its
+  role's total α; a frame is marked when any test fires. Valid whatever the
+  correlation between tests, conservative when they are correlated. `fit` warns
+  when n_valid·α/K < 1.
+- **Code hash of a user descriptor** covers the whole source file of its module
+  plus its package's installed version, not only the function: helpers in the
+  same file are then covered, and false refusals (refit) are cheaper than
+  silently wrong scores. Built-ins hash the function and the helpers DetectAna
+  lists. Code imported from other files of an editable install is not covered.
+- **Loading never imports a user module.** A bundle is data, and an import runs
+  code: the caller imports the module first or passes
+  `load(path, descriptor_modules=[...])`. `fit` may import, since the caller
+  named the module.
+- **Groups** are defined by the descriptor author with no size rule; RBC is not
+  normalised by group size, and each group's size is reported with it.
+- **Empty tracks** (ring on a ring-less molecule) are dropped and recorded.
+- **The batch pipeline** keeps one joined track scored by T² until the default is
+  decided; a pipeline config with `tracks:` or `scores:` is refused.
 
 ## Consequences
 

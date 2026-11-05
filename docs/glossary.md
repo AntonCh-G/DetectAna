@@ -66,35 +66,50 @@ since beads are not independent). For illustration, a 500-frame window at
 window, the fraction actually used, ρ, effective trials, flags needed and the
 false-alarm bounds per window and per run.
 
-## Library interface (ADR 0005 built; ADR 0006–0007 planned)
+## Library interface (ADR 0005–0007)
 
 **Reference bundle** — the saved fit for one force field (`detectana.fit`,
 `detectana.load`; `src/detectana/bundle.py`): a directory with `manifest.json`
-(format version, statistic `T2`, DetectAna version, elements and topology, units,
-feature names, PCA parameters, thresholds, onset rule, descriptor code hash) and
-`state.npz` (fitted arrays, no pickle). Callers use its metadata API and
-`score`, never the fitted state. It refuses a bundle of another format version,
-changed descriptor code or other units, and frames of another atom count,
-element order or unit. One track today, `geometric`. The batch pipeline fits one
-and saves it to `outputs/models/geometric.bundle`; it no longer writes the
-`descriptor_pipeline.pkl` / `scorer.pkl` pair.
+(format version, DetectAna version, elements and topology, units, descriptors
+with their code hashes, tracks, thresholds per score and role, budget, onset
+rule) and `state.npz` (fitted arrays, no pickle). Callers use its metadata API,
+`score`, `exceedance` and `attribute`, never the fitted state. It refuses a
+bundle of another format version, changed or unimported descriptor code or other
+units, and frames of another atom count, element order or unit. The batch
+pipeline fits one with a single joined track `geometric`, scored by T² only, and
+saves it to `outputs/models/geometric.bundle`.
 
 **Frame check** — what `validate_frame` returns for a first frame that passed
 the hard checks: stretched bonds and possible same-element swaps against the
 bundle's reference geometry. Diagnostics, not proof of atom identity.
 
-*Planned (not built):*
-
 **Descriptor registry** — descriptors as functions marked `@descriptor("name")`,
-each returning named numbers with their atoms and a group ID (a dihedral's sin and
-cos share one). Built-ins plus user modules named in the config.
+each mapping a batch of frames and the topology to named numbers, with each
+number's atoms and group ID returned alongside the values. Built-ins (bonds,
+angles, dihedrals, ring) plus user modules named as `module:function`.
+Parameters live in the user's module, not in DetectAna. A bundle never imports
+a user module itself.
+
+**Descriptor group** — the numbers that are explained together: one bond, one
+angle, one dihedral's sin and cos, the ring planarity. The descriptor author
+defines them; a group's atoms are all atoms its numbers name. Its size is
+reported with every attribution, since larger groups tend to show larger RBC.
 
 **Track** — a set of descriptor numbers fitted, scored and thresholded together,
 as the embedding track is. Default (provisional): bonds, angles, dihedrals, ring.
+The *joined track* puts all four into one; the batch pipeline uses it.
 
-**Threshold role** — what `MahalanobisScorer.thresholds` keys today (`bead`,
-`centroid`, still called "track" in the code until ADR 0006 is built): different
-cut-offs on the same score inside one track. Not a track.
+**Test** — one score of one track (T² or SPE) against its own thresholds, e.g.
+"bonds, SPE". A test is *active* when its score can fire; an inactive SPE is not
+a test. A frame is marked for a role when any active test exceeds its threshold.
+
+**False-alarm budget** — the total false-alarm rate α of a threshold role
+(1 − percentile/100), split equally over the active tests (Bonferroni: each test
+gets α/K). Holds whatever the correlation between tests; conservative when they
+are correlated.
+
+**Threshold role** — `bead` or `centroid` (`role=` in `MahalanobisScorer`):
+different cut-offs on the same score inside one track. Not a track.
 
 **T²** — Hotelling's statistic, the squared Mahalanobis distance in the kept PCA
 space: unusual within the motions the training data showed. Every stored score
@@ -103,11 +118,23 @@ pipeline and the embedding track; "distance" is only a label for √T²
 (`MahalanobisScorer.score`). Up to 0.3.0 the pipeline stored the distance.
 
 **SPE (Q)** — squared prediction error of the PCA residual: a new kind of motion
-the training data never showed. Inactive when PCA keeps every direction.
+the training data never showed. Inactive when PCA keeps every direction or the
+validation residual is numerically zero; an inactive SPE is not a test and takes
+no budget.
 
 **Attribution strength (RBC)** — reconstruction-based contribution: how much a
 score would drop if one descriptor group were reconstructed to its expected value.
 Values overlap and do not sum to the score; never call them shares.
+
+**Atom strength** — the largest attribution strength among the descriptor groups
+that involve an atom. A pointer for colouring a molecule, in score units; the
+explanation itself is the group.
+
+**Exceedance** — for one threshold role, the largest score ÷ threshold over a
+frame's active tests, with the test that produced it. Above 1 = the frame is
+marked. Its size is not comparable across tests; only "above 1" has a
+statistical meaning. The one per-frame signal the window rule reads.
+_Avoid_: threshold ratio, severity.
 
 **Mark, alarm** — a mark is one frame above a threshold; an alarm is the window
 rule firing, i.e. the anomaly persisted.

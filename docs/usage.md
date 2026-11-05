@@ -186,32 +186,73 @@ from detectana.topology import build_topology
 topo = build_topology("initial.xyz")              # or an ase Atoms object
 bundle = detectana.fit(
     train, valid, topo,                            # (n_frames, n_atoms, 3), Å
-    percentiles={"bead": 99.0, "centroid": 99.0},
+    percentiles={"bead": 99.0, "centroid": 99.0},  # total budget per threshold role
     window_frames=500, step_frames=50, fraction_threshold=0.2,
 )
 bundle.save("aspirin.bundle")
 
 bundle = detectana.load("aspirin.bundle")          # refuses a mismatched bundle
 bundle.validate_frame(elements, first_frame)       # atom order, count, unit
-t2 = bundle.score(frames)["geometric"]             # T² per frame
-flags = t2 > bundle.thresholds("geometric")["bead"]
-
+scores = bundle.score(frames)                      # {"bonds": {"T2": ..., "SPE": ...}, ...}
+ex = bundle.exceedance(scores, role="bead")        # largest score/threshold per frame
 stream = bundle.onset_rule.stream()                # same result as detect_onset
-for flag in flags:
-    onset = stream.push(float(flag))               # window start frame, or None
+for marked in ex.marked:
+    onset = stream.push(float(marked))             # window start frame, or None
+
+why = bundle.attribute(frames, "bonds", score="T2")   # RBC per descriptor group
+why.top(frame=0, k=5)                                 # strongest groups first
+why.atom_strength                                     # (n_frames, n_atoms)
 ```
 
-The bundle directory holds `manifest.json` (format version, statistic, DetectAna
-version, elements and topology, units, feature names, PCA parameters, thresholds,
-onset rule, descriptor code hash) and `state.npz` (fitted arrays, no pickle).
-`load` refuses another format version, changed descriptor code, other units, or
-arrays that disagree with the manifest; `validate_frame` and `score` refuse
-frames with another atom count, element order or unit. Every refusal is a
-`detectana.BundleError`.
+**Tracks.** By default a bundle has four tracks — `bonds`, `angles`,
+`dihedrals`, `ring` — each standardised, reduced by PCA and scored twice: **T²**
+(unusual within the motions training showed) and **SPE** (the squared PCA
+residual: a new kind of motion). SPE is inactive when PCA keeps every direction,
+as for the one-number ring track. This default is **provisional** until the
+benchmark (`scripts/benchmark_tracks.py`) settles it; `tracks=detectana.JOINED_TRACKS,
+scores=("T2",)` gives the step-1 single joined track, which the batch pipeline
+uses.
 
-The bundle stores **T²**, the squared Mahalanobis distance, and its thresholds
-are percentiles of validation T². The batch pipeline fits the same bundle and
-reports the same T² (`outputs/models/geometric.bundle`).
+**Budget.** Each active (track, score) pair is a *test*. A role's false-alarm
+rate α = 1 − percentile/100 is split equally over the K tests (Bonferroni), and
+a frame is marked when any test exceeds its threshold. `exceedance` is that rule
+as one number per frame: above 1 means marked. Its size is not comparable
+across tests. `fit` warns when the validation set is too small for α/K.
+
+**Attribution.** `attribute` gives each descriptor group's reconstruction-based
+contribution (RBC): how much the score would drop if that group were moved to the
+values the model expects. A dihedral's sin and cos are one group. Values are
+*attribution strengths*: they overlap and do not sum to the score, so never
+present them as shares. Larger groups tend to show larger values.
+
+**Your own descriptor.** Mark a function in your own module:
+
+```python
+import numpy as np
+from detectana import DescriptorValues, descriptor
+
+@descriptor("pair_distance")
+def pair_distance(positions, topology):          # (n_frames, n_atoms, 3) Å
+    d = np.linalg.norm(positions[:, 0] - positions[:, 1], axis=-1)
+    return DescriptorValues(d[:, None], names=("d01",), atoms=((0, 1),), groups=("d01",))
+```
+
+and name it in a track: `detectana.fit(..., tracks={"bonds": ["bonds"],
+"pair": ["mypkg.mydesc:pair_distance"]})`. `fit` imports the module; `load`
+never does — import it first, or `detectana.load(path,
+descriptor_modules=["mypkg.mydesc"])`. Parameters (cutoffs, reference
+geometries) live in your module. The bundle stores a hash of the whole module
+file and your package's version; any edit to that file refuses old bundles.
+Code imported from *other* files of an editable install is not covered.
+
+The bundle directory holds `manifest.json` (format version 2, DetectAna version,
+elements and topology, units, each descriptor's reference, code hash and number
+names, each track's numbers with their atoms and groups, PCA parameters,
+thresholds per score and role, the budget, onset rule) and `state.npz` (fitted
+arrays, no pickle). `load` refuses another format version, changed or
+unimported descriptor code, other units, or arrays that disagree with the
+manifest; `validate_frame` and `score` refuse frames with another atom count,
+element order or unit. Every refusal is a `detectana.BundleError`.
 
 `validate_frame` also returns a `FrameCheck` with two diagnostics against the
 geometry the topology was built from: bonds stretched past 1.5× their reference
@@ -357,6 +398,21 @@ Writes `detection_benchmark.csv`/`.json`/`.png` and `torsion_coverage.csv` under
 `outputs/<...>/benchmark/`. What it measures and why the positives are labelled by
 training coverage is in [ADR 0004](adr/0004-detector-evaluation.md).
 
+### Comparing tracks and SPE
+
+```bash
+python scripts/benchmark_tracks.py --config config/local.yaml --false-flag-rate 0.01
+python scripts/benchmark_tracks.py --config config/demo.yaml \
+    --synthetic 3000 2000 --motion harmonic          # demo data, labelled as such
+```
+
+Compares one joined track against the four-track default, each with and without
+SPE, at the same total false-alarm rate (ADR 0006), plus per-group RBC used as an
+alarm, reported separately. Writes `tracks_benchmark.csv`/`.json` under
+`outputs/<...>/benchmark_tracks/`. With `--synthetic` the frames are generated
+(`detectana.synthetic`) and every output says so: they test the machinery, not
+the default on real data.
+
 ### Score against force-field error
 
 ```bash
@@ -430,13 +486,16 @@ src/detectana/
   io.py               XYZ and HDF5 loaders, MoleculeSpec frame validation
   xyz_reader.py       Byte-offset-indexed reader for multi-GB XYZ files
   topology.py         Bond graph, angles, dihedrals, ring, hard-chemistry checks
-  descriptors.py      Internal-coordinate fingerprint + StandardScaler + PCA
-  scorer.py           Mahalanobis scorer and threshold calibration
-  bundle.py           Reference bundle: fit, save, load, score (library interface)
+  descriptors.py      Internal-coordinate fingerprint, built-in descriptors, StandardScaler + PCA
+  registry.py         Descriptor registry: @descriptor, module:function references, code hashes
+  scorer.py           Mahalanobis scorer and threshold calibration (threshold roles)
+  bundle.py           Reference bundle: fit, save, load, score, exceedance, attribute
+  attribution.py      Reconstruction-based contribution (RBC) per descriptor group
   embedding_scorer.py Per-atom Mahalanobis scorer in MLFF embedding space
   aggregator.py       Bead-score aggregation per timestep
   onset.py            Windowed onset rule (batch and streaming) + false-alarm arithmetic
   evaluation.py       Detection metrics, error correlation, controlled distortions
+  synthetic.py        Demo frames: per-atom rattle or harmonic normal modes
   pipeline.py         The orchestrator
 scripts/
   run_pipeline.py             Main pipeline, XYZ or HDF5 input
@@ -444,6 +503,7 @@ scripts/
   extract_onset_frames.py     Frames around the onset
   select_configurations.py    Training-set selection in descriptor space
   benchmark_detector.py       Detector benchmark against known distortions
+  benchmark_tracks.py         Joined vs four tracks, with and without SPE
   score_vs_error.py           OOD score against force-field error
   extract_embeddings.py       MLFF per-atom embeddings to HDF5
   make_demo_data.py           Regenerates data/smoke/

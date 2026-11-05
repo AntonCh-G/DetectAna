@@ -13,6 +13,27 @@ produces results that still look plausible. See
 ## Unreleased
 
 ### Added
+- **Descriptor registry** (ADR 0006, `detectana.registry`): `@descriptor("name")`
+  marks `fn(positions, topology) -> DescriptorValues` (values plus each number's
+  name, atoms and group). Built-ins `bonds`, `angles`, `dihedrals`, `ring`; side by
+  side they equal the joined internal-coordinate descriptor bit for bit. User
+  descriptors are named `module.path:function`.
+- **Tracks, SPE and the false-alarm budget** (ADR 0006, 0007): `fit(tracks=...,
+  scores=...)`. Each track gets T² and SPE (the squared PCA residual); SPE is
+  inactive when PCA keeps every direction or no residual variance remains. A
+  threshold role's α is split equally over the active tests (Bonferroni). The
+  default is four tracks — bonds, angles, dihedrals, ring — **provisional** until
+  benchmarked on real data. `detectana.JOINED_TRACKS` gives the single joined track.
+- `ReferenceBundle.exceedance(scores, role)`: largest score ÷ threshold per frame
+  and the test behind it; above 1 = marked.
+- `ReferenceBundle.attribute(frames, track, score)`: reconstruction-based
+  contribution (RBC) per descriptor group, mapped to atoms (`detectana.attribution`).
+  Attribution strengths overlap and do not sum to the score.
+- `scripts/benchmark_tracks.py`: joined vs four tracks, with and without SPE, at
+  one total false-alarm rate; per-group RBC as an alarm reported separately.
+- `detectana.synthetic`: demo frames by per-atom rattle (the smoke set, unchanged)
+  or by thermal sampling of a harmonic spring model (atoms move together).
+- `topology.complete_topology()` fills feature names and index arrays.
 - **Reference bundle** (ADR 0005): `detectana.fit(train, valid, topology)` →
   `ReferenceBundle` with `save`, `detectana.load`, `score(frames)` →
   `{"geometric": T²}`, `validate_frame`, and a metadata API (elements, atom
@@ -32,6 +53,19 @@ produces results that still look plausible. See
 - `ReferenceBundle.score_features` scores descriptors computed elsewhere.
 
 ### Changed
+- **Bundle format 2.** `score()` returns `{track: {"T2": ..., "SPE": ...}}`;
+  `thresholds(track)` returns `{score: {role: value}}`. Format-1 bundles are refused
+  (refit). The manifest records each descriptor's reference, code hash and numbers.
+  `load(path, descriptor_modules=[...])`: a user descriptor's module is never
+  imported because a bundle names it.
+- **Scientific definition: thresholds of multi-test bundles.** With K active tests,
+  each threshold is the 100·(1 − α/K) percentile of validation values, not the
+  configured percentile. A one-test bundle (the batch pipeline's) is unchanged.
+- The batch pipeline fits the joined track scored by T² only: its outputs are
+  unchanged. A config with `tracks:` or `scores:` is refused until the pipeline
+  supports them.
+- `MahalanobisScorer`: `track=` is renamed `role=` (threshold role), and
+  `DEFAULT_TRACK` is `DEFAULT_ROLE`. Pickles are unaffected.
 - Core dependencies are `numpy`, `scipy`, `scikit-learn`, `ase`. `pandas`,
   `matplotlib`, `h5py`, `pyyaml`, `joblib` moved to a `[pipeline]` extra, which
   `[dev]` includes. Install with `pip install "detectana[pipeline]"` to run the
@@ -54,6 +88,10 @@ produces results that still look plausible. See
   refused on load. `score_vs_error.py --reuse-scan` refuses a pre-T² scan, and
   `extract_onset_frames.py --threshold` (now in T² units) refuses a run whose
   manifest does not record T².
+
+### Removed
+- `DescriptorPipeline.inverse_contributions`: it returned PCA residuals while its
+  docstring claimed a share of the score. Use SPE and `attribute` (issue 01).
 
 ### Fixed
 - Fitting a one-feature input crashed `MahalanobisScorer.fit` (`np.cov` returns

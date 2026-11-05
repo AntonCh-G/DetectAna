@@ -1,7 +1,9 @@
 # ADR 0007 — A second score for new kinds of motion, and attribution by reconstruction
 
-**Status:** Accepted (not built). Must pass the benchmark (ADR 0004) before being
-claimed in a paper.
+**Status:** Accepted; built 2026-11-05 (`bundle.py`, `attribution.py`). Must pass
+the benchmark (ADR 0004) on real reference data before being claimed in a paper.
+SPE is also reported inactive when the largest validation SPE is below 1e-10
+(numerically no residual), not only when PCA keeps every direction.
 **Date:** 2026-11-04
 
 ## Context
