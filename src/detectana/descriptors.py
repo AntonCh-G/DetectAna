@@ -250,29 +250,6 @@ class DescriptorPipeline:
         return self._pca.transform(X_scaled)  # type: ignore[union-attr]
 
     # ------------------------------------------------------------------
-    def inverse_contributions(self, X: np.ndarray) -> np.ndarray:
-        """Return per-original-feature squared contribution to PCA score.
-
-        Useful for identifying which internal coordinate drives an anomaly.
-
-        Parameters
-        ----------
-        X : (n_frames, n_features) raw descriptors
-
-        Returns
-        -------
-        contributions : (n_frames, n_features)
-            Each row sums to approximately the squared Mahalanobis distance
-            in PCA space (up to the variance explained).
-        """
-        self._check_fitted()
-        X_scaled = self._scaler.transform(X)  # type: ignore[union-attr]
-        # Project to PCA then reconstruct back — residual carries the variance
-        X_pca = self._pca.transform(X_scaled)  # type: ignore[union-attr]
-        X_recon = self._pca.inverse_transform(X_pca)  # type: ignore[union-attr]
-        return (X_scaled - X_recon) ** 2
-
-    # ------------------------------------------------------------------
     @property
     def n_components(self) -> int:
         self._check_fitted()
