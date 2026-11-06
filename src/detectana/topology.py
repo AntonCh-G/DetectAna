@@ -128,6 +128,7 @@ def build_topology(
     nl_mult: float = 1.1,
     ring_atoms: Sequence[int] | None = None,
     ring_size: int = 6,
+    bonds: Sequence[tuple[int, int]] | None = None,
 ) -> MoleculeTopology:
     """Build topology from the first frame of ``initial_xyz``.
 
@@ -143,6 +144,11 @@ def build_topology(
         Pass an empty sequence to switch the planarity feature off.
     ring_size : ring length to search for when ``ring_atoms`` is None
         (default 6, i.e. a benzene-like carbon ring).
+    bonds : the bond graph as 0-based atom pairs, found by the caller (for
+        example by a chemistry toolkit over many frames). Replaces the
+        covalent-radii search, which reads one geometry only: a single thermal
+        frame can squeeze two non-bonded atoms into range or stretch a bond out
+        of it. Angles, dihedrals and the ring are derived from it as usual.
     """
     from detectana.io import load_single_frame
 
@@ -159,22 +165,26 @@ def build_topology(
     )
 
     # ── Bond graph ──────────────────────────────────────────────────────────
-    cutoffs = natural_cutoffs(atoms, mult=nl_mult)
-    nl = NeighborList(cutoffs, self_interaction=False, bothways=True)
-    nl.update(atoms)
-    conn = nl.get_connectivity_matrix(sparse=False)
-
-    topo.bonds = [
-        (i, j)
-        for i in range(topo.n_atoms)
-        for j in range(i + 1, topo.n_atoms)
-        if conn[i, j] > 0
-    ]
+    if bonds is not None:
+        pairs = sorted({(min(int(i), int(j)), max(int(i), int(j))) for i, j in bonds})
+        bad = [p for p in pairs if p[0] == p[1] or p[0] < 0 or p[1] >= topo.n_atoms]
+        if bad:
+            raise ValueError(f"bonds {bad} are not pairs of distinct atoms of {topo.n_atoms}")
+        topo.bonds = pairs
+    else:
+        cutoffs = natural_cutoffs(atoms, mult=nl_mult)
+        nl = NeighborList(cutoffs, self_interaction=False, bothways=True)
+        nl.update(atoms)
+        conn = nl.get_connectivity_matrix(sparse=False)
+        topo.bonds = [
+            (i, j)
+            for i in range(topo.n_atoms)
+            for j in range(i + 1, topo.n_atoms)
+            if conn[i, j] > 0
+        ]
 
     if not topo.bonds:
-        raise ValueError(
-            f"No bonds detected in {source} with nl_mult={nl_mult}"
-        )
+        raise ValueError(f"No bonds detected in {source}")
 
     # ── Adjacency dict ───────────────────────────────────────────────────────
     adj: dict[int, list[int]] = {i: [] for i in range(topo.n_atoms)}

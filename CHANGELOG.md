@@ -13,6 +13,11 @@ produces results that still look plausible. See
 ## Unreleased
 
 ### Added
+- **`build_topology(..., bonds=...)`**: the caller gives the bond graph (for
+  example found by a chemistry toolkit over many frames); angles, dihedrals and
+  the ring follow from it. The covalent-radii search reads one geometry, and a
+  single thermal frame can squeeze two non-bonded atoms into its range (its
+  neighbour list adds a 0.3 Å skin per atom) or stretch a bond out of it.
 - **Descriptor registry** (ADR 0006, `detectana.registry`): `@descriptor("name")`
   marks `fn(positions, topology) -> DescriptorValues` (values plus each number's
   name, atoms and group). Built-ins `bonds`, `angles`, `dihedrals`, `ring`; side by
