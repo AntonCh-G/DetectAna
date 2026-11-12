@@ -5,196 +5,106 @@
 [![Python 3.10+](https://img.shields.io/badge/python-3.10%2B-blue.svg)](https://www.python.org/)
 
 DetectAna finds the frame where an MD or PIMD trajectory leaves the region its
-machine-learned force field was trained on. That frame is where you cut the run,
-and the structures around it are the ones worth recomputing at a higher level of
-theory and adding to the training set.
+machine-learned force field was trained on. A force field drifting out of its
+training data keeps returning plausible forces, so nothing crashes. DetectAna
+scores every frame against the training data and reports when the run left it,
+at a false-alarm rate you set in advance.
 
-A force field is only reliable near its training data. A long simulation drifts
-away from it and the model keeps returning plausible forces anyway — nothing
-crashes, and you notice much later, when a bond has visibly stretched. DetectAna
-scores every frame against the reference training distribution and reports the
-onset with a false-alarm rate you state in advance rather than discover
-afterwards.
+That frame is where to cut the run, and the structures around it are the ones
+worth recomputing and adding to the training set. A flag means *outside the
+training data*, not *chemically impossible*.
 
-Python 3.10–3.12, CPU only. The force field stays external.
+![DetectAna scores inside FFAST during a LAMMPS run: the molecule in 3D, the descriptor groups behind an alarm, the worst test divided by its threshold against simulation step with alarm markers, and the event log.](docs/images/ffast-live-monitoring.png)
+
+*DetectAna running inside [FFAST](https://github.com/TCPUniLU/FFAST) during a
+LAMMPS run (in development). Plot **d** shows the highest score ÷ threshold per
+step; above 1 means the frame is marked. Panel **c** lists the dihedrals with
+the highest attribution strength for the alarm. The run stopped on a chemistry
+alarm.*
 
 ## Install
 
 ```bash
 git clone https://github.com/AntonCh-G/DetectAna.git
 cd DetectAna
-
-uv venv .venv --python 3.11      # or: python -m venv .venv
-source .venv/bin/activate
-uv pip install -e ".[dev]"
+pip install -e ".[pipeline]"     # batch pipeline, scripts, plots
+# pip install -e .               # library only: fit, save, load, score
+# pip install -e ".[dev]"        # + tests, ruff, mypy
 ```
 
-`[dev]` includes `[pipeline]`, which the batch pipeline, scripts and plots need
-(pandas, matplotlib, h5py, pyyaml, joblib). The core library alone — fit, save,
-load and score a reference bundle — needs only `pip install -e .`.
+Python 3.10–3.12, CPU only. The force field stays outside DetectAna.
 
 ## Use
 
-Run the whole pipeline on the demo data that ships with the repository:
+**Batch, after the run.** Try the demo, then copy the template for your data:
 
 ```bash
-python scripts/run_pipeline.py --config config/demo.yaml
-```
-
-Seconds, and writes to `outputs/demo/`: per-frame scores, a per-timestep
-aggregate, the onset table, a score-against-time plot, and a `manifest.json`
-recording the config, the calibrated threshold and the false-alarm arithmetic
-behind the result.
-
-Check the install:
-
-```bash
-pytest tests/ -v
-```
-
-For your own data, copy the annotated template and fill in the paths:
-
-```bash
-cp config/example.yaml config/local.yaml     # config/local.yaml is git-ignored
+python scripts/run_pipeline.py --config config/demo.yaml     # seconds; writes outputs/demo/
+cp config/example.yaml config/local.yaml                     # fill in your paths
 python scripts/run_pipeline.py --config config/local.yaml
 ```
 
-You need three things: an `initial.xyz` defining the molecule, the reference
-`train`/`valid`/`test` split the force field was fitted on, and the trajectory —
-as i-PI XYZ (one file per bead plus a centroid), as a single HDF5 file, or, for
-classical MD, as one file in any format ASE reads (`.traj`, extended XYZ, ...).
-Every key is documented in **[docs/usage.md](docs/usage.md)**; data requirements and determinism are in
-**[docs/reproducibility.md](docs/reproducibility.md)**.
+You need an `initial.xyz` defining the molecule, the force field's
+`train`/`valid` reference frames, and the trajectory in one of these forms:
+i-PI XYZ (one file per bead plus a centroid), one HDF5 file, or, for classical
+MD, one file in any format ASE reads (`.traj`, extxyz, ...). You get per-frame
+scores, an onset table (first bead, persistent bead, centroid and collective
+onset), chemistry flags, the atoms behind each alarm, plots and a `manifest.json`
+recording every parameter.
 
-Other entry points, all with `--help`:
+**Library, frame by frame.**
 
-| Script | Does |
-|---|---|
-| `scripts/benchmark_detector.py` | Measures the detector against distortions of known size |
-| `scripts/benchmark_tracks.py` | Compares one joined track with four tracks, with and without SPE |
-| `scripts/extract_onset_frames.py` | Pulls the frames around a detected onset |
-| `scripts/select_configurations.py` | Picks a diverse set of configurations for retraining |
-| `scripts/score_vs_error.py` | Relates the OOD score to force-field error |
-| `scripts/extract_embeddings.py` | Force-field per-atom embeddings → HDF5 (GPU, optional track) |
-| `scripts/make_demo_data.py` | Regenerates `data/smoke/` |
+```python
+import detectana
+from detectana.topology import build_topology
+
+bundle = detectana.fit(train, valid, build_topology("initial.xyz"))  # (frames, atoms, 3), Å
+bundle.save("aspirin.bundle")
+
+bundle = detectana.load("aspirin.bundle")
+marked = bundle.exceedance(bundle.score(frames), role="bead").marked
+why = bundle.attribute(frames, "dihedrals", score="SPE")             # which atoms
+```
 
 ## How it works
 
-1. **Topology** from the run's `initial.xyz` — bonds, angles, dihedrals, optional
-   ring. Every frame of every file is validated against it for atom count and
-   element order; a mismatch is a hard failure, because internal coordinates are
-   index tuples and a reordered file gives silently wrong descriptors.
-2. **Descriptor**: bond lengths, bond angles, every dihedral as a $(\sin, \cos)$
-   pair so the $0 \to 2\pi$ wrap is continuous, plus ring planarity.
-3. **Fit on training frames only**, per *track*. By default there are four
-   tracks — bonds, angles, dihedrals, ring — each standardised and reduced by
-   PCA, then scored twice: T², the squared Mahalanobis distance (unusual within
-   the motions training showed), and SPE, the squared PCA residual (a new kind of
-   motion). The default is provisional until benchmarked on real data. The fit is
-   saved as a reference bundle (`outputs/models/geometric.bundle`).
-4. **Calibrate on held-out validation frames.** Each (track, score) pair is a
-   test. The false-alarm rate α = 1 − percentile/100 is split equally over the
-   tests, and each test's threshold is a percentile of its validation scores. A
-   frame is marked when any test exceeds its threshold; the pipeline stores the
-   largest score ÷ threshold, so above 1 means marked. Nothing from the trajectory
-   touches the fit or the threshold.
-5. **Aggregate across beads without averaging** — per timestep: max, 95th
-   percentile, and fraction above threshold. A single bead can leave the training
-   region long before the centroid notices, and a mean erases that.
-6. **Detect onset with a window rule.** A threshold that flags a fraction α of
-   in-distribution frames flags ~α of *any* long run, so the first flagged frame
-   says more about the threshold than the trajectory. The detector is the fraction
-   of a window that must be flagged; under the null that count is binomial over an
-   autocorrelation-corrected effective sample size. State a `false_alarm_budget`
-   and the most sensitive rule inside it is derived for you.
-7. **Hard-chemistry checks kept separate** — broken bonds, close contacts, ring
-   planarity, in their own file, because "out of distribution" and "unphysical"
-   are different claims.
-8. **Attribution.** For marked frames, the descriptor groups (a bond, an angle, a
-   dihedral) that pushed the score up most, mapped to atoms. These are
-   attribution strengths: they overlap and do not sum to the score.
+1. **Descriptor**: bond lengths, angles, dihedrals (as sin, cos) and ring
+   planarity, taken from the molecule in `initial.xyz`. The atom order is
+   checked on every frame.
+2. **Four tracks** (bonds, angles, dihedrals, ring), each fitted on training
+   frames only and scored twice. **T²** asks whether a frame is unusual among
+   the motions seen in training. **SPE** asks whether it shows a new kind of
+   motion.
+3. **Thresholds** come from held-out validation frames. The false-alarm rate is
+   split across the tests.
+4. **Onset** is a window rule, not the first flagged frame. You state the
+   false-alarm chance you accept for the whole run.
+5. **Beads are kept apart.** A single bead can leave the training data before
+   the centroid does, so bead, centroid and run onsets are reported separately.
+6. **Chemistry checks** (broken bonds, close contacts) and **attribution** to
+   atoms are reported separately from the score.
 
-The full treatment, with equations and the reasoning behind each choice, is in
-**[docs/methodology.md](docs/methodology.md)**.
+Equations and reasoning are in [docs/methodology.md](docs/methodology.md).
 
-An optional second track scores in the force field's own invariant embedding
-space, which asks "has the model seen anything like this?" rather than "is this
-structure unusual?" ([ADR 0002](docs/adr/0002-embedding-ood-track.md)).
+## Status and limits
 
-Developed on aspirin, but not tied to it: the molecule comes from the input
-geometry, and one with no ring simply drops the planarity feature
-([ADR 0003](docs/adr/0003-molecule-agnostic-topology.md)).
+Version 0.4.0, in development. The four-track default is provisional until it
+is benchmarked on real data. Benchmark results are withheld until the
+associated work is published; the code to reproduce them is here. Whether a
+high score predicts force-field error is not yet tested.
 
-## Validation status
-
-The detector has been evaluated against distortions of known size, with synthetic
-positives labelled by how much training data covers them rather than by
-distortion size — a distortion landing inside the training distribution is not an
-anomaly, and flagging it would be the error
-([ADR 0004](docs/adr/0004-detector-evaluation.md)).
-
-**The quantitative results are withheld.** They were measured on a reference
-dataset belonging to work that is not yet published, so neither the numbers nor
-the figures are in this repository, and they cannot be reproduced from a clone.
-The evaluation code is here and runs; `data/smoke/` is synthetic and stands in
-for the real reference data, so the benchmark reproduces the machinery and not
-the result. Both will be published together with the associated work.
-
-Separately, whether a high score predicts actual force-field error is **not yet
-answered**. `scripts/score_vs_error.py` implements the test and needs forces
-recomputed with the reference method. Until it runs, the score is a statement
-about training coverage only, which is all this repository claims for it.
-
-## Repository layout
-
-```
-src/detectana/     the library: io, topology, descriptors, registry, bundle,
-                   attribution, scorer, embedding_scorer, aggregator, onset,
-                   evaluation, synthetic, pipeline, xyz_reader
-scripts/           thin CLI entry points; orchestration and plotting only
-config/            demo.yaml (runs as-is) and example.yaml (annotated template)
-data/smoke/        synthetic demo dataset, generated by make_demo_data.py
-tests/             test suite; test_smoke.py is the scientific checklist, executable
-docs/              methodology, reproducibility, usage, scientific-rules,
-                   glossary, adr/
-```
-
-## Limitations
-
-- **Positions only.** Forces are loaded and unit-checked but never enter the
-  descriptor.
-- **Out of distribution is not unphysical.** A flag says the force field is
-  extrapolating; the hard-chemistry flags answer the separate question.
-- **Beads are not independent replicas.** They are path-integral images of one
-  molecule, so bead scores are early warnings and the run is the unit you compare
-  across models.
-- **One gas-phase molecule.** No periodic boundaries, no second molecule, no
-  reactions.
-- **The covariance needs data.** Roughly ten training frames per retained PCA
-  component is the floor; the benchmark warns below it, and the demo data is
-  deliberately below it.
-- **Global descriptor.** Local atomic-environment descriptors (SOAP, ACSF) would
-  be more expressive; left out to avoid a heavy dependency
-  ([ADR 0001](docs/adr/0001-ood-scoring-method.md)).
-
-Next: validate the score against force-field error; compare the geometric and
-embedding tracks on one benchmark; close the active-learning loop (detect, select,
-recompute, retrain); add force-based descriptors.
-
-**Status:** v0.4.0, in active development. Interfaces may still change. Scientific
-definitions, thresholds and atom indexing will not change silently — see
-[docs/scientific-rules.md](docs/scientific-rules.md).
+The input must be one gas-phase molecule with a fixed atom order. Periodic
+boxes are not unwrapped. Only positions are used, not forces.
 
 ## Documentation
 
-- [docs/methodology.md](docs/methodology.md) — the full method, with equations
-- [docs/reproducibility.md](docs/reproducibility.md) — environment, data, determinism
-- [docs/usage.md](docs/usage.md) — configuration reference, every script, outputs
-- [docs/scientific-rules.md](docs/scientific-rules.md) — constraints; read before changing anything
-- [docs/glossary.md](docs/glossary.md) — terms, units, array shapes
-- [docs/adr/](docs/adr/) — decision records, including rejected alternatives
-- [CHANGELOG.md](CHANGELOG.md) — what changed, with scientific changes called out
+- [Usage](docs/usage.md): every config key, script and output
+- [Methodology](docs/methodology.md): the method, with equations
+- [Reproducibility](docs/reproducibility.md): data, environment, determinism
+- [Scientific rules](docs/scientific-rules.md): read before changing anything
+- [Glossary](docs/glossary.md), [decision records](docs/adr/), [changelog](CHANGELOG.md)
 
 ## License and citation
 
-MIT, see [LICENSE](LICENSE). Citation metadata in [CITATION.cff](CITATION.cff).
+MIT, see [LICENSE](LICENSE). Citation metadata is in [CITATION.cff](CITATION.cff).
+The screenshot is from [FFAST](https://github.com/TCPUniLU/FFAST) (MIT).
