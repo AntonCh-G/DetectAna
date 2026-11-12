@@ -222,7 +222,33 @@ for marked in ex.marked:
 why = bundle.attribute(frames, "bonds", score="T2")   # RBC per descriptor group
 why.top(frame=0, k=5)                                 # strongest groups first
 why.atom_strength                                     # (n_frames, n_atoms)
+
+flags = bundle.check_chemistry(frames)             # per frame: broken bonds, close contacts, ring
+bundle.false_flag_rate("bead")                     # the role's total α, over all tests
 ```
+
+`frames` can come from any file ASE reads, e.g. a `.traj` written after the run:
+
+```python
+from detectana.io import load_ase_trajectory
+
+frames, _ = load_ase_trajectory("md.traj")          # (n_frames, n_atoms, 3), Å; checks atom order
+```
+
+`check_chemistry` uses the bundle's own bond graph, with cutoffs
+`bond_break_cutoff=2.0` and `close_contact_cutoff=1.2` Å by default. Its flags
+are a claim about the geometry, separate from the OOD scores.
+
+**Your own bond graph.** `build_topology` finds bonds from covalent radii in one
+geometry, and a single thermal frame can squeeze two non-bonded atoms into range
+or stretch a bond out of it. Give the bonds yourself to avoid that — for
+example from a chemistry toolkit run over many frames:
+
+```python
+topo = build_topology("initial.xyz", bonds=[(0, 1), (1, 2), ...])  # 0-based atom pairs
+```
+
+Angles, dihedrals and the ring then follow from those bonds.
 
 **Tracks.** By default a bundle has four tracks — `bonds`, `angles`,
 `dihedrals`, `ring` — each standardised, reduced by PCA and scored twice: **T²**
@@ -230,8 +256,8 @@ why.atom_strength                                     # (n_frames, n_atoms)
 residual: a new kind of motion). SPE is inactive when PCA keeps every direction,
 as for the one-number ring track. This default is **provisional** until the
 benchmark (`scripts/benchmark_tracks.py`) settles it; `tracks=detectana.JOINED_TRACKS,
-scores=("T2",)` gives the step-1 single joined track, which the batch pipeline
-uses.
+scores=("T2",)` gives the step-1 single joined track. The batch pipeline uses the
+same default unless the config sets `tracks:` and `scores:`.
 
 **Budget.** Each active (track, score) pair is a *test*. A role's false-alarm
 rate α = 1 − percentile/100 is split equally over the K tests (Bonferroni), and

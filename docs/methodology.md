@@ -209,8 +209,32 @@ $\alpha$ for a new exchangeable frame.
 Beads and the centroid may take different percentiles
 (`threshold.bead_percentile` / `centroid_percentile`), because a sensitive rule
 suits an early-warning signal and a strict one suits the classical-limit signal.
-Thresholds are stored per named track so calibrating one cannot overwrite
-another.
+These are *threshold roles*; thresholds are stored per role so calibrating one
+cannot overwrite another.
+
+**Tracks, SPE and the budget** ([ADR 0006](adr/0006-descriptor-registry-and-tracks.md),
+[ADR 0007](adr/0007-spe-score-and-reconstruction-based-attribution.md)). The
+descriptor is split into *tracks*, each standardised, projected and scored on its
+own. The default is four tracks — bonds, angles, dihedrals, ring — and is
+**provisional** until benchmarked on real data (`scripts/benchmark_tracks.py`).
+Each track has two scores:
+
+- $T^2$ above: how unusual the frame is *within* the directions PCA kept.
+- SPE (squared prediction error, also called $Q$): the squared residual left
+  after projecting onto those directions, $\mathrm{SPE}(x) = \lVert \tilde x -
+  P P^\top \tilde x \rVert^2$ with $\tilde x$ the standardised descriptor and $P$
+  the kept components. It catches a *new kind* of motion, which $T^2$ cannot see
+  because that motion lies outside the kept directions. SPE is inactive when PCA
+  keeps every direction or the largest validation SPE is below $10^{-10}$.
+
+Each active (track, score) pair is a *test*. With $K$ active tests, a role's
+$\alpha$ is split equally (Bonferroni): each test's threshold is the
+$100\,(1 - \alpha/K)$ percentile of its validation values, and a frame is marked
+when **any** test exceeds its threshold. The batch pipeline stores the
+*exceedance*, the largest score ÷ threshold over the tests, so above 1 means
+marked; its size is not comparable across tests. With one test ($K = 1$) this is
+the single-threshold rule above. `tracks: {geometric: [bonds, angles, dihedrals,
+ring]}` with `scores: [T2]` reproduces the 0.3.0 flags and onsets.
 
 **Nothing from the trajectory reaches either step.** The scaler, the PCA, the
 mean and the covariance come from `train`; the threshold from `valid`;
@@ -230,6 +254,19 @@ These answer a different question from the score and are reported in a different
 file. "Out of distribution" is a statement about the training set; "broken" is a
 statement about chemistry. Conflating them is the single most likely
 misinterpretation of this pipeline, which is why the outputs are kept apart.
+
+### 4.6 Attribution
+
+For a marked frame, reconstruction-based contribution (RBC; Alcala & Qin) gives
+each descriptor *group* — one bond, one angle, one dihedral's sin and cos
+together — the amount the score would drop if that group were moved to the value
+the model expects, for $T^2$ and for SPE. Groups map to atoms, so a flag can be
+traced to a part of the molecule ([ADR 0007](adr/0007-spe-score-and-reconstruction-based-attribution.md)).
+The values are **attribution strengths**: they overlap and do not sum to the
+score, and larger groups tend to show larger values, so they are never presented
+as shares or as causes. The pipeline writes the three strongest groups of each
+marked centroid frame to `frame_aggregate.csv`, and explains each alarm in
+`onset_attribution.csv`.
 
 ## 5. The embedding track (optional second measurement)
 
