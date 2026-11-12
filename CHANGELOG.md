@@ -126,6 +126,21 @@ scores are T², batch-pipeline scores are exceedances, and configs without
   `extract_onset_frames.py --threshold` (now in T² units) refuses a run whose
   manifest does not record T².
 
+- Bead files of unequal length no longer abort the run. The analysis uses the
+  frame range every bead covers — the shortest bead's extent — and reports it: a
+  warning naming the per-bead counts, and a `frame_alignment` block in
+  `manifest.json` recording `n_frames_used`, the counts found on disk, the
+  centroid count and how many frames were dropped. The same applies to the
+  embedding track, under `frame_alignment.embedding`. A simulation killed
+  mid-write is ordinary, and losing the whole analysis to it cost more than the
+  strictness bought. See [docs/scientific-rules.md](docs/scientific-rules.md).
+- Beads whose step numbers disagree over the common frame range are still a hard
+  failure, and now say so specifically. Trimming is safe only because it drops
+  frames from the tail, leaving frame *i* the same timestep in every bead; when
+  that does not hold, per-timestep aggregates would mix different times.
+- `trajectory:` runs record the same `frame_alignment` block (one bead, so nothing
+  is trimmed unless the centroid differs).
+
 ### Removed
 - `DescriptorPipeline.inverse_contributions`: it returned PCA residuals while its
   docstring claimed a share of the score. Use SPE and `attribute` (issue 01).
