@@ -37,13 +37,18 @@ python scripts/run_pipeline.py --config config/local.yaml --force-recompute
 files. Only `config/demo.yaml` and `config/example.yaml` are tracked; anything
 else you drop in `config/` is git-ignored, so local paths stay local.
 
-Three input layouts work:
+Four input layouts work. Each run names exactly one of `bead_glob`, `hdf5` or
+`trajectory`:
 
 - i-PI XYZ, one file per bead (`bead_glob`) plus a centroid file (`centroid_xyz`)
 - one HDF5 file holding all beads and the centroid (`hdf5`), via
   `scripts/run_pipeline_hdf5.py`
 - classical MD: point `bead_glob` and `centroid_xyz` at the same trajectory. With
   one replica, that replica is the centroid.
+- classical MD in any file ASE reads, such as `.traj` or extxyz (`trajectory`).
+  The file is bead 00 and the centroid. Steps are frame indices, so time is
+  frame × `timestep_fs` × `stride`. Positions are used as stored: a periodic run
+  whose molecule is split across the cell boundary looks like broken bonds.
 
 ## Configuration
 

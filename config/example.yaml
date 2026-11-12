@@ -38,8 +38,16 @@ runs:
     # Comment out the two lines above and uncomment this.
     # hdf5: "path/to/nvt_trajectory.hdf5"
 
+    # --- Option C: one classical MD file in any format ASE reads ---
+    # .traj, extxyz, ... It is bead 00 and the centroid. Comment out the
+    # Option A lines and uncomment this. `format` is ASE's format name, only
+    # needed when ASE cannot tell it from the file name. Positions are used as
+    # stored: a molecule split across a periodic cell looks like broken bonds.
+    # trajectory: "path/to/md.traj"
+    # format: "traj"
+
     # time_ps = MD step × timestep_fs for i-PI XYZ (the step already counts
-    # the stride); frame index × timestep_fs × stride for HDF5.
+    # the stride); frame index × timestep_fs × stride for HDF5 and Option C.
     timestep_fs: 0.2
     stride: 50
 

@@ -110,9 +110,9 @@ input and is left alone.
 |---|---|---|
 | `initial.xyz` | One frame, the reference geometry | Defines atom count, element order and the bond graph for the whole run. Everything else is validated against it |
 | Reference `train` / `valid` / `test` | Extended XYZ, disjoint splits of the set the force field was fitted on | `train` fits scaler/PCA/covariance, `valid` calibrates the threshold, `test` checks it. Positions in Å; forces (eV/Å) and energy (eV) optional for the geometric track |
-| Trajectory | One of three layouts, below | Never enters the fit or the calibration |
+| Trajectory | One of four layouts, below | Never enters the fit or the calibration |
 
-Three accepted trajectory layouts:
+Four accepted trajectory layouts:
 
 1. **i-PI XYZ** — one file per bead (`bead_glob`, sorted → bead 00, 01, …) plus a
    centroid file (`centroid_xyz`).
@@ -121,6 +121,9 @@ Three accepted trajectory layouts:
    deprecated wrapper kept for its two-threshold config schema.
 3. **Classical MD** — point `bead_glob` and `centroid_xyz` at the same
    trajectory. With one replica, that replica is the centroid.
+4. **Any file ASE reads** — one classical MD file, e.g. `.traj` or extxyz
+   (`trajectory:`, optional `format:` for ASE). It is bead 00 and the centroid;
+   steps are frame indices. Positions are not unwrapped.
 
 Array shapes and units for every format are tabulated in
 [glossary.md](glossary.md).

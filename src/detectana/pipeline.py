@@ -35,6 +35,7 @@ from detectana.embedding_scorer import EmbeddingPipeline
 from detectana.io import (
     MoleculeSpec,
     iter_bead_positions,
+    load_ase_trajectory,
     load_embeddings_h5,
     load_pimd_trajectory_hdf5,
     load_reference_frames,
@@ -175,12 +176,31 @@ def time_per_step_fs(run_cfg: dict) -> float:
     """Femtoseconds per unit of the ``step`` column of a run.
 
     XYZ runs carry i-PI's MD step number (the output stride is already in it), so
-    one step is one timestep. HDF5 runs carry the frame index, one per output
-    stride, so one step is timestep × stride.
+    one step is one timestep. HDF5 and ``trajectory:`` runs carry the frame index,
+    one per output stride, so one step is timestep × stride.
     """
-    if "hdf5" in run_cfg:
+    if "hdf5" in run_cfg or "trajectory" in run_cfg:
         return float(run_cfg["timestep_fs"]) * float(run_cfg["stride"])
     return float(run_cfg["timestep_fs"])
+
+
+RUN_SOURCES = ("bead_glob", "hdf5", "trajectory")
+
+
+def check_run_source(run_cfg: dict) -> str:
+    """The one trajectory source a run names: ``bead_glob``, ``hdf5`` or ``trajectory``.
+
+    Raises ValueError when a run names none of them, or more than one.
+    """
+    given = [key for key in RUN_SOURCES if key in run_cfg]
+    if len(given) != 1:
+        raise ValueError(
+            f"Run '{run_cfg.get('name', '?')}' must name exactly one of "
+            f"{', '.join(RUN_SOURCES)}; it names {given or 'none'}"
+        )
+    if given[0] == "bead_glob" and "centroid_xyz" not in run_cfg:
+        raise ValueError(f"Run '{run_cfg.get('name', '?')}': bead_glob needs centroid_xyz")
+    return given[0]
 
 
 # ---------------------------------------------------------------------------
@@ -201,6 +221,8 @@ def run_pipeline(cfg: dict) -> None:
     # Topology comes first: the first run's initial.xyz defines the molecule, and
     # every reference and trajectory frame is then validated against it.
     chem_cfg_global = cfg["chemistry"]
+    for run_cfg in cfg["runs"]:
+        check_run_source(run_cfg)
     first_run = cfg["runs"][0]
     topo = build_topology(
         first_run["initial_xyz"],
@@ -417,7 +439,8 @@ def _process_run(
     results: list[tuple[int, dict[str, np.ndarray], np.ndarray]]
     keys = _test_keys(bundle)
 
-    if "hdf5" in run_cfg:
+    source = check_run_source(run_cfg)
+    if source == "hdf5":
         # ── HDF5 path ─────────────────────────────────────────────────────────
         log.info("Loading HDF5 trajectory for run '%s' …", run_name)
         traj = load_pimd_trajectory_hdf5(run_cfg["hdf5"], spec=spec)
@@ -462,6 +485,38 @@ def _process_run(
             cache_dir=desc_cache_dir,
         )
         del traj  # release RAM early
+
+    elif source == "trajectory":
+        # ── One file ASE reads (.traj, extxyz, ...): classical MD ───────────
+        # A single trajectory is bead 00 and the centroid at once, as when an
+        # XYZ run points bead_glob and centroid_xyz at the same file.
+        log.info("Loading trajectory for run '%s' …", run_name)
+        positions, _ = load_ase_trajectory(
+            run_cfg["trajectory"], spec=spec, format=run_cfg.get("format")
+        )
+        results = [
+            _process_bead_array(
+                bead_idx=0,
+                bead_positions=positions,
+                desc_cache_dir=desc_cache_dir,
+                topo=topo,
+                bundle=bundle,
+                chem_cfg=chem_cfg,
+                force_recompute=force_recompute,
+                run_out=run_out,
+            )
+        ]
+        bead_raw = {k: results[0][1][k][None, :] for k in keys}
+        step_arrays = results[0][2]
+
+        centroid_raw, centroid_steps, centroid_descs = _score_centroid_array(
+            centroid_positions=positions,
+            topo=topo,
+            bundle=bundle,
+            force_recompute=force_recompute,
+            cache_dir=desc_cache_dir,
+        )
+        del positions
 
     else:
         # ── XYZ / bead_glob path (original) ──────────────────────────────────

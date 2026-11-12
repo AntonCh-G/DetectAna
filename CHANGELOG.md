@@ -13,6 +13,14 @@ produces results that still look plausible. See
 ## Unreleased
 
 ### Added
+- **`trajectory:` runs**: one classical MD file in any format ASE reads (`.traj`,
+  extxyz, ...), with optional `format:`. The file is bead 00 and the centroid;
+  steps are frame indices, so time is frame × `timestep_fs` × `stride`, as for
+  HDF5. Read by `detectana.io.load_ase_trajectory`, which checks each frame's
+  atom count and element order and warns that periodic frames are not
+  unwrapped. A run must now name exactly one of `bead_glob`, `hdf5`,
+  `trajectory`, and `bead_glob` needs `centroid_xyz`; the pipeline says so
+  before fitting instead of failing on a missing key later.
 - **`build_topology(..., bonds=...)`**: the caller gives the bond graph (for
   example found by a chemistry toolkit over many frames); angles, dihedrals and
   the ring follow from it. The covalent-radii search reads one geometry, and a
