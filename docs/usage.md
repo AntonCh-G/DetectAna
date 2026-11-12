@@ -12,7 +12,9 @@ For environment setup, data requirements and determinism, see
 ```bash
 uv venv .venv --python 3.11      # or python -m venv .venv
 source .venv/bin/activate
-uv pip install -e ".[dev]"
+uv pip install -e ".[dev]"      # tests, lint, and the [pipeline] extra
+uv pip install -e ".[pipeline]" # batch pipeline, scripts and plots only
+uv pip install -e .             # core library only: the reference bundle
 ```
 
 Python 3.10–3.12. CPU only — no deep-learning framework is imported anywhere.
@@ -35,13 +37,18 @@ python scripts/run_pipeline.py --config config/local.yaml --force-recompute
 files. Only `config/demo.yaml` and `config/example.yaml` are tracked; anything
 else you drop in `config/` is git-ignored, so local paths stay local.
 
-Three input layouts work:
+Four input layouts work. Each run names exactly one of `bead_glob`, `hdf5` or
+`trajectory`:
 
 - i-PI XYZ, one file per bead (`bead_glob`) plus a centroid file (`centroid_xyz`)
 - one HDF5 file holding all beads and the centroid (`hdf5`), via
   `scripts/run_pipeline_hdf5.py`
 - classical MD: point `bead_glob` and `centroid_xyz` at the same trajectory. With
   one replica, that replica is the centroid.
+- classical MD in any file ASE reads, such as `.traj` or extxyz (`trajectory`).
+  The file is bead 00 and the centroid. Steps are frame indices, so time is
+  frame × `timestep_fs` × `stride`. Positions are used as stored: a periodic run
+  whose molecule is split across the cell boundary looks like broken bonds.
 
 ## Configuration
 
@@ -159,19 +166,148 @@ cores you were allocated; oversubscribing makes it slower, not faster.
 outputs/
   onset_summary.csv                # one row per run
   models/
-    descriptor_pipeline.pkl        # fitted scaler + PCA
-    scorer.pkl                     # fitted Mahalanobis scorer
+    geometric.bundle/              # reference bundle: manifest.json + state.npz
   <run_name>/
-    manifest.json                  # config, version, threshold, onset design
+    manifest.json                  # config, version, tests, thresholds, budget, onset design
     onset_table.csv                # run-level onset summary
-    bead_scores.npy                # (n_beads, n_frames)
-    centroid_scores.npy            # (n_frames,)
-    frame_aggregate.csv            # aggregated scores per timestep
+    onset_attribution.csv          # strongest descriptor groups at each onset frame
+    bead_scores.npy                # (n_beads, n_frames), exceedance (bead role)
+    centroid_scores.npy            # (n_frames,), exceedance (centroid role)
+    bead_test_scores.npz           # raw T²/SPE per test, (n_beads, n_frames) each
+    centroid_test_scores.npz       # raw T²/SPE per test, (n_frames,) each
+    frame_aggregate.csv            # per timestep: aggregates, top test, per-test
+                                   #   centroid scores, top groups of marked frames
     chemistry_flags_bead00.csv     # hard-chemistry flags, bead 00
     descriptor_cache/              # raw descriptor NPZ caches, per bead
     plots/
       score_vs_time.png            # bead max/p95, fraction OOD, centroid
 ```
+
+**Scores are exceedances.** A run has several *tests* — each track's T² and
+SPE — each with its own threshold. The pipeline's per-frame score is the
+**exceedance**: the largest score ÷ threshold over the tests, for the bead role on
+beads and the centroid role on the centroid. Above 1 means the frame is marked;
+the fraction of beads, the window rule and the onsets work on that. Its size is
+not comparable across tests. `centroid_top_test` names the test that set it, and
+the raw scores of every test are in the `*_test_scores.npz` files and the
+`centroid_<track>_<score>` columns. A config with `tracks: {geometric: [bonds,
+angles, dihedrals, ring]}` and `scores: [T2]` reproduces the flags and onsets of
+runs made before tracks.
+
+## Library use: the reference bundle
+
+For scoring frames as they arrive (ADR 0005), fit once, save, and score from
+Python. Only the core install is needed.
+
+```python
+import detectana
+from detectana.topology import build_topology
+
+topo = build_topology("initial.xyz")              # or an ase Atoms object
+bundle = detectana.fit(
+    train, valid, topo,                            # (n_frames, n_atoms, 3), Å
+    percentiles={"bead": 99.0, "centroid": 99.0},  # total budget per threshold role
+    window_frames=500, step_frames=50, fraction_threshold=0.2,
+)
+bundle.save("aspirin.bundle")
+
+bundle = detectana.load("aspirin.bundle")          # refuses a mismatched bundle
+bundle.validate_frame(elements, first_frame)       # atom order, count, unit
+scores = bundle.score(frames)                      # {"bonds": {"T2": ..., "SPE": ...}, ...}
+ex = bundle.exceedance(scores, role="bead")        # largest score/threshold per frame
+stream = bundle.onset_rule.stream()                # same result as detect_onset
+for marked in ex.marked:
+    onset = stream.push(float(marked))             # window start frame, or None
+
+why = bundle.attribute(frames, "bonds", score="T2")   # RBC per descriptor group
+why.top(frame=0, k=5)                                 # strongest groups first
+why.atom_strength                                     # (n_frames, n_atoms)
+
+flags = bundle.check_chemistry(frames)             # per frame: broken bonds, close contacts, ring
+bundle.false_flag_rate("bead")                     # the role's total α, over all tests
+```
+
+`frames` can come from any file ASE reads, e.g. a `.traj` written after the run:
+
+```python
+from detectana.io import load_ase_trajectory
+
+frames, _ = load_ase_trajectory("md.traj")          # (n_frames, n_atoms, 3), Å; checks atom order
+```
+
+`check_chemistry` uses the bundle's own bond graph, with cutoffs
+`bond_break_cutoff=2.0` and `close_contact_cutoff=1.2` Å by default. Its flags
+are a claim about the geometry, separate from the OOD scores.
+
+**Your own bond graph.** `build_topology` finds bonds from covalent radii in one
+geometry, and a single thermal frame can squeeze two non-bonded atoms into range
+or stretch a bond out of it. Give the bonds yourself to avoid that — for
+example from a chemistry toolkit run over many frames:
+
+```python
+topo = build_topology("initial.xyz", bonds=[(0, 1), (1, 2), ...])  # 0-based atom pairs
+```
+
+Angles, dihedrals and the ring then follow from those bonds.
+
+**Tracks.** By default a bundle has four tracks — `bonds`, `angles`,
+`dihedrals`, `ring` — each standardised, reduced by PCA and scored twice: **T²**
+(unusual within the motions training showed) and **SPE** (the squared PCA
+residual: a new kind of motion). SPE is inactive when PCA keeps every direction,
+as for the one-number ring track. This default is **provisional** until the
+benchmark (`scripts/benchmark_tracks.py`) settles it; `tracks=detectana.JOINED_TRACKS,
+scores=("T2",)` gives the step-1 single joined track. The batch pipeline uses the
+same default unless the config sets `tracks:` and `scores:`.
+
+**Budget.** Each active (track, score) pair is a *test*. A role's false-alarm
+rate α = 1 − percentile/100 is split equally over the K tests (Bonferroni), and
+a frame is marked when any test exceeds its threshold. `exceedance` is that rule
+as one number per frame: above 1 means marked. Its size is not comparable
+across tests. `fit` warns when the validation set is too small for α/K.
+
+**Attribution.** `attribute` gives each descriptor group's reconstruction-based
+contribution (RBC): how much the score would drop if that group were moved to the
+values the model expects. A dihedral's sin and cos are one group. Values are
+*attribution strengths*: they overlap and do not sum to the score, so never
+present them as shares. Larger groups tend to show larger values.
+
+**Your own descriptor.** Mark a function in your own module:
+
+```python
+import numpy as np
+from detectana import DescriptorValues, descriptor
+
+@descriptor("pair_distance")
+def pair_distance(positions, topology):          # (n_frames, n_atoms, 3) Å
+    d = np.linalg.norm(positions[:, 0] - positions[:, 1], axis=-1)
+    return DescriptorValues(d[:, None], names=("d01",), atoms=((0, 1),), groups=("d01",))
+```
+
+and name it in a track: `detectana.fit(..., tracks={"bonds": ["bonds"],
+"pair": ["mypkg.mydesc:pair_distance"]})`. `fit` imports the module; `load`
+never does — import it first, or `detectana.load(path,
+descriptor_modules=["mypkg.mydesc"])`. Parameters (cutoffs, reference
+geometries) live in your module. The bundle stores a hash of the whole module
+file and your package's version; any edit to that file refuses old bundles.
+Code imported from *other* files of an editable install is not covered.
+
+The bundle directory holds `manifest.json` (format version 2, DetectAna version,
+elements and topology, units, each descriptor's reference, code hash and number
+names, each track's numbers with their atoms and groups, PCA parameters,
+thresholds per score and role, the budget, onset rule) and `state.npz` (fitted
+arrays, no pickle). `load` refuses another format version, changed or
+unimported descriptor code, other units, or arrays that disagree with the
+manifest; `validate_frame` and `score` refuse frames with another atom count,
+element order or unit. Every refusal is a `detectana.BundleError`.
+
+`validate_frame` also returns a `FrameCheck` with two diagnostics against the
+geometry the topology was built from: bonds stretched past 1.5× their reference
+length (catches swaps between atoms bonded to different partners) and possible
+same-element swaps from rigid alignment plus Hungarian matching (catches swaps
+the bond graph cannot see, such as two hydrogens on one carbon, but only while
+the frame is near the reference: a methyl group turned by 120° looks the same as
+a swap). Neither proves atom identity; starting the run from the bundle's
+reference frame, in its atom order, does.
 
 ## Scripts
 
@@ -308,6 +444,21 @@ Writes `detection_benchmark.csv`/`.json`/`.png` and `torsion_coverage.csv` under
 `outputs/<...>/benchmark/`. What it measures and why the positives are labelled by
 training coverage is in [ADR 0004](adr/0004-detector-evaluation.md).
 
+### Comparing tracks and SPE
+
+```bash
+python scripts/benchmark_tracks.py --config config/local.yaml --false-flag-rate 0.01
+python scripts/benchmark_tracks.py --config config/demo.yaml \
+    --synthetic 3000 2000 --motion harmonic          # demo data, labelled as such
+```
+
+Compares one joined track against the four-track default, each with and without
+SPE, at the same total false-alarm rate (ADR 0006), plus per-group RBC used as an
+alarm, reported separately. Writes `tracks_benchmark.csv`/`.json` under
+`outputs/<...>/benchmark_tracks/`. With `--synthetic` the frames are generated
+(`detectana.synthetic`) and every output says so: they test the machinery, not
+the default on real data.
+
 ### Score against force-field error
 
 ```bash
@@ -381,12 +532,16 @@ src/detectana/
   io.py               XYZ and HDF5 loaders, MoleculeSpec frame validation
   xyz_reader.py       Byte-offset-indexed reader for multi-GB XYZ files
   topology.py         Bond graph, angles, dihedrals, ring, hard-chemistry checks
-  descriptors.py      Internal-coordinate fingerprint + StandardScaler + PCA
-  scorer.py           Mahalanobis scorer and threshold calibration
+  descriptors.py      Internal-coordinate fingerprint, built-in descriptors, StandardScaler + PCA
+  registry.py         Descriptor registry: @descriptor, module:function references, code hashes
+  scorer.py           Mahalanobis scorer and threshold calibration (threshold roles)
+  bundle.py           Reference bundle: fit, save, load, score, exceedance, attribute
+  attribution.py      Reconstruction-based contribution (RBC) per descriptor group
   embedding_scorer.py Per-atom Mahalanobis scorer in MLFF embedding space
   aggregator.py       Bead-score aggregation per timestep
-  onset.py            Windowed fraction onset detector + false-alarm arithmetic
+  onset.py            Windowed onset rule (batch and streaming) + false-alarm arithmetic
   evaluation.py       Detection metrics, error correlation, controlled distortions
+  synthetic.py        Demo frames: per-atom rattle or harmonic normal modes
   pipeline.py         The orchestrator
 scripts/
   run_pipeline.py             Main pipeline, XYZ or HDF5 input
@@ -394,6 +549,7 @@ scripts/
   extract_onset_frames.py     Frames around the onset
   select_configurations.py    Training-set selection in descriptor space
   benchmark_detector.py       Detector benchmark against known distortions
+  benchmark_tracks.py         Joined vs four tracks, with and without SPE
   score_vs_error.py           OOD score against force-field error
   extract_embeddings.py       MLFF per-atom embeddings to HDF5
   make_demo_data.py           Regenerates data/smoke/

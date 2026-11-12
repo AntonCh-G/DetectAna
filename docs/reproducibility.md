@@ -40,8 +40,9 @@ uv pip install -e ".[dev]"       # or: pip install -e ".[dev]"
 ```
 
 Runtime dependencies and their floors are declared in
-[`pyproject.toml`](../pyproject.toml): `ase`, `numpy`, `scipy`, `scikit-learn`,
-`pandas`, `matplotlib`, `pyyaml`, `joblib`, `h5py`. `uv.lock` pins the exact
+[`pyproject.toml`](../pyproject.toml): the core library needs `ase`, `numpy`,
+`scipy` and `scikit-learn`; the batch pipeline and scripts add the `[pipeline]`
+extra, `pandas`, `matplotlib`, `pyyaml`, `joblib` and `h5py` (`[dev]` includes it). `uv.lock` pins the exact
 versions the project was last developed against; installing from it rather than
 from the floors is the way to reproduce bit-for-bit.
 
@@ -62,13 +63,15 @@ Writes to `outputs/demo/`, in seconds:
 outputs/demo/
   onset_summary.csv            # one row per run
   models/
-    descriptor_pipeline.pkl    # fitted scaler + PCA
-    scorer.pkl                 # fitted Mahalanobis scorer
+    geometric.bundle/          # reference bundle: manifest.json + state.npz
   demo/
     manifest.json              # config, version, threshold, topology, onset design
     onset_table.csv            # the four onset criteria
-    bead_scores.npy            # (n_beads, n_frames)
-    centroid_scores.npy        # (n_frames,)
+    onset_attribution.csv      # strongest descriptor groups at each onset
+    bead_scores.npy            # (n_beads, n_frames), exceedance
+    centroid_scores.npy        # (n_frames,), exceedance
+    bead_test_scores.npz       # raw T²/SPE per test
+    centroid_test_scores.npz
     frame_aggregate.csv        # per-timestep max / p95 / fraction OOD / centroid
     chemistry_flags_bead00.csv # hard-chemistry flags, separate from the score
     descriptor_cache/          # per-bead descriptor NPZ
@@ -107,9 +110,9 @@ input and is left alone.
 |---|---|---|
 | `initial.xyz` | One frame, the reference geometry | Defines atom count, element order and the bond graph for the whole run. Everything else is validated against it |
 | Reference `train` / `valid` / `test` | Extended XYZ, disjoint splits of the set the force field was fitted on | `train` fits scaler/PCA/covariance, `valid` calibrates the threshold, `test` checks it. Positions in Å; forces (eV/Å) and energy (eV) optional for the geometric track |
-| Trajectory | One of three layouts, below | Never enters the fit or the calibration |
+| Trajectory | One of four layouts, below | Never enters the fit or the calibration |
 
-Three accepted trajectory layouts:
+Four accepted trajectory layouts:
 
 1. **i-PI XYZ** — one file per bead (`bead_glob`, sorted → bead 00, 01, …) plus a
    centroid file (`centroid_xyz`).
@@ -118,6 +121,9 @@ Three accepted trajectory layouts:
    deprecated wrapper kept for its two-threshold config schema.
 3. **Classical MD** — point `bead_glob` and `centroid_xyz` at the same
    trajectory. With one replica, that replica is the centroid.
+4. **Any file ASE reads** — one classical MD file, e.g. `.traj` or extxyz
+   (`trajectory:`, optional `format:` for ASE). It is bead 00 and the centroid;
+   steps are frame indices. Positions are not unwrapped.
 
 Array shapes and units for every format are tabulated in
 [glossary.md](glossary.md).

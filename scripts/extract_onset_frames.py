@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import argparse
 import glob
+import json
 import math
 import re
 import sys
@@ -39,6 +40,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
 
 from detectana.aggregator import aggregate_bead_scores
 from detectana.onset import detect_onset
+from detectana.pipeline import time_per_step_fs
 from detectana.xyz_reader import load_or_build_index
 
 # NIST 2018 CODATA: 1 Hartree/Bohr = 51.4221 eV/Å
@@ -143,6 +145,22 @@ def _write_extxyz_frame(
 # CLI
 # ---------------------------------------------------------------------------
 
+def saved_score_units(run_manifest: Path) -> str:
+    """Units of a run's bead_scores.npy, from its manifest.
+
+    ``"exceedance"`` (score ÷ threshold over the tests; current runs) or ``"T2"``
+    (runs written before tracks). Runs that saved distances, or record neither,
+    raise ``ValueError``: a threshold would be compared on the wrong scale.
+    """
+    statistic = json.loads(run_manifest.read_text()).get("statistic") if run_manifest.exists() else None
+    if statistic in ("exceedance", "T2"):
+        return str(statistic)
+    raise ValueError(
+        f"{run_manifest} records neither exceedance nor T² scores (it has {statistic!r}): "
+        "rerun run_pipeline.py before overriding the threshold."
+    )
+
+
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(
         description="Extract frames around anomaly onset from the first-anomaly bead.",
@@ -164,8 +182,10 @@ def parse_args() -> argparse.Namespace:
                    ))
     p.add_argument("--threshold", type=float, default=None, metavar="SCORE",
                    help=(
-                       "Override the Mahalanobis distance threshold (e.g. 15.0). "
-                       "Read the value directly from the score_vs_time.png plot. "
+                       "Override the threshold, in the units of the run's saved scores: "
+                       "exceedance for current runs (1 = the calibrated thresholds, "
+                       "2 = every test at twice its threshold), T² for runs written "
+                       "before tracks. Read the value from score_vs_time.png. "
                        "Re-detects onset from saved bead_scores.npy. "
                        "If omitted, uses onset frame from onset_table.csv as-is."
                    ))
@@ -223,8 +243,12 @@ def main() -> None:
     onset_frame = int(onset_frame)
     bead_idx = int(bead_idx)
 
-    # ── Optional: re-detect onset at a different Mahalanobis threshold ────────
+    # ── Optional: re-detect onset at a different T² threshold ────────────────
     if args.threshold is not None:
+        try:
+            units = saved_score_units(run_out / "manifest.json")
+        except ValueError as exc:
+            sys.exit(str(exc))
         bead_scores_path = run_out / "bead_scores.npy"
         centroid_scores_path = run_out / "centroid_scores.npy"
         agg_csv_path = run_out / "frame_aggregate.csv"
@@ -234,13 +258,13 @@ def main() -> None:
                 sys.exit(f"Required file not found: {p}. Run run_pipeline.py first.")
 
         new_threshold = args.threshold
-        print(f"Threshold override: {new_threshold:.4f}")
+        print(f"Threshold override: {new_threshold:.4f} ({units})")
 
         bead_scores = np.load(bead_scores_path)       # (n_beads, n_frames)
         centroid_scores = np.load(centroid_scores_path)
         agg_df_src = pd.read_csv(agg_csv_path)
         steps = agg_df_src["step"].to_numpy()
-        frame_time_fs = run_cfg["timestep_fs"] * run_cfg["stride"]
+        frame_time_fs = time_per_step_fs(run_cfg)
 
         agg_df_new = aggregate_bead_scores(
             bead_scores=bead_scores,

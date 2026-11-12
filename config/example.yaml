@@ -38,7 +38,16 @@ runs:
     # Comment out the two lines above and uncomment this.
     # hdf5: "path/to/nvt_trajectory.hdf5"
 
-    # frame_time_fs = timestep_fs * stride
+    # --- Option C: one classical MD file in any format ASE reads ---
+    # .traj, extxyz, ... It is bead 00 and the centroid. Comment out the
+    # Option A lines and uncomment this. `format` is ASE's format name, only
+    # needed when ASE cannot tell it from the file name. Positions are used as
+    # stored: a molecule split across a periodic cell looks like broken bonds.
+    # trajectory: "path/to/md.traj"
+    # format: "traj"
+
+    # time_ps = MD step × timestep_fs for i-PI XYZ (the step already counts
+    # the stride); frame index × timestep_fs × stride for HDF5 and Option C.
     timestep_fs: 0.2
     stride: 50
 
@@ -53,9 +62,29 @@ descriptor:
   # Fixed so runs are reproducible.
   random_seed: 42
 
+# ── Tracks and scores (ADR 0006, 0007) ───────────────────────────────────────
+# Each track is fitted, scored and thresholded on its own: T² (unusual within the
+# motions training showed) and SPE (a new kind of motion). Left out, the library
+# default applies — four tracks, provisional. To reproduce runs made before
+# tracks, use the joined track with T² only:
+#
+# tracks:
+#   geometric: [bonds, angles, dihedrals, ring]
+# scores: [T2]
+#
+# A track can name your own descriptor as "module.path:function".
+#
+# tracks:
+#   bonds: [bonds]
+#   angles: [angles]
+#   dihedrals: [dihedrals]
+#   ring: [ring]
+# scores: [T2, SPE]
+
 # ── Threshold calibration ─────────────────────────────────────────────────────
 threshold:
-  # Which percentile of the validation-set scores becomes the OOD threshold.
+  # Total false-alarm budget: 100 − percentile is split equally over the active
+  # tests (track × score), each thresholded at its share of validation scores.
   percentile: 99.0
 
 # ── Hard-chemistry checks ─────────────────────────────────────────────────────

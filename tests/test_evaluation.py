@@ -293,3 +293,37 @@ def test_gap_rich_dihedral_raises_when_no_torsion_qualifies(ethanol_xyz):
     # … but demanding a fragment larger than the molecule leaves nothing eligible.
     with pytest.raises(ValueError, match="No rotatable"):
         most_gap_rich_dihedral(positions, ethanol_topo, min_fragment=99)
+
+
+# ---------------------------------------------------------------------------
+# Several tests at one total false-alarm budget (ADR 0006)
+# ---------------------------------------------------------------------------
+
+def test_union_thresholds_give_each_test_alpha_over_k():
+    from detectana.evaluation import conformal_threshold, union_thresholds
+
+    rng = np.random.default_rng(0)
+    calib = {("a", "T2"): rng.normal(size=500), ("b", "SPE"): rng.normal(size=500)}
+    thr = union_thresholds(calib, 0.02)
+    for test, scores in calib.items():
+        assert thr[test] == conformal_threshold(scores, 0.01)
+    one = union_thresholds({("a", "T2"): calib[("a", "T2")]}, 0.02)
+    assert one[("a", "T2")] == conformal_threshold(calib[("a", "T2")], 0.02)
+
+
+def test_union_flags_fire_when_any_test_exceeds():
+    from detectana.evaluation import union_flags
+
+    scores = {"x": np.array([0.0, 2.0, 0.0]), "y": np.array([0.0, 0.0, 5.0])}
+    np.testing.assert_array_equal(union_flags(scores, {"x": 1.0, "y": 4.0}), [False, True, True])
+
+
+def test_union_false_alarm_rate_stays_within_budget():
+    """Independent null tests: the union flags at most about α of new frames."""
+    from detectana.evaluation import union_flags, union_thresholds
+
+    rng = np.random.default_rng(1)
+    tests = [f"t{i}" for i in range(7)]
+    thr = union_thresholds({t: rng.normal(size=4000) for t in tests}, 0.05)
+    rate = union_flags({t: rng.normal(size=20000) for t in tests}, thr).mean()
+    assert rate <= 0.05 + 0.005

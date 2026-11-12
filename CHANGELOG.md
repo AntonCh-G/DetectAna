@@ -10,9 +10,122 @@ are called out explicitly whenever they change, because a silent change there
 produces results that still look plausible. See
 [docs/scientific-rules.md](docs/scientific-rules.md).
 
-## Unreleased
+## 0.4.0 — 2026-11-12
+
+A library you can call frame by frame: a saved reference bundle, four
+descriptor tracks each scored by T² and SPE under one false-alarm budget,
+attribution to atoms, and runs read from any file ASE reads. **Results change**:
+scores are T², batch-pipeline scores are exceedances, and configs without
+`tracks:` now use four tracks; see Changed for how to reproduce 0.3.0.
+
+### Added
+- **`trajectory:` runs**: one classical MD file in any format ASE reads (`.traj`,
+  extxyz, ...), with optional `format:`. The file is bead 00 and the centroid;
+  steps are frame indices, so time is frame × `timestep_fs` × `stride`, as for
+  HDF5. Read by `detectana.io.load_ase_trajectory`, which checks each frame's
+  atom count and element order and warns that periodic frames are not
+  unwrapped. A run must now name exactly one of `bead_glob`, `hdf5`,
+  `trajectory`, and `bead_glob` needs `centroid_xyz`; the pipeline says so
+  before fitting instead of failing on a missing key later.
+- **`build_topology(..., bonds=...)`**: the caller gives the bond graph (for
+  example found by a chemistry toolkit over many frames); angles, dihedrals and
+  the ring follow from it. The covalent-radii search reads one geometry, and a
+  single thermal frame can squeeze two non-bonded atoms into its range (its
+  neighbour list adds a 0.3 Å skin per atom) or stretch a bond out of it.
+- **Descriptor registry** (ADR 0006, `detectana.registry`): `@descriptor("name")`
+  marks `fn(positions, topology) -> DescriptorValues` (values plus each number's
+  name, atoms and group). Built-ins `bonds`, `angles`, `dihedrals`, `ring`; side by
+  side they equal the joined internal-coordinate descriptor bit for bit. User
+  descriptors are named `module.path:function`.
+- **Tracks, SPE and the false-alarm budget** (ADR 0006, 0007): `fit(tracks=...,
+  scores=...)`. Each track gets T² and SPE (the squared PCA residual); SPE is
+  inactive when PCA keeps every direction or no residual variance remains. A
+  threshold role's α is split equally over the active tests (Bonferroni). The
+  default is four tracks — bonds, angles, dihedrals, ring — **provisional** until
+  benchmarked on real data. `detectana.JOINED_TRACKS` gives the single joined track.
+- `ReferenceBundle.exceedance(scores, role)`: largest score ÷ threshold per frame
+  and the test behind it; above 1 = marked.
+- `ReferenceBundle.attribute(frames, track, score)`: reconstruction-based
+  contribution (RBC) per descriptor group, mapped to atoms (`detectana.attribution`).
+- `ReferenceBundle.check_chemistry(frames)`: broken bonds, close contacts and ring
+  planarity per frame against the bundle's own topology (`ChemistryFlags`, now
+  exported). `ReferenceBundle.false_flag_rate(role)`: the role's total α.
+  Attribution strengths overlap and do not sum to the score.
+- `scripts/benchmark_tracks.py`: joined vs four tracks, with and without SPE, at
+  one total false-alarm rate; per-group RBC as an alarm reported separately.
+- `detectana.synthetic`: demo frames by per-atom rattle (the smoke set, unchanged)
+  or by thermal sampling of a harmonic spring model (atoms move together).
+- `topology.complete_topology()` fills feature names and index arrays.
+- **Reference bundle** (ADR 0005): `detectana.fit(train, valid, topology)` →
+  `ReferenceBundle` with `save`, `detectana.load`, `score(frames)` →
+  `{"geometric": T²}`, `validate_frame`, and a metadata API (elements, atom
+  count, units, topology, tracks, feature names, thresholds, onset rule,
+  `history_frames`). Saved as `manifest.json` + `state.npz`, no pickle. `load`
+  refuses another format version or statistic, changed descriptor code (SHA-256
+  of its source), other units, or inconsistent arrays.
+- `MahalanobisScorer.score_t2()` — Hotelling's T², the squared distance.
+- `onset.WindowRule` and `WindowRule.stream()` — the window onset rule one frame
+  at a time, equal to `detect_onset` on the same frames.
+- `build_topology` accepts an ase `Atoms` as well as a path, and keeps the
+  geometry it was built from (`MoleculeTopology.reference_positions`).
+- `ReferenceBundle.validate_frame` returns a `FrameCheck`: bonds stretched past
+  1.5× their reference length, and possible same-element atom swaps found by
+  rigid alignment plus Hungarian matching against the bundle's reference
+  geometry. Diagnostics only; they do not prove atom identity.
+- `ReferenceBundle.score_features` scores descriptors computed elsewhere.
 
 ### Changed
+- **Bundle format 2.** `score()` returns `{track: {"T2": ..., "SPE": ...}}`;
+  `thresholds(track)` returns `{score: {role: value}}`. Format-1 bundles are refused
+  (refit). The manifest records each descriptor's reference, code hash and numbers.
+  `load(path, descriptor_modules=[...])`: a user descriptor's module is never
+  imported because a bundle names it.
+- **Scientific definition: thresholds of multi-test bundles.** With K active tests,
+  each threshold is the 100·(1 − α/K) percentile of validation values, not the
+  configured percentile. A one-test bundle (the batch pipeline's) is unchanged.
+- **Scientific definition: batch pipeline scores are exceedances.** The pipeline
+  fits the config's `tracks:` and `scores:` (absent → the four-track default) and
+  stores, per bead and centroid frame, the largest score ÷ threshold over the
+  tests (bead role for beads, centroid role for the centroid); above 1 = marked.
+  `bead_scores.npy`, `centroid_scores.npy` and the score columns of
+  `frame_aggregate.csv` change meaning accordingly; raw T²/SPE per test are in
+  `bead_test_scores.npz` / `centroid_test_scores.npz`. Existing configs without
+  `tracks:` change results on their next run; `tracks: {geometric: [bonds, angles,
+  dihedrals, ring]}` with `scores: [T2]` reproduces the previous flags and onsets.
+  The run manifest records `"statistic": "exceedance"`, the tests, thresholds per
+  test and role, and the budget (the scalar `ood_threshold` keys are gone).
+- `frame_aggregate.csv` adds the top test, per-test centroid scores, and for
+  marked centroid frames the three strongest descriptor groups (RBC); a new
+  `onset_attribution.csv` explains each alarm by the most exceeded centroid
+  frame in the window that fired (`onset_frame` is the window start, `frame` the
+  frame explained).
+- `extract_onset_frames.py --threshold` is in the run's score units: exceedance
+  for current runs, T² for runs written before tracks.
+- `MahalanobisScorer`: `track=` is renamed `role=` (threshold role), and
+  `DEFAULT_TRACK` is `DEFAULT_ROLE`. Pickles are unaffected.
+- Core dependencies are `numpy`, `scipy`, `scikit-learn`, `ase`. `pandas`,
+  `matplotlib`, `h5py`, `pyyaml`, `joblib` moved to a `[pipeline]` extra, which
+  `[dev]` includes. Install with `pip install "detectana[pipeline]"` to run the
+  batch pipeline and scripts.
+- **Scientific definition: every OOD score is now T²**, the squared Mahalanobis
+  distance, not the distance √T² — in the bundle, the batch pipeline
+  (`bead_scores.npy`, `centroid_scores.npy`, the score columns of
+  `frame_aggregate.csv`, thresholds, plots) and the embedding track. Thresholds
+  are percentiles of validation T². Column and file names are unchanged; each
+  run's `manifest.json` records `"statistic": "T2"`. Rank-based results (AUROC,
+  average precision, conformal detection rates, Spearman) are unchanged; stored
+  values, thresholds, medians and Pearson correlations are not. On the demo data
+  every flag and onset is the same as in 0.3.0. With
+  `frame_autocorrelation: auto`, ρ is now measured on the centroid T² series.
+- The batch pipeline fits a reference bundle and saves it to
+  `outputs/models/geometric.bundle`; it no longer writes
+  `descriptor_pipeline.pkl` or `scorer.pkl`. `benchmark_detector.py` and
+  `score_vs_error.py` fit the same way.
+- `EmbeddingPipeline` pickles record their statistic; one saved before T² is
+  refused on load. `score_vs_error.py --reuse-scan` refuses a pre-T² scan, and
+  `extract_onset_frames.py --threshold` (now in T² units) refuses a run whose
+  manifest does not record T².
+
 - Bead files of unequal length no longer abort the run. The analysis uses the
   frame range every bead covers — the shortest bead's extent — and reports it: a
   warning naming the per-bead counts, and a `frame_alignment` block in
@@ -25,6 +138,25 @@ produces results that still look plausible. See
   failure, and now say so specifically. Trimming is safe only because it drops
   frames from the tail, leaving frame *i* the same timestep in every bead; when
   that does not hold, per-timestep aggregates would mix different times.
+- `trajectory:` runs record the same `frame_alignment` block (one bead, so nothing
+  is trimmed unless the centroid differs).
+
+### Removed
+- `DescriptorPipeline.inverse_contributions`: it returned PCA residuals while its
+  docstring claimed a share of the score. Use SPE and `attribute` (issue 01).
+
+### Fixed
+- **Units: the time axis of XYZ runs was too large by the output stride.** i-PI's
+  step number already counts MD steps, and the pipeline multiplied it by
+  `timestep_fs × stride`. `time_ps` in `frame_aggregate.csv` and the plot axes of
+  XYZ runs are now `step × timestep_fs`; on the demo, 20 ps instead of 1000 ps.
+  Earlier picosecond values from XYZ runs should be divided by `stride`. Step
+  numbers, frame indices and HDF5 runs were right and are unchanged.
+- Fitting a one-feature input crashed `MahalanobisScorer.fit` (`np.cov` returns
+  a scalar for one column).
+- A molecule with no angles or dihedrals (a diatomic) crashed the vectorised
+  descriptor (empty index arrays were 1-d).
+- `detectana.onset` no longer needs pandas to import.
 
 ## 0.3.0 — 2026-08-11
 

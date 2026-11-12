@@ -35,24 +35,27 @@ import numpy as np
 from ase.io import read
 
 from detectana.evaluation import dihedral_angles_deg, perturb_dihedral
+from detectana.synthetic import (  # noqa: F401  (re-exported for older callers)
+    CARBOXYL,
+    CARBOXYL_SIGMA_DEG,
+    ESTER,
+    ESTER_SIGMA_DEG,
+    RATTLE_H_A,
+    RATTLE_HEAVY_A,
+    SEED_TRAIN,
+    SEED_TRAJ,
+    SEED_VALID,
+    random_orientation,
+    rattle,
+    reference_frames,
+)
 from detectana.topology import build_topology
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 SMOKE_DIR = PROJECT_ROOT / "data" / "smoke"
 
-# Torsions left free to move. Everything else is held by the rattle alone.
-CARBOXYL = (6, 5, 10, 7)
-ESTER = (5, 6, 12, 11)
-
-# Spread of each free torsion in the reference set, degrees. Loose enough that
-# the two conformers are both visited, tight enough to stay one basin each.
-CARBOXYL_SIGMA_DEG = 12.0
-ESTER_SIGMA_DEG = 25.0
-
-# Rattle amplitude per atom, Å. Hydrogens move further at the same temperature.
-RATTLE_HEAVY_A = 0.035
-RATTLE_H_A = 0.070
-
+# Torsions, spreads, rattle amplitudes and seeds live in detectana.synthetic,
+# which the benchmark also uses; re-exported here under their old names.
 N_TRAIN = 64
 N_VALID = 32
 N_TRAJ = 24
@@ -66,38 +69,11 @@ START_STEP = 100_000
 TRAJ_DRIFT_DEG = 130.0
 BEAD_JITTER_A = 0.05  # bead 0 around the centroid
 
-SEED_TRAIN = 20260810
-SEED_VALID = 20260811
-SEED_TRAJ = 20260812
-
 CELL_A = 105.83544  # i-PI writes a cell even for a gas-phase molecule
 
 
-def _rattle(pos: np.ndarray, symbols: list[str], rng: np.random.Generator) -> np.ndarray:
-    sigma = np.array(
-        [RATTLE_H_A if s == "H" else RATTLE_HEAVY_A for s in symbols],
-        dtype=np.float64,
-    )[:, None]
-    return pos + rng.normal(scale=sigma, size=pos.shape)
-
-
-def _random_orientation(pos: np.ndarray, rng: np.random.Generator) -> np.ndarray:
-    """Random rotation about the centre of mass, plus a small translation.
-
-    The descriptors are built from internal coordinates and so are invariant to
-    this. It is here so the files look like trajectory output rather than a
-    stack of aligned copies.
-    """
-    q = rng.normal(size=4)
-    q /= np.linalg.norm(q)
-    w, x, y, z = q
-    rot = np.array([
-        [1 - 2 * (y * y + z * z), 2 * (x * y - z * w), 2 * (x * z + y * w)],
-        [2 * (x * y + z * w), 1 - 2 * (x * x + z * z), 2 * (y * z - x * w)],
-        [2 * (x * z - y * w), 2 * (y * z + x * w), 1 - 2 * (x * x + y * y)],
-    ])
-    centre = pos.mean(axis=0)
-    return (pos - centre) @ rot.T + centre + rng.normal(scale=0.05, size=3)
+_rattle = rattle
+_random_orientation = random_orientation
 
 
 def _reference_frames(
@@ -106,16 +82,10 @@ def _reference_frames(
     topo,
     n_frames: int,
     seed: int,
+    motion: str = "rattle",
 ) -> np.ndarray:
-    rng = np.random.default_rng(seed)
-    frames = []
-    for _ in range(n_frames):
-        pos = equilibrium.copy()
-        for dihedral, sigma in ((CARBOXYL, CARBOXYL_SIGMA_DEG), (ESTER, ESTER_SIGMA_DEG)):
-            pos = perturb_dihedral(pos, topo, float(rng.normal(scale=sigma)), dihedral=dihedral)
-        pos = _rattle(pos, symbols, rng)
-        frames.append(_random_orientation(pos, rng))
-    return np.stack(frames)
+    """Synthetic reference frames; see ``detectana.synthetic.reference_frames``."""
+    return reference_frames(equilibrium, topo, n_frames, seed, motion=motion)
 
 
 def _trajectory_frames(

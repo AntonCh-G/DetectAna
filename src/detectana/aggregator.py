@@ -34,7 +34,9 @@ def aggregate_bead_scores(
     centroid_scores : (n_frames,)
     steps : (n_frames,) simulation step indices
     threshold : OOD threshold
-    frame_time_fs : time per frame in femtoseconds (timestep × stride)
+    frame_time_fs : femtoseconds per unit of ``steps``: the timestep when steps are
+        MD step numbers (i-PI XYZ), timestep × stride when they are frame
+        indices (HDF5). See ``pipeline.time_per_step_fs``.
 
     Returns
     -------

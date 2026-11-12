@@ -95,8 +95,10 @@ leak information:
   carry no element symbols — the fast binary XYZ reader and HDF5 — can only be
   checked on atom count, and files with mixed atom counts across frames are
   rejected.
-- **Striding.** Trajectories are read at their stored output stride; the
-  configured `timestep_fs × stride` converts frame index to picoseconds. Output
+- **Striding.** Trajectories are read at their stored output stride. Time in
+  picoseconds is `step × timestep_fs` for i-PI XYZ files, whose step column is
+  the MD step number, and `frame × timestep_fs × stride` for HDF5 files, whose
+  step column is the frame index (`pipeline.time_per_step_fs`). Output
   tables carry both the raw step index and the time, because mixing the two
   produces a plot that looks entirely plausible.
 - **No alignment, no centering, no rotation.** Internal coordinates are
@@ -176,16 +178,22 @@ directions.
 
 ### 4.4 OOD statistic and threshold
 
-The score is the Mahalanobis distance in PCA space, with mean $\mu$ and
-covariance $\Sigma$ estimated on the training projections:
+The score is Hotelling's $T^2$, the squared Mahalanobis distance in PCA space,
+with mean $\mu$ and covariance $\Sigma$ estimated on the training projections:
 
-$$s(x) = \sqrt{(z(x) - \mu)^\top \Sigma^{-1} (z(x) - \mu)}, \qquad
+$$s(x) = T^2(x) = (z(x) - \mu)^\top \Sigma^{-1} (z(x) - \mu), \qquad
 \Sigma \leftarrow \Sigma + 10^{-8} I$$
 
 where $z(\cdot)$ is standardise-then-project. The ridge term is numerical
-stabilisation, not regularisation of a fit.
+stabilisation, not regularisation of a fit. "Distance" is only a display label
+for $\sqrt{T^2}$; every stored score and threshold is $T^2$. Releases up to
+0.3.0 stored the distance; since squaring keeps the order of frames, rank-based
+results (AUROC, average precision, conformal detection rates, Spearman
+correlations) are the same, but stored values, thresholds and Pearson
+correlations are not, and old and new outputs must not be mixed. A run's
+`manifest.json` says which it holds (`"statistic": "T2"`).
 
-The threshold is a **percentile of the scores on the held-out validation set**
+The threshold is a **percentile of the $T^2$ scores on the held-out validation set**
 (`threshold.percentile`, default 99). This gives it an operational meaning: a
 frame is flagged when it scores above 99 % of reference frames the fit never
 saw. Define
@@ -201,8 +209,32 @@ $\alpha$ for a new exchangeable frame.
 Beads and the centroid may take different percentiles
 (`threshold.bead_percentile` / `centroid_percentile`), because a sensitive rule
 suits an early-warning signal and a strict one suits the classical-limit signal.
-Thresholds are stored per named track so calibrating one cannot overwrite
-another.
+These are *threshold roles*; thresholds are stored per role so calibrating one
+cannot overwrite another.
+
+**Tracks, SPE and the budget** ([ADR 0006](adr/0006-descriptor-registry-and-tracks.md),
+[ADR 0007](adr/0007-spe-score-and-reconstruction-based-attribution.md)). The
+descriptor is split into *tracks*, each standardised, projected and scored on its
+own. The default is four tracks — bonds, angles, dihedrals, ring — and is
+**provisional** until benchmarked on real data (`scripts/benchmark_tracks.py`).
+Each track has two scores:
+
+- $T^2$ above: how unusual the frame is *within* the directions PCA kept.
+- SPE (squared prediction error, also called $Q$): the squared residual left
+  after projecting onto those directions, $\mathrm{SPE}(x) = \lVert \tilde x -
+  P P^\top \tilde x \rVert^2$ with $\tilde x$ the standardised descriptor and $P$
+  the kept components. It catches a *new kind* of motion, which $T^2$ cannot see
+  because that motion lies outside the kept directions. SPE is inactive when PCA
+  keeps every direction or the largest validation SPE is below $10^{-10}$.
+
+Each active (track, score) pair is a *test*. With $K$ active tests, a role's
+$\alpha$ is split equally (Bonferroni): each test's threshold is the
+$100\,(1 - \alpha/K)$ percentile of its validation values, and a frame is marked
+when **any** test exceeds its threshold. The batch pipeline stores the
+*exceedance*, the largest score ÷ threshold over the tests, so above 1 means
+marked; its size is not comparable across tests. With one test ($K = 1$) this is
+the single-threshold rule above. `tracks: {geometric: [bonds, angles, dihedrals,
+ring]}` with `scores: [T2]` reproduces the 0.3.0 flags and onsets.
 
 **Nothing from the trajectory reaches either step.** The scaler, the PCA, the
 mean and the covariance come from `train`; the threshold from `valid`;
@@ -222,6 +254,19 @@ These answer a different question from the score and are reported in a different
 file. "Out of distribution" is a statement about the training set; "broken" is a
 statement about chemistry. Conflating them is the single most likely
 misinterpretation of this pipeline, which is why the outputs are kept apart.
+
+### 4.6 Attribution
+
+For a marked frame, reconstruction-based contribution (RBC; Alcala & Qin) gives
+each descriptor *group* — one bond, one angle, one dihedral's sin and cos
+together — the amount the score would drop if that group were moved to the value
+the model expects, for $T^2$ and for SPE. Groups map to atoms, so a flag can be
+traced to a part of the molecule ([ADR 0007](adr/0007-spe-score-and-reconstruction-based-attribution.md)).
+The values are **attribution strengths**: they overlap and do not sum to the
+score, and larger groups tend to show larger values, so they are never presented
+as shares or as causes. The pipeline writes the three strongest groups of each
+marked centroid frame to `frame_aggregate.csv`, and explains each alarm in
+`onset_attribution.csv`.
 
 ## 5. The embedding track (optional second measurement)
 

@@ -77,14 +77,15 @@ from ase.io import iread
 
 sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
 
-from detectana.descriptors import DescriptorPipeline, compute_descriptor_batch
+import detectana
+from detectana.bundle import JOINED_TRACKS
+from detectana.descriptors import compute_descriptor_batch
 from detectana.evaluation import (
     error_by_score_decile,
     per_frame_force_error,
     score_error_correlation,
 )
 from detectana.io import MoleculeSpec, load_reference_frames, validate_frame
-from detectana.scorer import MahalanobisScorer
 from detectana.topology import build_topology, check_chemistry_batch
 from detectana.xyz_reader import load_or_build_index
 
@@ -141,7 +142,7 @@ def _load_predicted(path: Path, spec: MoleculeSpec) -> np.ndarray:
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _fit_reference(cfg: dict, initial_xyz: str | None = None):
-    """Build topology and fit the descriptor pipeline and scorer, as the pipeline does.
+    """Build topology and fit the reference bundle, as the pipeline does.
 
     ``initial_xyz`` overrides the config's run entry, which lets a trajectory file
     stand in as its own topology source when the run has no separate initial.xyz.
@@ -154,18 +155,19 @@ def _fit_reference(cfg: dict, initial_xyz: str | None = None):
     )
     spec = MoleculeSpec(topo.n_atoms, tuple(topo.atom_types))
     train_pos, _, _ = load_reference_frames(cfg["reference"]["train"], spec=spec)
-    pipe = DescriptorPipeline(
+    valid_pos, _, _ = load_reference_frames(cfg["reference"]["valid"], spec=spec)
+    bundle = detectana.fit(
+        train_pos, valid_pos, topo,
+        tracks=JOINED_TRACKS,
+        scores=("T2",),
         pca_variance=cfg["descriptor"]["pca_variance"],
         random_seed=cfg["descriptor"]["random_seed"],
-    ).fit(compute_descriptor_batch(train_pos, topo))
-    scorer = MahalanobisScorer().fit(
-        pipe.transform(compute_descriptor_batch(train_pos, topo))
     )
     log.info(
         "Fitted on %d training frames, %d PCA components",
-        len(train_pos), pipe.n_components,
+        len(train_pos), bundle.manifest["tracks"]["geometric"]["n_components"],
     )
-    return topo, spec, pipe, scorer, len(train_pos)
+    return topo, spec, bundle, len(train_pos)
 
 
 def _read_frames(
@@ -258,12 +260,17 @@ def run_sample(args: argparse.Namespace, cfg: dict, out_dir: Path) -> None:
 
     # The trajectory's own first frame defines the molecule when the run has no
     # separate initial.xyz — the centroid file is a valid topology source.
-    topo, spec, pipe, scorer, n_train = _fit_reference(
+    topo, spec, bundle, n_train = _fit_reference(
         cfg, initial_xyz=args.initial_xyz or str(traj)
     )
 
     if args.reuse_scan:
         cached = np.load(args.reuse_scan)
+        if "statistic" not in cached.files or str(cached["statistic"]) != "T2":
+            raise SystemExit(
+                f"{args.reuse_scan} was written before scores became T² (it holds "
+                "distances). Rescan without --reuse-scan."
+            )
         scan_ids, steps, scores = cached["frame"], cached["step"], cached["ood_score"]
         log.info("Reusing %d cached scores from %s", len(scores), args.reuse_scan)
     else:
@@ -282,16 +289,16 @@ def run_sample(args: argparse.Namespace, cfg: dict, out_dir: Path) -> None:
         for start in range(0, len(scan_ids), chunk):
             block = scan_ids[start:start + chunk]
             blk_steps, blk_pos = _read_frames(traj, block, _cache_for(traj))
-            scores[start:start + len(block)] = scorer.score(
-                pipe.transform(compute_descriptor_batch(blk_pos, topo))
-            )
+            scores[start:start + len(block)] = bundle.score_features(
+                compute_descriptor_batch(blk_pos, topo)
+            )["geometric"]["T2"]
             steps[start:start + len(block)] = blk_steps
             log.info("  scored %d / %d", start + len(block), len(scan_ids))
 
         np.savez(
             out_dir / "scan_scores.npz",
             frame=scan_ids, step=steps, ood_score=scores,
-            scan_stride=args.scan_stride,
+            scan_stride=args.scan_stride, statistic="T2",
         )
 
     # ── Stratified bins, equal draw per bin ──────────────────────────────────
@@ -489,7 +496,7 @@ def main() -> None:
 
     # ── Fit exactly as the pipeline does ─────────────────────────────────────
     chem_cfg = cfg["chemistry"]
-    topo, spec, pipe, scorer, n_train = _fit_reference(cfg, args.initial_xyz)
+    topo, spec, bundle, n_train = _fit_reference(cfg, args.initial_xyz)
 
     # ── Load the frames to analyse ───────────────────────────────────────────
     positions, ref_forces = _load_forces_and_positions(Path(args.reference_xyz), spec)
@@ -510,7 +517,7 @@ def main() -> None:
     log.info("Analysing %d frames", len(positions))
 
     # ── Score, error, correlate ──────────────────────────────────────────────
-    scores = scorer.score(pipe.transform(compute_descriptor_batch(positions, topo)))
+    scores = bundle.score(positions)["geometric"]["T2"]
     errors = per_frame_force_error(ref_forces, pred_forces, metric=args.metric)
     flags = check_chemistry_batch(
         positions, topo, chem_cfg["bond_break_cutoff"], chem_cfg["close_contact_cutoff"]
@@ -540,7 +547,8 @@ def main() -> None:
         "n_frames": int(len(scores)),
         "top_over_bottom_decile_error_ratio": ratio,
         "n_train": int(n_train),
-        "pca_n_components": int(pipe.n_components),
+        "pca_n_components": int(bundle.manifest["tracks"]["geometric"]["n_components"]),
+        "statistic": "T2",
     }
     with open(out_dir / "score_vs_error.json", "w") as fh:
         json.dump(summary, fh, indent=2)
@@ -580,7 +588,7 @@ def _plot(
 
     fig, axes = plt.subplots(1, 2, figsize=(11, 4.2))
     axes[0].scatter(scores, errors, s=8, alpha=0.4, color="steelblue")
-    axes[0].set_xlabel("OOD score (Mahalanobis distance)")
+    axes[0].set_xlabel("OOD score (T², squared Mahalanobis)")
     axes[0].set_ylabel(f"Force {metric} (eV/Å)")
     axes[0].set_title("Per frame")
     axes[0].grid(alpha=0.3)

@@ -29,6 +29,10 @@ source .venv/bin/activate
 uv pip install -e ".[dev]"
 ```
 
+`[dev]` includes `[pipeline]`, which the batch pipeline, scripts and plots need
+(pandas, matplotlib, h5py, pyyaml, joblib). The core library alone — fit, save,
+load and score a reference bundle — needs only `pip install -e .`.
+
 ## Use
 
 Run the whole pipeline on the demo data that ships with the repository:
@@ -45,7 +49,7 @@ behind the result.
 Check the install:
 
 ```bash
-pytest tests/ -v        # 176 tests
+pytest tests/ -v
 ```
 
 For your own data, copy the annotated template and fill in the paths:
@@ -57,9 +61,9 @@ python scripts/run_pipeline.py --config config/local.yaml
 
 You need three things: an `initial.xyz` defining the molecule, the reference
 `train`/`valid`/`test` split the force field was fitted on, and the trajectory —
-as i-PI XYZ (one file per bead plus a centroid), as a single HDF5 file, or as one
-extended-XYZ file for classical MD. Every key is documented in
-**[docs/usage.md](docs/usage.md)**; data requirements and determinism are in
+as i-PI XYZ (one file per bead plus a centroid), as a single HDF5 file, or, for
+classical MD, as one file in any format ASE reads (`.traj`, extended XYZ, ...).
+Every key is documented in **[docs/usage.md](docs/usage.md)**; data requirements and determinism are in
 **[docs/reproducibility.md](docs/reproducibility.md)**.
 
 Other entry points, all with `--help`:
@@ -67,6 +71,7 @@ Other entry points, all with `--help`:
 | Script | Does |
 |---|---|
 | `scripts/benchmark_detector.py` | Measures the detector against distortions of known size |
+| `scripts/benchmark_tracks.py` | Compares one joined track with four tracks, with and without SPE |
 | `scripts/extract_onset_frames.py` | Pulls the frames around a detected onset |
 | `scripts/select_configurations.py` | Picks a diverse set of configurations for retraining |
 | `scripts/score_vs_error.py` | Relates the OOD score to force-field error |
@@ -81,11 +86,18 @@ Other entry points, all with `--help`:
    index tuples and a reordered file gives silently wrong descriptors.
 2. **Descriptor**: bond lengths, bond angles, every dihedral as a $(\sin, \cos)$
    pair so the $0 \to 2\pi$ wrap is continuous, plus ring planarity.
-3. **Fit on training frames only** — standardise, PCA, then a Mahalanobis
-   distance from the training mean and covariance.
-4. **Calibrate on held-out validation frames.** The threshold is a percentile of
-   validation scores, so "flagged" means "above 99 % of reference frames the fit
-   never saw". Nothing from the trajectory touches the fit or the threshold.
+3. **Fit on training frames only**, per *track*. By default there are four
+   tracks — bonds, angles, dihedrals, ring — each standardised and reduced by
+   PCA, then scored twice: T², the squared Mahalanobis distance (unusual within
+   the motions training showed), and SPE, the squared PCA residual (a new kind of
+   motion). The default is provisional until benchmarked on real data. The fit is
+   saved as a reference bundle (`outputs/models/geometric.bundle`).
+4. **Calibrate on held-out validation frames.** Each (track, score) pair is a
+   test. The false-alarm rate α = 1 − percentile/100 is split equally over the
+   tests, and each test's threshold is a percentile of its validation scores. A
+   frame is marked when any test exceeds its threshold; the pipeline stores the
+   largest score ÷ threshold, so above 1 means marked. Nothing from the trajectory
+   touches the fit or the threshold.
 5. **Aggregate across beads without averaging** — per timestep: max, 95th
    percentile, and fraction above threshold. A single bead can leave the training
    region long before the centroid notices, and a mean erases that.
@@ -98,6 +110,9 @@ Other entry points, all with `--help`:
 7. **Hard-chemistry checks kept separate** — broken bonds, close contacts, ring
    planarity, in their own file, because "out of distribution" and "unphysical"
    are different claims.
+8. **Attribution.** For marked frames, the descriptor groups (a bond, an angle, a
+   dihedral) that pushed the score up most, mapped to atoms. These are
+   attribution strengths: they overlap and do not sum to the score.
 
 The full treatment, with equations and the reasoning behind each choice, is in
 **[docs/methodology.md](docs/methodology.md)**.
@@ -133,12 +148,13 @@ about training coverage only, which is all this repository claims for it.
 ## Repository layout
 
 ```
-src/detectana/     the library: io, topology, descriptors, scorer,
-                   embedding_scorer, aggregator, onset, evaluation, pipeline
+src/detectana/     the library: io, topology, descriptors, registry, bundle,
+                   attribution, scorer, embedding_scorer, aggregator, onset,
+                   evaluation, synthetic, pipeline, xyz_reader
 scripts/           thin CLI entry points; orchestration and plotting only
 config/            demo.yaml (runs as-is) and example.yaml (annotated template)
 data/smoke/        synthetic demo dataset, generated by make_demo_data.py
-tests/             176 tests; test_smoke.py is the scientific checklist, executable
+tests/             test suite; test_smoke.py is the scientific checklist, executable
 docs/              methodology, reproducibility, usage, scientific-rules,
                    glossary, adr/
 ```
@@ -165,7 +181,7 @@ Next: validate the score against force-field error; compare the geometric and
 embedding tracks on one benchmark; close the active-learning loop (detect, select,
 recompute, retrain); add force-based descriptors.
 
-**Status:** v0.3.0, in active development. Interfaces may still change. Scientific
+**Status:** v0.4.0, in active development. Interfaces may still change. Scientific
 definitions, thresholds and atom indexing will not change silently — see
 [docs/scientific-rules.md](docs/scientific-rules.md).
 

@@ -21,6 +21,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 import numpy as np
+from ase import Atoms
 from ase.neighborlist import NeighborList, natural_cutoffs
 
 log = logging.getLogger(__name__)
@@ -69,6 +70,10 @@ class MoleculeTopology:
     angle_idx: np.ndarray | None = field(default=None)      # (n_angles, 3)
     dihedral_idx: np.ndarray | None = field(default=None)   # (n_dihedrals, 4)
     ring_idx: np.ndarray | None = field(default=None)       # (ring_size,) or None
+
+    # The geometry the topology was built from, (n_atoms, 3) Å. A reference bundle
+    # keeps it to check a first frame's atom order. None for hand-built topologies.
+    reference_positions: np.ndarray | None = field(default=None)
 
     @property
     def has_ring(self) -> bool:
@@ -119,16 +124,18 @@ AspirinTopology = MoleculeTopology
 # ---------------------------------------------------------------------------
 
 def build_topology(
-    initial_xyz: str | Path,
+    initial_xyz: str | Path | Atoms,
     nl_mult: float = 1.1,
     ring_atoms: Sequence[int] | None = None,
     ring_size: int = 6,
+    bonds: Sequence[tuple[int, int]] | None = None,
 ) -> MoleculeTopology:
     """Build topology from the first frame of ``initial_xyz``.
 
     Parameters
     ----------
-    initial_xyz : path to the initial geometry. Its atom count and element order
+    initial_xyz : path to the initial geometry, or an ase ``Atoms`` already in
+        memory (e.g. the first training frame). Its atom count and element order
         define the molecule for the whole run.
     nl_mult : NeighborList covalent-radii multiplier (default 1.1).
     ring_atoms : explicit 0-based indices of the ring used for the planarity
@@ -137,32 +144,47 @@ def build_topology(
         Pass an empty sequence to switch the planarity feature off.
     ring_size : ring length to search for when ``ring_atoms`` is None
         (default 6, i.e. a benzene-like carbon ring).
+    bonds : the bond graph as 0-based atom pairs, found by the caller (for
+        example by a chemistry toolkit over many frames). Replaces the
+        covalent-radii search, which reads one geometry only: a single thermal
+        frame can squeeze two non-bonded atoms into range or stretch a bond out
+        of it. Angles, dihedrals and the ring are derived from it as usual.
     """
     from detectana.io import load_single_frame
 
-    atoms = load_single_frame(initial_xyz)
+    if isinstance(initial_xyz, Atoms):
+        atoms = initial_xyz
+        source = "Atoms"
+    else:
+        atoms = load_single_frame(initial_xyz)
+        source = Path(initial_xyz).name
     topo = MoleculeTopology(
         n_atoms=len(atoms),
         atom_types=list(atoms.get_chemical_symbols()),
+        reference_positions=np.array(atoms.get_positions(), dtype=np.float64),
     )
 
     # ── Bond graph ──────────────────────────────────────────────────────────
-    cutoffs = natural_cutoffs(atoms, mult=nl_mult)
-    nl = NeighborList(cutoffs, self_interaction=False, bothways=True)
-    nl.update(atoms)
-    conn = nl.get_connectivity_matrix(sparse=False)
-
-    topo.bonds = [
-        (i, j)
-        for i in range(topo.n_atoms)
-        for j in range(i + 1, topo.n_atoms)
-        if conn[i, j] > 0
-    ]
+    if bonds is not None:
+        pairs = sorted({(min(int(i), int(j)), max(int(i), int(j))) for i, j in bonds})
+        bad = [p for p in pairs if p[0] == p[1] or p[0] < 0 or p[1] >= topo.n_atoms]
+        if bad:
+            raise ValueError(f"bonds {bad} are not pairs of distinct atoms of {topo.n_atoms}")
+        topo.bonds = pairs
+    else:
+        cutoffs = natural_cutoffs(atoms, mult=nl_mult)
+        nl = NeighborList(cutoffs, self_interaction=False, bothways=True)
+        nl.update(atoms)
+        conn = nl.get_connectivity_matrix(sparse=False)
+        topo.bonds = [
+            (i, j)
+            for i in range(topo.n_atoms)
+            for j in range(i + 1, topo.n_atoms)
+            if conn[i, j] > 0
+        ]
 
     if not topo.bonds:
-        raise ValueError(
-            f"No bonds detected in {Path(initial_xyz).name} with nl_mult={nl_mult}"
-        )
+        raise ValueError(f"No bonds detected in {source}")
 
     # ── Adjacency dict ───────────────────────────────────────────────────────
     adj: dict[int, list[int]] = {i: [] for i in range(topo.n_atoms)}
@@ -176,7 +198,7 @@ def build_topology(
             "%s: bond graph has %d disconnected fragments. Internal coordinates "
             "are computed on raw positions with no periodic images, so results "
             "are only meaningful for a single gas-phase molecule.",
-            Path(initial_xyz).name, n_fragments,
+            source, n_fragments,
         )
 
     # ── Angles ───────────────────────────────────────────────────────────────
@@ -223,6 +245,14 @@ def build_topology(
         else:
             log.info("Ring-planarity feature disabled by configuration.")
 
+    return complete_topology(topo)
+
+
+def complete_topology(topo: MoleculeTopology) -> MoleculeTopology:
+    """Fill in feature names and numpy index arrays from bonds, angles, dihedrals
+    and ring atoms. ``build_topology`` calls it; so does a reference bundle that
+    rebuilds a topology from its manifest. Returns ``topo``, changed in place.
+    """
     # ── Feature names ────────────────────────────────────────────────────────
     sym = topo.atom_types
     topo.bond_names = [f"bond_{sym[i]}{i}-{sym[j]}{j}_Å" for i, j in topo.bonds]
@@ -241,9 +271,10 @@ def build_topology(
     )
 
     # ── Precomputed numpy index arrays for vectorised descriptors ─────────────
-    topo.bond_idx = np.array(topo.bonds, dtype=np.int32)            # (n_bonds, 2)
-    topo.angle_idx = np.array(topo.angles, dtype=np.int32)          # (n_angles, 3)
-    topo.dihedral_idx = np.array(topo.dihedrals, dtype=np.int32)    # (n_dihedrals, 4)
+    # reshape keeps an empty list 2-d (a diatomic has no angles or dihedrals).
+    topo.bond_idx = np.array(topo.bonds, dtype=np.int32).reshape(-1, 2)          # (n_bonds, 2)
+    topo.angle_idx = np.array(topo.angles, dtype=np.int32).reshape(-1, 3)        # (n_angles, 3)
+    topo.dihedral_idx = np.array(topo.dihedrals, dtype=np.int32).reshape(-1, 4)  # (n_dihedrals, 4)
     topo.ring_idx = (
         np.array(topo.ring_atoms, dtype=np.int32) if topo.ring_atoms else None
     )

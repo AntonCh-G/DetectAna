@@ -380,3 +380,11 @@ def test_embedding_pipeline_save_load(tmp_path, fitted_emb_pipeline):
     assert pipe2.n_atoms == n_atoms
     assert pipe2.n_features == n_feat
     np.testing.assert_allclose(pipe2.score(val_emb), scores_before)
+
+
+def test_inverse_contributions_is_removed():
+    """Issue 01: it returned PCA residuals while claiming to explain the score.
+    SPE (the residual) and RBC (attribution) replace it (ADR 0007)."""
+    from detectana.descriptors import DescriptorPipeline
+
+    assert not hasattr(DescriptorPipeline, "inverse_contributions")

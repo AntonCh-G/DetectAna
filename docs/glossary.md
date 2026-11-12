@@ -53,6 +53,9 @@ rate: at α = 1 % a clean 200,000-frame run still gets ~2000 flagged frames.
 flagged fraction reaches `fraction_threshold`. Bounds on its false-alarm rate come
 from `onset.window_false_alarm_probability`; `onset.choose_fraction_threshold`
 inverts it, turning a `false_alarm_budget` into the loosest fraction that fits.
+`onset.WindowRule(...).stream()` applies the same rule one frame at a time and
+gives exactly the onset frame `detect_onset` gives on the same frames; the
+first onset latches.
 
 **Effective trials** — independent flag opportunities in a window, `window ·
 (1−ρ)/(1+ρ)` for lag-1 autocorrelation ρ, times `n_effective_beads` (default 1,
@@ -62,6 +65,81 @@ since beads are not independent). For illustration, a 500-frame window at
 **Onset design report** — the block written to `manifest.json` recording α, the
 window, the fraction actually used, ρ, effective trials, flags needed and the
 false-alarm bounds per window and per run.
+
+## Library interface (ADR 0005–0007)
+
+**Reference bundle** — the saved fit for one force field (`detectana.fit`,
+`detectana.load`; `src/detectana/bundle.py`): a directory with `manifest.json`
+(format version, DetectAna version, elements and topology, units, descriptors
+with their code hashes, tracks, thresholds per score and role, budget, onset
+rule) and `state.npz` (fitted arrays, no pickle). Callers use its metadata API,
+`score`, `exceedance` and `attribute`, never the fitted state. It refuses a
+bundle of another format version, changed or unimported descriptor code or other
+units, and frames of another atom count, element order or unit. The batch
+pipeline fits one with the config's tracks and saves it to
+`outputs/models/geometric.bundle`.
+
+**Frame check** — what `validate_frame` returns for a first frame that passed
+the hard checks: stretched bonds and possible same-element swaps against the
+bundle's reference geometry. Diagnostics, not proof of atom identity.
+
+**Descriptor registry** — descriptors as functions marked `@descriptor("name")`,
+each mapping a batch of frames and the topology to named numbers, with each
+number's atoms and group ID returned alongside the values. Built-ins (bonds,
+angles, dihedrals, ring) plus user modules named as `module:function`.
+Parameters live in the user's module, not in DetectAna. A bundle never imports
+a user module itself.
+
+**Descriptor group** — the numbers that are explained together: one bond, one
+angle, one dihedral's sin and cos, the ring planarity. The descriptor author
+defines them; a group's atoms are all atoms its numbers name. Its size is
+reported with every attribution, since larger groups tend to show larger RBC.
+
+**Track** — a set of descriptor numbers fitted, scored and thresholded together,
+as the embedding track is. Default (provisional): bonds, angles, dihedrals, ring.
+The *joined track* puts all four into one; with T² alone it is the detector used
+before tracks.
+
+**Test** — one score of one track (T² or SPE) against its own thresholds, e.g.
+"bonds, SPE". A test is *active* when its score can fire; an inactive SPE is not
+a test. A frame is marked for a role when any active test exceeds its threshold.
+
+**False-alarm budget** — the total false-alarm rate α of a threshold role
+(1 − percentile/100), split equally over the active tests (Bonferroni: each test
+gets α/K). Holds whatever the correlation between tests; conservative when they
+are correlated.
+
+**Threshold role** — `bead` or `centroid` (`role=` in `MahalanobisScorer`):
+different cut-offs on the same score inside one track. Not a track.
+
+**T²** — Hotelling's statistic, the squared Mahalanobis distance in the kept PCA
+space: unusual within the motions the training data showed. Every stored score
+and threshold is T² (`MahalanobisScorer.score_t2`), in the bundle, the batch
+pipeline and the embedding track; "distance" is only a label for √T²
+(`MahalanobisScorer.score`). Up to 0.3.0 the pipeline stored the distance.
+
+**SPE (Q)** — squared prediction error of the PCA residual: a new kind of motion
+the training data never showed. Inactive when PCA keeps every direction or the
+validation residual is numerically zero; an inactive SPE is not a test and takes
+no budget.
+
+**Attribution strength (RBC)** — reconstruction-based contribution: how much a
+score would drop if one descriptor group were reconstructed to its expected value.
+Values overlap and do not sum to the score; never call them shares.
+
+**Atom strength** — the largest attribution strength among the descriptor groups
+that involve an atom. A pointer for colouring a molecule, in score units; the
+explanation itself is the group.
+
+**Exceedance** — for one threshold role, the largest score ÷ threshold over a
+frame's active tests, with the test that produced it. Above 1 = the frame is
+marked. Its size is not comparable across tests; only "above 1" has a
+statistical meaning. The one per-frame signal the window rule reads; the batch
+pipeline stores it as each bead's and the centroid's score.
+_Avoid_: threshold ratio, severity.
+
+**Mark, alarm** — a mark is one frame above a threshold; an alarm is the window
+rule firing, i.e. the anomaly persisted.
 
 ## Evaluation
 
@@ -212,14 +290,14 @@ itself; this space is distinct from the training-set-fitted descriptor space
 used by the main OOD pipeline, and distances between the two are not
 directly comparable.
 
-**Mahalanobis distance** — OOD score used by both tracks. Computed from a fitted
-mean and inverse covariance. Higher = more out-of-distribution. In the geometric
+**Mahalanobis distance** — √T². Both tracks score its square, T², computed from
+a fitted mean and inverse covariance. Higher = more out-of-distribution. In the geometric
 track: computed in PCA-reduced internal-coordinate space. In the embedding track:
 computed per atom in the (e.g. 128-dimensional) invariant embedding space.
 
 ## Anomaly Detection
 
-**OOD threshold** — a percentile of the validation-set scores,
+**OOD threshold** — a percentile of the validation-set T² scores,
 `threshold.percentile`, default 99. Fit on the training set only, calibrated on
 the held-out validation set: no trajectory frame reaches either. One threshold per
 track (geometric and embedding). The demo config uses 95 instead, because with 32
@@ -233,11 +311,11 @@ chemically impossible; it means the MLFF is being asked to extrapolate.
 torsions, ring planarity, and close contacts. Separate from OOD score.
 A frame can be OOD without failing chemical validity and vice versa.
 
-**Geometric OOD score** — Mahalanobis distance in PCA-reduced internal-coordinate
+**Geometric OOD score** — T² (squared Mahalanobis distance) in PCA-reduced internal-coordinate
 space. Flags structural outliers: unusual bonds, angles, dihedrals, ring
 planarity. One scalar per frame (bead or centroid).
 
-**Embedding OOD score** — per-atom Mahalanobis distance in the MLFF's invariant
+**Embedding OOD score** — per-atom T² (squared Mahalanobis distance) in the MLFF's invariant
 per-atom embedding space. Flags model-reliability outliers: frames the MLFF has not encountered
 during training, where energy/force predictions are likely extrapolating. One
 scalar per atom per frame; aggregated to one scalar per frame via max over all 21

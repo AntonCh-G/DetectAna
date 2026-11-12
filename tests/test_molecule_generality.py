@@ -190,3 +190,39 @@ def test_ring_atoms_out_of_range_is_rejected(initial_xyz):
 
     with pytest.raises(ValueError, match="out of range"):
         build_topology(initial_xyz, ring_atoms=[0, 1, 2, 3, 4, 99])
+
+
+def test_build_topology_from_atoms_equals_from_path(initial_xyz):
+    """A caller holding frames in memory gets the same topology as from a file."""
+    from detectana.io import load_single_frame
+    from detectana.topology import build_topology
+
+    from_path = build_topology(initial_xyz)
+    from_atoms = build_topology(load_single_frame(initial_xyz))
+    assert from_atoms.bonds == from_path.bonds
+    assert from_atoms.angles == from_path.angles
+    assert from_atoms.dihedrals == from_path.dihedrals
+    assert from_atoms.ring_atoms == from_path.ring_atoms
+    assert from_atoms.atom_types == from_path.atom_types
+    assert from_atoms.feature_names == from_path.feature_names
+
+
+def test_diatomic_has_a_one_feature_descriptor():
+    """A molecule with no angles or dihedrals (one bond) gives one descriptor column.
+
+    The empty angle and dihedral index arrays used to be 1-d, which broke the
+    vectorised descriptor.
+    """
+    import numpy as np
+    from ase import Atoms
+
+    from detectana.descriptors import compute_descriptor_batch
+    from detectana.topology import build_topology
+
+    h2 = Atoms("H2", positions=[[0.0, 0.0, 0.0], [0.74, 0.0, 0.0]])
+    topo = build_topology(h2)
+    assert topo.n_features == 1
+    frames = np.stack([h2.positions, h2.positions * 1.1])
+    X = compute_descriptor_batch(frames, topo)
+    assert X.shape == (2, 1)
+    np.testing.assert_allclose(X[:, 0], [0.74, 0.814])

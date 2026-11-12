@@ -490,3 +490,52 @@ def load_pimd_trajectory_hdf5(
         bead_forces=bead_forces,
         centroid_forces=centroid_forces,
     )
+
+
+# ---------------------------------------------------------------------------
+# Any trajectory file ASE reads (.traj, extxyz, ...)
+# ---------------------------------------------------------------------------
+
+def load_ase_trajectory(
+    path: str | Path,
+    spec: MoleculeSpec | None = None,
+    format: str | None = None,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Positions of every frame in a file ASE can read, e.g. ``.traj`` or extxyz.
+
+    Meant for a classical MD run written after the fact: one file, one molecule.
+
+    Parameters
+    ----------
+    path : trajectory file.
+    spec : expected molecule; each frame's atom count and element order are
+           checked against it, and the first mismatching frame raises.
+    format : ASE format name; ``None`` lets ASE guess it from the file name.
+
+    Returns
+    -------
+    positions : (n_frames, n_atoms, 3)  float64  Å, as stored in the file.
+    steps     : (n_frames,)  int64  — the frame index (0, 1, 2, ...). Files ASE
+                reads carry no common step field, so one step is one saved frame.
+
+    Positions are not unwrapped. A file from a periodic box may have the molecule
+    split across the cell boundary, which then looks like broken bonds; a warning
+    is logged when any frame is periodic.
+    """
+    path = Path(path)
+    positions: list[np.ndarray] = []
+    periodic = False
+    for frame_idx, atoms in enumerate(iread(str(path), index=":", format=format)):
+        validate_frame(atoms, frame_idx, source=path.name, spec=spec)
+        positions.append(np.asarray(atoms.positions, dtype=np.float64))
+        periodic = periodic or bool(np.any(atoms.pbc))
+    if not positions:
+        raise ValueError(f"No frames found in {path}")
+    if periodic:
+        log.warning(
+            "%s: frames are periodic; positions are used as stored, not unwrapped. "
+            "A molecule split across the cell boundary will look like broken bonds.",
+            path.name,
+        )
+    log.info("Loaded %s: %d frames, %d atoms", path.name, len(positions), positions[0].shape[0])
+    return np.stack(positions), np.arange(len(positions), dtype=np.int64)

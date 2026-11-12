@@ -32,11 +32,15 @@ deliberate: evaluation data must never touch the fit or the threshold.
 from __future__ import annotations
 
 import logging
+from collections.abc import Hashable, Mapping
+from typing import TypeVar
 
 import numpy as np
 import pandas as pd
 from scipy.stats import pearsonr, spearmanr
 from sklearn.metrics import average_precision_score, roc_auc_score
+
+K = TypeVar("K", bound=Hashable)
 
 log = logging.getLogger(__name__)
 
@@ -61,6 +65,27 @@ def conformal_threshold(scores_in_distribution: np.ndarray, false_flag_rate: flo
     k = int(np.ceil((len(scores) + 1) * false_flag_rate))
     k = min(max(k, 1), len(scores))
     return float(np.sort(scores)[-k])
+
+
+def union_thresholds(
+    calibration_scores: Mapping[K, np.ndarray], false_flag_rate: float
+) -> dict[K, float]:
+    """Thresholds for several tests sharing one false-alarm budget (Bonferroni).
+
+    Each test gets the conformal threshold at ``false_flag_rate / K``, so a frame
+    flagged when *any* test exceeds its threshold is a false alarm with
+    probability at most ``false_flag_rate``, whatever the correlation between
+    tests (ADR 0006).
+    """
+    k = len(calibration_scores)
+    if k == 0:
+        raise ValueError("no tests")
+    return {t: conformal_threshold(s, false_flag_rate / k) for t, s in calibration_scores.items()}
+
+
+def union_flags(scores: Mapping[K, np.ndarray], thresholds: Mapping[K, float]) -> np.ndarray:
+    """True where any test's score exceeds its threshold."""
+    return np.any(np.stack([np.asarray(scores[t]) > thresholds[t] for t in thresholds]), axis=0)
 
 
 def detection_metrics(
