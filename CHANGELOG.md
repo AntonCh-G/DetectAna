@@ -10,7 +10,13 @@ are called out explicitly whenever they change, because a silent change there
 produces results that still look plausible. See
 [docs/scientific-rules.md](docs/scientific-rules.md).
 
-## Unreleased
+## 0.4.0 — 2026-11-12
+
+A library you can call frame by frame: a saved reference bundle, four
+descriptor tracks each scored by T² and SPE under one false-alarm budget,
+attribution to atoms, and runs read from any file ASE reads. **Results change**:
+scores are T², batch-pipeline scores are exceedances, and configs without
+`tracks:` now use four tracks; see Changed for how to reproduce 0.3.0.
 
 ### Added
 - **`trajectory:` runs**: one classical MD file in any format ASE reads (`.traj`,

@@ -14,7 +14,7 @@ Library entry points (ADR 0005–0007)::
 A user descriptor is a function marked ``@detectana.descriptor("name")``.
 """
 
-__version__ = "0.3.0"
+__version__ = "0.4.0"
 
 from detectana.attribution import Attribution, GroupStrength  # noqa: E402
 from detectana.bundle import (  # noqa: E402
